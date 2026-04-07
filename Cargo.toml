@@ -79,7 +79,7 @@ serde_with = { version = "3", features = ["chrono_0_4"] }
 oauth2 = { version = "5", default-features = false }
 ractor = "0.15"
 sha2 = "0.11"
-mimalloc = { version = "0.1", optional = true }
+mimalloc = { version = "0.1", optional = true , features = ["v3"] }
 dhat = { version = "0", optional = true }
 etcetera = { version = "0", optional = true }
 hex = "0.4"
@@ -98,7 +98,7 @@ rustls = { version = "0.23", default-features = false, features = [
 
 
 [features]
-default = ["portable", "external-resource"]
+default = ["portable", "external-resource", "mimalloc"]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
 portable = ["dep:zip", "dep:self-replace", "dep:tempfile"]
 xdg = ["dep:etcetera"]
