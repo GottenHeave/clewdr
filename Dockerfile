@@ -26,7 +26,7 @@ COPY --from=planner /build/recipe.json recipe.json
 
 # Build dependencies - this is the caching Docker layer.
 RUN mkdir -p ~/.cargo \
-    && cargo chef cook --release --no-default-features --features embed-resource,xdg --recipe-path recipe.json
+    && cargo chef cook --release --no-default-features --features embed-resource,xdg,mimalloc --recipe-path recipe.json
 
 # Build application
 COPY . .
