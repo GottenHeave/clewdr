@@ -383,9 +383,29 @@ async fn fetch_usage_percent(
     u32,
     Option<String>,
 )> {
-    let mut state = ClaudeCodeState::from_cookie(handle, cookie).ok()?;
-    let usage = state.fetch_usage_metrics().await.ok()?;
+    let mut state = match ClaudeCodeState::from_cookie(handle, cookie.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "fetch_usage_percent: from_cookie failed for {}: {}",
+                cookie.cookie, e
+            );
+            return None;
+        }
+    };
+    let usage = match state.fetch_usage_metrics().await {
+        Ok(u) => u,
+        Err(e) => {
+            warn!(
+                "fetch_usage_percent: fetch_usage_metrics failed for {}: {}",
+                cookie.cookie, e
+            );
+            state.return_cookie(None).await;
+            return None;
+        }
+    };
     state.return_cookie(None).await;
+
     let five = usage
         .get("five_hour")
         .and_then(|o| o.get("utilization"))
