@@ -21,6 +21,7 @@ use crate::{
     claude_code_state::ClaudeCodeState,
     config::{CLEWDR_CONFIG, CookieStatus},
     services::cookie_actor::CookieActorHandle,
+    claude_web_state::ClaudeWebState,
 };
 
 /// Cache entry for cookie status responses
@@ -383,29 +384,73 @@ async fn fetch_usage_percent(
     u32,
     Option<String>,
 )> {
-    let mut state = match ClaudeCodeState::from_cookie(handle, cookie.clone()) {
+    // 1) Try OAuth endpoint (works for Pro / Max with Claude Code Access)
+    let usage = match try_oauth_usage(&cookie, &handle).await {
+        Some(u) => u,
+        None => {
+            // 2) Fallback to claude.ai web endpoint (works for Enterprise)
+            info!(
+                "OAuth usage unavailable for {}, trying web fallback",
+                cookie.cookie
+            );
+            match ClaudeWebState::fetch_web_usage(handle, cookie.clone()).await {
+                Some(u) => u,
+                None => {
+                    warn!(
+                        "Web usage fallback also failed for {}",
+                        cookie.cookie
+                    );
+                    return None;
+                }
+            }
+        }
+    };
+
+    extract_usage_fields(&usage)
+}
+
+/// Try the OAuth endpoint (`api.anthropic.com/api/oauth/usage`)
+async fn try_oauth_usage(
+    cookie: &CookieStatus,
+    handle: &CookieActorHandle,
+) -> Option<serde_json::Value> {
+    let mut state = match ClaudeCodeState::from_cookie(handle.clone(), cookie.clone()) {
         Ok(s) => s,
         Err(e) => {
             warn!(
-                "fetch_usage_percent: from_cookie failed for {}: {}",
+                "try_oauth_usage: from_cookie failed for {}: {}",
                 cookie.cookie, e
             );
             return None;
         }
     };
-    let usage = match state.fetch_usage_metrics().await {
-        Ok(u) => u,
+    let result = state.fetch_usage_metrics().await;
+    state.return_cookie(None).await;
+    match result {
+        Ok(u) => Some(u),
         Err(e) => {
             warn!(
-                "fetch_usage_percent: fetch_usage_metrics failed for {}: {}",
+                "try_oauth_usage: fetch failed for {}: {}",
                 cookie.cookie, e
             );
-            state.return_cookie(None).await;
-            return None;
+            None
         }
-    };
-    state.return_cookie(None).await;
+    }
+}
 
+/// Extract the eight usage fields from the usage JSON returned by either endpoint
+fn extract_usage_fields(
+    usage: &serde_json::Value,
+) -> Option<(
+    u32,
+    Option<String>,
+    u32,
+    Option<String>,
+    u32,
+    Option<String>,
+    u32,
+    Option<String>,
+)> {
     let five = usage
         .get("five_hour")
         .and_then(|o| o.get("utilization"))
