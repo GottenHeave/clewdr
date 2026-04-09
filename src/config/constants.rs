@@ -77,21 +77,9 @@ pub static CONFIG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
 });
 
 pub static CACHE_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
-    #[cfg(feature = "portable")]
-    {
-        PORTABLE_DIR.join(CACHE_NAME)
-    }
-    #[cfg(feature = "xdg")]
-    {
-        use etcetera::{AppStrategy, AppStrategyArgs, choose_app_strategy};
-        let strategy = choose_app_strategy(AppStrategyArgs {
-            top_level_domain: "org".to_string(),
-            author: "Xerxes-2".to_string(),
-            app_name: "clewdr".to_string(),
-        })
-        .expect("Failed to choose app strategy");
-        strategy.in_data_dir(CACHE_NAME)
-    }
+    // Always place cache file next to the config file
+    let dir = CONFIG_PATH.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| CONFIG_PATH.clone());
+    dir.join(CACHE_NAME)
 });
 
 #[cfg(feature = "portable")]
