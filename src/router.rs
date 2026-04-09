@@ -10,6 +10,7 @@ use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 
 use crate::{
     api::*,
+    claude_web_state::conversation_cache::ConversationCache,
     middleware::{
         RequireAdminAuth, RequireBearerAuth, RequireFlexibleAuth,
         claude::{add_usage_info, apply_stop_sequences, check_overloaded, to_oai},
@@ -35,7 +36,24 @@ impl RouterBuilder {
         let cookie_handle = CookieActorHandle::start()
             .await
             .expect("Failed to start CookieActor");
-        let claude_providers = crate::providers::claude::build_providers(cookie_handle.clone());
+
+        // Create shared conversation cache
+        let conv_cache = ConversationCache::new();
+
+        // Spawn periodic cleanup task (every hour)
+        let cache_clone = conv_cache.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                cache_clone.cleanup().await;
+            }
+        });
+
+        let claude_providers = crate::providers::claude::build_providers(
+            cookie_handle.clone(),
+            conv_cache,
+        );
         RouterBuilder {
             claude_providers,
             cookie_actor_handle: cookie_handle,
