@@ -790,7 +790,7 @@ impl CreateMessageResponse {
     pub fn text(content: String, model: String, usage: Usage) -> Self {
         Self {
             content: vec![ContentBlock::text(content)],
-            id: uuid::Uuid::new_v4().to_string(),
+            id: uuid::Uuid::now_v7().to_string(),
             model,
             role: Role::Assistant,
             stop_reason: None,

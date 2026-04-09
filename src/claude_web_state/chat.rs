@@ -290,8 +290,8 @@ impl ClaudeWebState {
         })?;
 
         // Generate turn_message_uuids
-        let human_uuid = uuid::Uuid::new_v4().to_string();
-        let assistant_uuid = uuid::Uuid::new_v4().to_string();
+        let human_uuid = uuid::Uuid::now_v7().to_string();
+        let assistant_uuid = uuid::Uuid::now_v7().to_string();
         body.turn_message_uuids = Some(TurnMessageUuids {
             human_message_uuid: human_uuid.clone(),
             assistant_message_uuid: assistant_uuid.clone(),
@@ -382,8 +382,8 @@ impl ClaudeWebState {
         let bundled = self.bundle_user_messages(&new_user_msgs);
 
         // Generate turn UUIDs
-        let human_uuid = uuid::Uuid::new_v4().to_string();
-        let assistant_uuid = uuid::Uuid::new_v4().to_string();
+        let human_uuid = uuid::Uuid::now_v7().to_string();
+        let assistant_uuid = uuid::Uuid::now_v7().to_string();
 
         let body = self.build_incremental_body(
             &bundled, parent_uuid, &human_uuid, &assistant_uuid, p,
@@ -448,8 +448,8 @@ impl ClaudeWebState {
         // Bundle all remaining user messages
         let bundled = self.bundle_user_messages(&remaining_user_msgs);
 
-        let human_uuid = uuid::Uuid::new_v4().to_string();
-        let assistant_uuid = uuid::Uuid::new_v4().to_string();
+        let human_uuid = uuid::Uuid::now_v7().to_string();
+        let assistant_uuid = uuid::Uuid::now_v7().to_string();
 
         let body = self.build_incremental_body(
             &bundled, parent_uuid, &human_uuid, &assistant_uuid, p,

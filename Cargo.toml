@@ -39,7 +39,7 @@ tracing-subscriber = { version = "=0.3.19", features = [
 chrono = "0.4"
 futures = "0.3"
 thiserror = "2"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 itertools = "0.14"
