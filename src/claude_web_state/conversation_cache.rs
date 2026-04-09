@@ -79,6 +79,13 @@ pub struct CacheKey {
     pub key_index: usize,
 }
 
+/// Serializable entry for file persistence (HashMap key can't be a struct in JSON)
+#[derive(Serialize, Deserialize)]
+struct CacheEntry {
+    key: CacheKey,
+    conversation: CachedConversation,
+}
+
 /// Thread-safe conversation cache with file persistence
 #[derive(Clone)]
 pub struct ConversationCache {
@@ -112,15 +119,18 @@ impl ConversationCache {
         }
         match tokio::fs::read_to_string(path).await {
             Ok(text) => {
-                match serde_json::from_str::<HashMap<CacheKey, CachedConversation>>(&text) {
-                    Ok(mut map) => {
-                        // Fix stream health flags after deserialization
-                        for conv in map.values_mut() {
-                            conv.fix_stream_health();
+                // Deserialize as Vec of entries (HashMap key can't be a struct in JSON)
+                match serde_json::from_str::<Vec<CacheEntry>>(&text) {
+                    Ok(entries) => {
+                        let mut map = HashMap::new();
+                        let mut count = 0usize;
+                        for mut entry in entries {
+                            entry.conversation.fix_stream_health();
+                            if entry.conversation.valid && !entry.conversation.is_expired() {
+                                map.insert(entry.key, entry.conversation);
+                                count += 1;
+                            }
                         }
-                        // Remove expired/invalid entries on load
-                        map.retain(|_, v| v.valid && !v.is_expired());
-                        let count = map.len();
                         let mut inner = cache.inner.lock().await;
                         *inner = map;
                         info!("[CACHE] loaded {} entry/entries from {}", count, path.display());
@@ -142,14 +152,14 @@ impl ConversationCache {
         let Some(ref path) = self.path else { return };
         let map = self.inner.lock().await;
 
-        // Filter out invalid/expired entries before saving
-        let filtered: HashMap<CacheKey, CachedConversation> = map
+        // Serialize as Vec of entries (HashMap key can't be a struct in JSON)
+        let entries: Vec<CacheEntry> = map
             .iter()
             .filter(|(_, v)| v.valid && !v.is_expired())
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| CacheEntry { key: k.clone(), conversation: v.clone() })
             .collect();
 
-        if filtered.is_empty() {
+        if entries.is_empty() {
             // Delete the file if cache is empty
             if path.exists() {
                 if let Err(e) = tokio::fs::remove_file(path).await {
@@ -159,7 +169,7 @@ impl ConversationCache {
             return;
         }
 
-        match serde_json::to_string_pretty(&filtered) {
+        match serde_json::to_string_pretty(&entries) {
             Ok(json) => {
                 if let Some(parent) = path.parent() {
                     if !parent.exists() {
@@ -172,7 +182,7 @@ impl ConversationCache {
                 if let Err(e) = tokio::fs::write(path, json).await {
                     error!("[CACHE] failed to write cache file {}: {}", path.display(), e);
                 } else {
-                    debug!("[CACHE] saved {} entry/entries to {}", filtered.len(), path.display());
+                    debug!("[CACHE] saved {} entry/entries to {}", entries.len(), path.display());
                 }
             }
             Err(e) => {

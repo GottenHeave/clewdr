@@ -419,3 +419,112 @@ async fn test_cache_key_isolation() {
     assert!(cache.get(&key0).await.is_none());
     assert!(cache.get(&key1).await.is_some());
 }
+
+/// Test: persistence — save to file and load back
+#[tokio::test]
+async fn test_persistence_save_and_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test_cache.json");
+    let key = CacheKey { key_index: 0 };
+    let sys_hash = hash_system(&None);
+
+    // Create cache with persistence, add data, save
+    let cache = ConversationCache::with_persistence(path.clone());
+    let conv = make_cached(
+        "conv_persist",
+        vec![CachedTurn {
+            user_hashes: vec![hash_user_message(&make_user_msg("u1"))],
+            assistant_uuid: "asst0".to_string(),
+        }],
+        sys_hash,
+    );
+    cache.set(key.clone(), conv).await;
+    cache.save_to_file().await;
+
+    // File should exist
+    assert!(path.exists());
+
+    // Load from file
+    let loaded = ConversationCache::load_from_file(&path).await;
+    let loaded_conv = loaded.get(&key).await.unwrap();
+    assert_eq!(loaded_conv.conv_uuid, "conv_persist");
+    assert_eq!(loaded_conv.turns.len(), 1);
+    assert_eq!(loaded_conv.turns[0].assistant_uuid, "asst0");
+    // last_stream_healthy defaults to true after deserialization
+    assert!(loaded_conv.last_stream_healthy.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+/// Test: persistence — invalid entries are filtered on save and load
+#[tokio::test]
+async fn test_persistence_filters_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test_cache.json");
+    let key0 = CacheKey { key_index: 0 };
+    let key1 = CacheKey { key_index: 1 };
+    let sys_hash = hash_system(&None);
+
+    // Create two entries, invalidate one, save
+    let cache = ConversationCache::with_persistence(path.clone());
+    cache.set(key0.clone(), make_cached(
+        "conv_valid",
+        vec![CachedTurn {
+            user_hashes: vec![hash_user_message(&make_user_msg("u1"))],
+            assistant_uuid: "asst0".to_string(),
+        }],
+        sys_hash,
+    )).await;
+    cache.set(key1.clone(), make_cached(
+        "conv_invalid",
+        vec![CachedTurn {
+            user_hashes: vec![hash_user_message(&make_user_msg("u1"))],
+            assistant_uuid: "asst1".to_string(),
+        }],
+        sys_hash,
+    )).await;
+    cache.invalidate(&key1).await;
+    cache.save_to_file().await;
+
+    // Load back — only valid entry should be present
+    let loaded = ConversationCache::load_from_file(&path).await;
+    assert!(loaded.get(&key0).await.is_some());
+    assert!(loaded.get(&key1).await.is_none());
+}
+
+/// Test: persistence — empty cache deletes the file
+#[tokio::test]
+async fn test_persistence_empty_deletes_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test_cache.json");
+    let key = CacheKey { key_index: 0 };
+    let sys_hash = hash_system(&None);
+
+    let cache = ConversationCache::with_persistence(path.clone());
+    cache.set(key.clone(), make_cached(
+        "conv_to_delete",
+        vec![CachedTurn {
+            user_hashes: vec![hash_user_message(&make_user_msg("u1"))],
+            assistant_uuid: "asst0".to_string(),
+        }],
+        sys_hash,
+    )).await;
+    cache.save_to_file().await;
+    assert!(path.exists());
+
+    // Invalidate and save — file should be deleted
+    cache.invalidate(&key).await;
+    cache.save_to_file().await;
+    assert!(!path.exists());
+}
+
+/// Test: persistence — missing file starts fresh
+#[tokio::test]
+async fn test_persistence_missing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nonexistent.json");
+
+    let cache = ConversationCache::load_from_file(&path).await;
+    assert!(!path.exists());
+    // Should work fine as empty cache
+    let key = CacheKey { key_index: 0 };
+    assert!(cache.get(&key).await.is_none());
+}
