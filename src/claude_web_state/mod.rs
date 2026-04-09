@@ -14,6 +14,7 @@ use wreq::{
     header::{ORIGIN, REFERER},
 };
 use wreq_util::Emulation;
+use serde_json::Value;
 
 use crate::{
     config::{CLAUDE_ENDPOINT, CLEWDR_CONFIG, CookieStatus, Reason},
@@ -242,20 +243,87 @@ impl ClaudeWebState {
         };
         let endpoint = self
             .endpoint
-            .join(&format!(
-                "api/organizations/{}/chat_conversations/{}",
-                org_uuid, conv_uuid
-            ))
-            .expect("Url parse error");
-        debug!("Deleting chat: {}", conv_uuid);
-        let _ = self
-            .build_request(Method::DELETE, endpoint)
+            .join(&format!("api/organizations/{}/usage", org_uuid))
+            .ok()?;
+
+        let res = state
+            .build_request(Method::GET, url)
             .send()
             .await
-            .context(WreqSnafu {
-                msg: "Failed to delete chat conversation",
-            });
-        Ok(())
+            .inspect_err(|e| {
+                warn!("fetch_web_usage: request failed for {}: {}", cookie.cookie, e);
+            })
+            .ok()?;
+
+        res.json::<Value>()
+            .await
+            .inspect_err(|e| {
+                warn!("fetch_web_usage: parse failed for {}: {}", cookie.cookie, e);
+            })
+            .ok()
+    }
+
+    fn cache_key(&self) -> CacheKey {
+        CacheKey {
+            key_index: self.key.map(|(_, idx)| idx).unwrap_or(0),
+        }
+    }
+
+    fn cookie_id(&self) -> String {
+        self.cookie.as_ref()
+            .map(|c| c.cookie.to_string())
+            .unwrap_or_default()
+    }
+
+    /// Fetch usage data via the claude.ai web endpoint.
+    /// Used as a fallback when the OAuth usage endpoint is not available (e.g. Without Claude Code Access).
+    pub async fn fetch_web_usage(
+        handle: CookieActorHandle,
+        cookie: CookieStatus,
+    ) -> Option<Value> {
+        let mut state = ClaudeWebState::new(handle);
+        state.cookie = Some(cookie.clone());
+        state.proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();
+        state.endpoint = CLEWDR_CONFIG.load().endpoint();
+        let mut client = Client::builder()
+            .cookie_store(true)
+            .emulation(Emulation::Chrome136);
+        if let Some(ref proxy) = state.proxy {
+            client = client.proxy(proxy.to_owned());
+        }
+        state.client = client.build().ok()?;
+        state.cookie_header_value =
+            HeaderValue::from_str(cookie.cookie.to_string().as_str()).ok()?;
+
+        if let Err(e) = state.bootstrap().await {
+            warn!(
+                "fetch_web_usage: bootstrap failed for {}: {}",
+                cookie.cookie, e
+            );
+            return None;
+        }
+
+        let org_uuid = state.org_uuid.as_ref()?;
+        let url = state
+            .endpoint
+            .join(&format!("api/organizations/{}/usage", org_uuid))
+            .ok()?;
+
+        let res = state
+            .build_request(Method::GET, url)
+            .send()
+            .await
+            .inspect_err(|e| {
+                warn!("fetch_web_usage: request failed for {}: {}", cookie.cookie, e);
+            })
+            .ok()?;
+
+        res.json::<Value>()
+            .await
+            .inspect_err(|e| {
+                warn!("fetch_web_usage: parse failed for {}: {}", cookie.cookie, e);
+            })
+            .ok()
     }
 
     fn cache_key(&self) -> CacheKey {

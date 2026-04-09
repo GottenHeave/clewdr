@@ -232,6 +232,7 @@ impl ClaudeWebState {
                 org_uuid
             ))
             .expect("Url parse error");
+        let is_temporary = !CLEWDR_CONFIG.load().preserve_chats;
         let body = json!({
             "uuid": new_uuid,
             "name": if is_temporary { "".to_string() } else {
