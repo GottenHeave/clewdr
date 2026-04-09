@@ -11,6 +11,7 @@ use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 use crate::{
     api::*,
     claude_web_state::conversation_cache::ConversationCache,
+    config::CACHE_PATH,
     middleware::{
         RequireAdminAuth, RequireBearerAuth, RequireFlexibleAuth,
         claude::{add_usage_info, apply_stop_sequences, check_overloaded, to_oai},
@@ -37,10 +38,10 @@ impl RouterBuilder {
             .await
             .expect("Failed to start CookieActor");
 
-        // Create shared conversation cache
-        let conv_cache = ConversationCache::new();
+        // Load conversation cache from file (or start fresh)
+        let conv_cache = ConversationCache::load_from_file(&CACHE_PATH).await;
 
-        // Spawn periodic cleanup task (every hour)
+        // Spawn periodic cleanup + save task (every hour)
         let cache_clone = conv_cache.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));

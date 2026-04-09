@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info, warn};
 
 /// Represents one round-trip (ClewdR request → Claude response) in a cached conversation
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CachedTurn {
     /// Hash of each Role::User message's text content sent in this turn.
     /// Turn 0 (full paste) may contain multiple user hashes.
@@ -17,7 +20,7 @@ pub struct CachedTurn {
 }
 
 /// A cached conversation that can be reused across requests
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CachedConversation {
     /// Claude.ai conversation UUID
     pub conv_uuid: String,
@@ -40,7 +43,8 @@ pub struct CachedConversation {
     /// Whether cache is currently valid (set to false on stream errors)
     pub valid: bool,
     /// Shared flag set to true when the SSE stream completes with a stop signal.
-    /// Checked on next reuse; if still false, the previous stream was incomplete.
+    /// Not persisted — defaults to true on load (previous session ended normally).
+    #[serde(skip)]
     pub last_stream_healthy: Arc<AtomicBool>,
 }
 
@@ -59,27 +63,121 @@ impl CachedConversation {
     pub fn truncate_turns(&mut self, from_index: usize) {
         self.turns.truncate(from_index);
     }
+
+    /// Provide a default for `last_stream_healthy` after deserialization
+    fn fix_stream_health(&mut self) {
+        self.last_stream_healthy = Arc::new(AtomicBool::new(true));
+    }
 }
 
 /// Cache key: identifies a unique "conversation slot"
 /// First version: one conversation per (cookie, key_index) pair
 /// This means each downstream API key gets one cached conversation per cookie
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheKey {
     /// Index of the downstream API key in config (from self.key)
     pub key_index: usize,
 }
 
-/// Thread-safe conversation cache
+/// Thread-safe conversation cache with file persistence
 #[derive(Clone)]
 pub struct ConversationCache {
     inner: Arc<Mutex<HashMap<CacheKey, CachedConversation>>>,
+    path: Option<PathBuf>,
 }
 
 impl ConversationCache {
+    /// Create a new in-memory-only cache (no persistence)
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            path: None,
+        }
+    }
+
+    /// Create a cache that persists to the given file path
+    pub fn with_persistence(path: PathBuf) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            path: Some(path),
+        }
+    }
+
+    /// Load cache from file. Returns empty cache on error (file missing, corrupt, etc.)
+    pub async fn load_from_file(path: &Path) -> Self {
+        let cache = Self::with_persistence(path.to_path_buf());
+        if !path.exists() {
+            debug!("[CACHE] no cache file at {}, starting fresh", path.display());
+            return cache;
+        }
+        match tokio::fs::read_to_string(path).await {
+            Ok(text) => {
+                match serde_json::from_str::<HashMap<CacheKey, CachedConversation>>(&text) {
+                    Ok(mut map) => {
+                        // Fix stream health flags after deserialization
+                        for conv in map.values_mut() {
+                            conv.fix_stream_health();
+                        }
+                        // Remove expired/invalid entries on load
+                        map.retain(|_, v| v.valid && !v.is_expired());
+                        let count = map.len();
+                        let mut inner = cache.inner.lock().await;
+                        *inner = map;
+                        info!("[CACHE] loaded {} entry/entries from {}", count, path.display());
+                    }
+                    Err(e) => {
+                        warn!("[CACHE] failed to parse cache file {}: {}, starting fresh", path.display(), e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("[CACHE] failed to read cache file {}: {}, starting fresh", path.display(), e);
+            }
+        }
+        cache
+    }
+
+    /// Persist current cache to file (if persistence is enabled)
+    pub async fn save_to_file(&self) {
+        let Some(ref path) = self.path else { return };
+        let map = self.inner.lock().await;
+
+        // Filter out invalid/expired entries before saving
+        let filtered: HashMap<CacheKey, CachedConversation> = map
+            .iter()
+            .filter(|(_, v)| v.valid && !v.is_expired())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        if filtered.is_empty() {
+            // Delete the file if cache is empty
+            if path.exists() {
+                if let Err(e) = tokio::fs::remove_file(path).await {
+                    debug!("[CACHE] failed to remove empty cache file: {}", e);
+                }
+            }
+            return;
+        }
+
+        match serde_json::to_string_pretty(&filtered) {
+            Ok(json) => {
+                if let Some(parent) = path.parent() {
+                    if !parent.exists() {
+                        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                            error!("[CACHE] failed to create cache dir {}: {}", parent.display(), e);
+                            return;
+                        }
+                    }
+                }
+                if let Err(e) = tokio::fs::write(path, json).await {
+                    error!("[CACHE] failed to write cache file {}: {}", path.display(), e);
+                } else {
+                    debug!("[CACHE] saved {} entry/entries to {}", filtered.len(), path.display());
+                }
+            }
+            Err(e) => {
+                error!("[CACHE] failed to serialize cache: {}", e);
+            }
         }
     }
 
@@ -120,10 +218,12 @@ impl ConversationCache {
         }
     }
 
-    /// Remove expired entries (call periodically)
+    /// Remove expired and invalid entries (call periodically), then persist
     pub async fn cleanup(&self) {
         let mut map = self.inner.lock().await;
         map.retain(|_, v| v.valid && !v.is_expired());
+        drop(map); // release lock before I/O
+        self.save_to_file().await;
     }
 
     /// Invalidate all entries for a given cookie_id (cookie rotation)

@@ -11,6 +11,7 @@ use url::Url;
 use crate::{Args, config::ClewdrConfig};
 
 pub const CONFIG_NAME: &str = "clewdr.toml";
+pub const CACHE_NAME: &str = "conversation_cache.json";
 pub const CLAUDE_ENDPOINT: &str = "https://api.anthropic.com/";
 #[allow(dead_code)]
 pub const CLAUDE_CONSOLE_ENDPOINT: &str = "https://console.anthropic.com/";
@@ -72,6 +73,24 @@ pub static CONFIG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
             .expect("Failed to choose app strategy");
             strategy.in_config_dir(CONFIG_NAME)
         }
+    }
+});
+
+pub static CACHE_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
+    #[cfg(feature = "portable")]
+    {
+        PORTABLE_DIR.join(CACHE_NAME)
+    }
+    #[cfg(feature = "xdg")]
+    {
+        use etcetera::{AppStrategy, AppStrategyArgs, choose_app_strategy};
+        let strategy = choose_app_strategy(AppStrategyArgs {
+            top_level_domain: "org".to_string(),
+            author: "Xerxes-2".to_string(),
+            app_name: "clewdr".to_string(),
+        })
+        .expect("Failed to choose app strategy");
+        strategy.in_data_dir(CACHE_NAME)
     }
 });
 
