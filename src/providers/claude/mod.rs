@@ -8,6 +8,7 @@ use super::LLMProvider;
 use crate::{
     claude_code_state::ClaudeCodeState,
     claude_web_state::ClaudeWebState,
+    claude_web_state::conversation_cache::ConversationCache,
     error::ClewdrError,
     middleware::claude::{ClaudeApiFormat, ClaudeContext},
     services::cookie_actor::CookieActorHandle,
@@ -53,12 +54,14 @@ pub struct ClaudeProviderResponse {
 
 struct ClaudeSharedState {
     cookie_actor_handle: CookieActorHandle,
+    conv_cache: ConversationCache,
 }
 
 impl ClaudeSharedState {
-    fn new(cookie_actor_handle: CookieActorHandle) -> Self {
+    fn new(cookie_actor_handle: CookieActorHandle, conv_cache: ConversationCache) -> Self {
         Self {
             cookie_actor_handle,
+            conv_cache,
         }
     }
 }
@@ -70,8 +73,8 @@ pub struct ClaudeProviders {
 }
 
 impl ClaudeProviders {
-    pub fn new(cookie_actor_handle: CookieActorHandle) -> Self {
-        let shared = Arc::new(ClaudeSharedState::new(cookie_actor_handle));
+    pub fn new(cookie_actor_handle: CookieActorHandle, conv_cache: ConversationCache) -> Self {
+        let shared = Arc::new(ClaudeSharedState::new(cookie_actor_handle, conv_cache));
         let web = Arc::new(ClaudeWebProvider::new(shared.clone()));
         let code = Arc::new(ClaudeCodeProvider::new(shared.clone()));
         Self { web, code }
@@ -103,7 +106,10 @@ impl LLMProvider for ClaudeWebProvider {
     type Output = ClaudeProviderResponse;
 
     async fn invoke(&self, request: Self::Request) -> Result<Self::Output, ClewdrError> {
-        let mut state = ClaudeWebState::new(self.shared.cookie_actor_handle.clone());
+        let mut state = ClaudeWebState::new(
+            self.shared.cookie_actor_handle.clone(),
+            self.shared.conv_cache.clone(),
+        );
         let stream = request.context.is_stream();
         state.api_format = request.context.api_format();
         state.stream = stream;
@@ -212,6 +218,6 @@ impl LLMProvider for ClaudeCodeProvider {
     }
 }
 
-pub fn build_providers(cookie_actor_handle: CookieActorHandle) -> ClaudeProviders {
-    ClaudeProviders::new(cookie_actor_handle)
+pub fn build_providers(cookie_actor_handle: CookieActorHandle, conv_cache: ConversationCache) -> ClaudeProviders {
+    ClaudeProviders::new(cookie_actor_handle, conv_cache)
 }

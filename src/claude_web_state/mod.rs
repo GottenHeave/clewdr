@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use axum::http::{HeaderValue, header::COOKIE};
 use serde_json::Value;
 use snafu::ResultExt;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use url::Url;
 use wreq::{
     Client, Method, Proxy, RequestBuilder,
@@ -21,9 +21,34 @@ use crate::{
 
 pub mod bootstrap;
 pub mod chat;
+pub mod conversation_cache;
+pub mod diff;
 mod transform;
 /// Placeholder
 pub static SUPER_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
+
+use conversation_cache::{CacheKey, CachedConversation, CachedTurn, ConversationCache};
+
+/// Information needed to write cache after a successful response
+#[derive(Clone, Debug)]
+pub enum PendingCacheWrite {
+    /// First request: initialize cache with full conversation info
+    Init {
+        key: CacheKey,
+        conv: CachedConversation,
+    },
+    /// Subsequent request: append a new turn
+    AppendTurn {
+        key: CacheKey,
+        turn: CachedTurn,
+    },
+    /// Fork: truncate and append
+    ForkAndAppend {
+        key: CacheKey,
+        fork_turn_index: usize,
+        turn: CachedTurn,
+    },
+}
 
 /// State of current connection
 #[derive(Clone)]
@@ -41,13 +66,17 @@ pub struct ClaudeWebState {
     pub client: Client,
     pub key: Option<(u64, usize)>,
     pub usage: Usage,
-    // keep the last request params for potential post-call token accounting
+    // keep the last request params for possible post-call token accounting
     pub last_params: Option<CreateMessageParams>,
+    /// Shared conversation cache for reuse across requests
+    pub conv_cache: ConversationCache,
+    /// Pending cache write info (set by send_chat, consumed after success)
+    pub pending_cache_write: Option<PendingCacheWrite>,
 }
 
 impl ClaudeWebState {
     /// Create a new AppState instance
-    pub fn new(cookie_actor_handle: CookieActorHandle) -> Self {
+    pub fn new(cookie_actor_handle: CookieActorHandle, conv_cache: ConversationCache) -> Self {
         ClaudeWebState {
             cookie_actor_handle,
             cookie: None,
@@ -63,6 +92,8 @@ impl ClaudeWebState {
             key: None,
             usage: Usage::default(),
             last_params: None,
+            conv_cache,
+            pending_cache_write: None,
         }
     }
 
@@ -140,6 +171,10 @@ impl ClaudeWebState {
     pub async fn return_cookie(&self, reason: Option<Reason>) {
         // return the cookie to the cookie manager
         if let Some(ref cookie) = self.cookie {
+            // Invalidate cache for this cookie if there's a reason (cookie changed)
+            if reason.is_some() {
+                self.conv_cache.invalidate_by_cookie(&cookie.cookie.to_string()).await;
+            }
             self.cookie_actor_handle
                 .return_cookie(cookie.to_owned(), reason)
                 .await
@@ -181,7 +216,7 @@ impl ClaudeWebState {
     /// Fetch usage data via the claude.ai web endpoint.
     /// Used as a fallback when the OAuth usage endpoint is not available (e.g. Without Claude Code Access).
     pub async fn fetch_web_usage(handle: CookieActorHandle, cookie: CookieStatus) -> Option<Value> {
-        let mut state = ClaudeWebState::new(handle);
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
         state.cookie = Some(cookie.clone());
         state.proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();
         state.endpoint = CLEWDR_CONFIG.load().endpoint();
@@ -196,7 +231,6 @@ impl ClaudeWebState {
             );
             return None;
         }
-
         let org_uuid = state.org_uuid.as_ref()?;
         let url = state
             .endpoint
@@ -221,5 +255,49 @@ impl ClaudeWebState {
                 warn!("fetch_web_usage: parse failed for {}: {}", cookie.cookie, e);
             })
             .ok()
+    }
+
+    /// Deletes the current chat conversation based on configuration.
+    pub async fn clean_chat(&self) -> Result<(), ClewdrError> {
+        if CLEWDR_CONFIG.load().preserve_chats {
+            return Ok(());
+        }
+        if CLEWDR_CONFIG.load().reuse_conversation {
+            return Ok(());
+        }
+        let Some(ref org_uuid) = self.org_uuid else {
+            return Ok(());
+        };
+        let Some(ref conv_uuid) = self.conv_uuid else {
+            return Ok(());
+        };
+        let endpoint = self
+            .endpoint
+            .join(&format!(
+                "api/organizations/{}/chat_conversations/{}",
+                org_uuid, conv_uuid
+            ))
+            .expect("Url parse error");
+        debug!("Deleting chat: {}", conv_uuid);
+        let _ = self
+            .build_request(Method::DELETE, endpoint)
+            .send()
+            .await
+            .context(WreqSnafu {
+                msg: "Failed to delete chat conversation",
+            });
+        Ok(())
+    }
+
+    fn cache_key(&self) -> CacheKey {
+        CacheKey {
+            key_index: self.key.map(|(_, idx)| idx).unwrap_or(0),
+        }
+    }
+
+    fn cookie_id(&self) -> String {
+        self.cookie.as_ref()
+            .map(|c| c.cookie.to_string())
+            .unwrap_or_default()
     }
 }

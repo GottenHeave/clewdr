@@ -46,6 +46,8 @@ impl ClaudeWebState {
             timezone: TIME_ZONE.to_string(),
             images: merged.images,
             tools,
+            parent_message_uuid: None,
+            turn_message_uuids: None,
         })
     }
 

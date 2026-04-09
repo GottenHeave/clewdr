@@ -29,6 +29,13 @@ impl Attachment {
     }
 }
 
+/// Client-generated UUIDs for a single turn's messages
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TurnMessageUuids {
+    pub human_message_uuid: String,
+    pub assistant_message_uuid: String,
+}
+
 /// Request body to be sent to the Claude.ai
 #[derive(Deserialize, Serialize, Debug)]
 pub struct WebRequestBody {
@@ -43,6 +50,12 @@ pub struct WebRequestBody {
     #[serde(skip)]
     pub images: Vec<ImageSource>,
     pub tools: Vec<Tool>,
+    /// Parent message UUID for conversation continuation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_message_uuid: Option<String>,
+    /// Client-generated UUIDs for this turn's messages
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_message_uuids: Option<TurnMessageUuids>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
