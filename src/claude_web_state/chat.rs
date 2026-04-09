@@ -1,3 +1,6 @@
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
 use colored::Colorize;
 use futures::TryFutureExt;
 use serde_json::json;
@@ -59,6 +62,15 @@ impl ClaudeWebState {
             }
             let mut state = self.to_owned();
             let p = p.to_owned();
+
+            // Create shared stream health flag for monitoring SSE completion
+            let can_reuse = CLEWDR_CONFIG.load().reuse_conversation
+                && !CLEWDR_CONFIG.load().preserve_chats;
+            if can_reuse {
+                let flag = Arc::new(AtomicBool::new(false));
+                state.stream_health_flag = Some(flag.clone());
+                self.stream_health_flag = Some(flag);
+            }
 
             let cookie = state.request_cookie().await?;
             // check if request is successful
@@ -143,6 +155,13 @@ impl ClaudeWebState {
     ) -> Option<Result<Response, ClewdrError>> {
         let key = self.cache_key();
         let cached = self.conv_cache.get(&key).await?;
+
+        // Check stream health from previous request
+        if !self.conv_cache.is_last_stream_healthy(&key).await {
+            info!("[CACHE] last stream was unhealthy, invalidating");
+            self.conv_cache.invalidate(&key).await;
+            return None;
+        }
 
         // Validate: cookie must match
         if cached.cookie_id != self.cookie_id() {
@@ -314,6 +333,8 @@ impl ClaudeWebState {
             let user_hashes = extract_user_hashes(&p.messages)
                 .iter().map(|(_, h)| *h).collect();
             let sys_hash = hash_system(&p.system);
+            let stream_flag = self.stream_health_flag.clone()
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
 
             self.pending_cache_write = Some(PendingCacheWrite::Init {
                 key: self.cache_key(),
@@ -331,6 +352,7 @@ impl ClaudeWebState {
                     created_at: chrono::Utc::now(),
                     last_used: chrono::Utc::now(),
                     valid: true,
+                    last_stream_healthy: stream_flag,
                 },
             });
         }
@@ -591,11 +613,19 @@ impl ClaudeWebState {
             PendingCacheWrite::AppendTurn { key, turn } => {
                 info!("[CACHE] appended turn (assistant={})", turn.assistant_uuid);
                 self.conv_cache.append_turn(&key, turn).await;
+                // Update stream health flag for the new request
+                if let Some(flag) = self.stream_health_flag.as_ref() {
+                    self.conv_cache.update_stream_health(&key, flag.clone()).await;
+                }
             }
             PendingCacheWrite::ForkAndAppend { key, fork_turn_index, turn } => {
                 info!("[CACHE] forked at turn {}, new assistant={}",
                     fork_turn_index, turn.assistant_uuid);
                 self.conv_cache.fork_and_append(&key, fork_turn_index, turn).await;
+                // Update stream health flag for the new request
+                if let Some(flag) = self.stream_health_flag.as_ref() {
+                    self.conv_cache.update_stream_health(&key, flag.clone()).await;
+                }
             }
         }
     }

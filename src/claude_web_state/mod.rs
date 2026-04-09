@@ -1,4 +1,6 @@
 use std::sync::LazyLock;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use axum::http::{HeaderValue, header::COOKIE};
 use serde_json::Value;
@@ -72,6 +74,10 @@ pub struct ClaudeWebState {
     pub conv_cache: ConversationCache,
     /// Pending cache write info (set by send_chat, consumed after success)
     pub pending_cache_write: Option<PendingCacheWrite>,
+    /// Shared flag for monitoring stream health.
+    /// Set to true when the SSE stream completes with a proper stop signal.
+    /// Checked on next cache reuse attempt.
+    pub stream_health_flag: Option<Arc<AtomicBool>>,
 }
 
 impl ClaudeWebState {
@@ -94,6 +100,7 @@ impl ClaudeWebState {
             last_params: None,
             conv_cache,
             pending_cache_write: None,
+            stream_health_flag: None,
         }
     }
 
