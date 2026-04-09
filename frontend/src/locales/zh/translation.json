@@ -152,7 +152,8 @@
         "preserveChats": "保留聊天",
         "webSearch": "网页搜索",
         "webCountTokens": "允许 Web 渠道调用 count_tokens",
-        "sanitizeMessages": "消息清理（去除空白）"
+        "sanitizeMessages": "消息清理（去除空白）",
+        "reuseConversation": "复用对话（减少输入 Token 消耗）"
       },
       "cookie": {
         "title": "Cookie设置",
