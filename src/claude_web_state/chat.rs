@@ -111,12 +111,27 @@ impl ClaudeWebState {
                 org_uuid
             ))
             .expect("Url parse error");
+        let is_temporary = !CLEWDR_CONFIG.load().preserve_chats;
         let body = json!({
             "uuid": new_uuid,
-            "name": format!("ClewdR-{}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")),
+            "name": if is_temporary { "".to_string() } else { format!("ClewdR-{}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")) },
+            "is_temporary": is_temporary,
         });
 
+        let referer = if is_temporary {
+            self.endpoint
+                .join("new?incognito")
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| format!("{}new?incognito", crate::config::CLAUDE_ENDPOINT))
+        } else {
+            self.endpoint
+                .join("new")
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| format!("{}new", crate::config::CLAUDE_ENDPOINT))
+        };
+
         self.build_request(Method::POST, endpoint)
+            .header(wreq::header::REFERER, referer)
             .json(&body)
             .send()
             .await
