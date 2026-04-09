@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use chrono::{DateTime, Duration, Utc};
 
@@ -38,6 +39,9 @@ pub struct CachedConversation {
     pub last_used: DateTime<Utc>,
     /// Whether cache is currently valid (set to false on stream errors)
     pub valid: bool,
+    /// Shared flag set to true when the SSE stream completes with a stop signal.
+    /// Checked on next reuse; if still false, the previous stream was incomplete.
+    pub last_stream_healthy: Arc<AtomicBool>,
 }
 
 impl CachedConversation {
@@ -130,5 +134,21 @@ impl ConversationCache {
                 conv.valid = false;
             }
         }
+    }
+
+    /// Update the stream health flag on an existing cached conversation
+    pub async fn update_stream_health(&self, key: &CacheKey, flag: Arc<AtomicBool>) {
+        let mut map = self.inner.lock().await;
+        if let Some(conv) = map.get_mut(key) {
+            conv.last_stream_healthy = flag;
+        }
+    }
+
+    /// Check if the last stream completed healthily for a given cache key
+    pub async fn is_last_stream_healthy(&self, key: &CacheKey) -> bool {
+        let map = self.inner.lock().await;
+        map.get(key)
+            .map(|c| c.last_stream_healthy.load(Ordering::Relaxed))
+            .unwrap_or(true)
     }
 }

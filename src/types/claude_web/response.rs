@@ -7,6 +7,7 @@ use bytes::Bytes;
 use eventsource_stream::{EventStream, Eventsource};
 use futures::{Stream, TryStreamExt};
 use serde::Deserialize;
+use std::sync::atomic::Ordering;
 use url::Url;
 use wreq::Proxy;
 
@@ -78,6 +79,9 @@ impl ClaudeWebState {
         &mut self,
         wreq_res: wreq::Response,
     ) -> Result<axum::response::Response, ClewdrError> {
+        // Take the stream health flag so it can be moved into the stream wrapper
+        let stream_health_flag = self.stream_health_flag.take();
+
         if self.stream {
             // Stream through while accumulating completion text; persist usage at end
             let mut input_tokens = self.usage.input_tokens as u64;
@@ -111,6 +115,10 @@ impl ClaudeWebState {
                     let e = SseEvent::default().event(event.event).id(event.id);
                     let e = if let Some(retry) = event.retry { e.retry(retry) } else { e };
                     yield e.data(event.data);
+                }
+                // Stream completed successfully — mark as healthy
+                if let Some(flag) = stream_health_flag.as_ref() {
+                    flag.store(true, Ordering::Relaxed);
                 }
                 // on end of stream, compute output tokens and persist totals
                 if !acc.is_empty() {
@@ -177,6 +185,12 @@ impl ClaudeWebState {
         let stream = wreq_res.bytes_stream();
         let stream = stream.eventsource();
         let text = merge_sse(stream).await?;
+
+        // Non-streaming: full response received successfully — mark as healthy
+        if let Some(flag) = stream_health_flag.as_ref() {
+            flag.store(true, Ordering::Relaxed);
+        }
+
         print_out_text(text.to_owned(), "claude_web_non_stream.txt");
         let mut response =
             CreateMessageResponse::text(text.clone(), Default::default(), self.usage.to_owned());
