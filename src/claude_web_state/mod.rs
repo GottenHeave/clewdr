@@ -12,6 +12,7 @@ use wreq::{
     header::{ORIGIN, REFERER},
 };
 use wreq_util::Emulation;
+use serde_json::Value;
 
 use crate::{
     config::{CLAUDE_ENDPOINT, CLEWDR_CONFIG, CookieStatus, Reason},
@@ -210,5 +211,56 @@ impl ClaudeWebState {
                 msg: "Failed to delete chat conversation",
             });
         Ok(())
+    }
+
+    /// Fetch usage data via the claude.ai web endpoint.
+    /// Used as a fallback when the OAuth usage endpoint is not available (e.g. Without Claude Code Access).
+    pub async fn fetch_web_usage(
+        handle: CookieActorHandle,
+        cookie: CookieStatus,
+    ) -> Option<Value> {
+        let mut state = ClaudeWebState::new(handle);
+        state.cookie = Some(cookie.clone());
+        state.proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();
+        state.endpoint = CLEWDR_CONFIG.load().endpoint();
+        let mut client = Client::builder()
+            .cookie_store(true)
+            .emulation(Emulation::Chrome136);
+        if let Some(ref proxy) = state.proxy {
+            client = client.proxy(proxy.to_owned());
+        }
+        state.client = client.build().ok()?;
+        state.cookie_header_value =
+            HeaderValue::from_str(cookie.cookie.to_string().as_str()).ok()?;
+
+        if let Err(e) = state.bootstrap().await {
+            warn!(
+                "fetch_web_usage: bootstrap failed for {}: {}",
+                cookie.cookie, e
+            );
+            return None;
+        }
+
+        let org_uuid = state.org_uuid.as_ref()?;
+        let url = state
+            .endpoint
+            .join(&format!("api/organizations/{}/usage", org_uuid))
+            .ok()?;
+
+        let res = state
+            .build_request(Method::GET, url)
+            .send()
+            .await
+            .inspect_err(|e| {
+                warn!("fetch_web_usage: request failed for {}: {}", cookie.cookie, e);
+            })
+            .ok()?;
+
+        res.json::<Value>()
+            .await
+            .inspect_err(|e| {
+                warn!("fetch_web_usage: parse failed for {}: {}", cookie.cookie, e);
+            })
+            .ok()
     }
 }
