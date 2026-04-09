@@ -139,5 +139,10 @@ pub const fn default_skip_cool_down() -> bool {
     true
 }
 
+/// Default value for boolean flags that default to true
+pub const fn default_true() -> bool {
+    true
+}
+
 /// Default cookie value for testing purposes
 pub const PLACEHOLDER_COOKIE: &str = "sk-ant-sidXX----------------------------SET_YOUR_COOKIE_HERE----------------------------------------AAAAAAAA";
