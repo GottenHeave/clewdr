@@ -146,6 +146,13 @@ const ConfigForm: React.FC<ConfigFormProps> = ({ config, onChange }) => {
             onChange={onChange}
             label={t("config.sections.api.sanitizeMessages")}
           />
+
+          <ConfigCheckbox
+            name="reuse_conversation"
+            checked={config.reuse_conversation}
+            onChange={onChange}
+            label={t("config.sections.api.reuseConversation")}
+          />
         </div>
       </ConfigSection>
 
