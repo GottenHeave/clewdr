@@ -51,7 +51,12 @@ where
 /// Result indicating success or failure of the application execution
 #[tokio::main]
 async fn main() -> Result<(), ClewdrError> {
-    // Ensure aws-lc crypto provider is installed before rustls usage (yup-oauth2 / hyper-rustls)
+    // Ensure a crypto provider is installed before rustls usage (yup-oauth2 / hyper-rustls).
+    #[cfg(target_os = "android")]
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install ring crypto provider");
+    #[cfg(not(target_os = "android"))]
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install aws-lc crypto provider");

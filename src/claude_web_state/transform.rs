@@ -54,14 +54,13 @@ impl ClaudeWebState {
         // upload images
         stream::iter(imgs)
             .filter_map(async |img| {
-                // check if the image is base64
-                if img.type_ != "base64" {
+                let ImageSource::Base64 { media_type, data } = img else {
                     warn!("Image type is not base64");
                     return None;
-                }
+                };
                 // decode the image
                 let bytes = BASE64_STANDARD
-                    .decode(img.data)
+                    .decode(data)
                     .inspect_err(|e| {
                         warn!("Failed to decode image: {}", e);
                     })
@@ -163,10 +162,24 @@ fn merge_messages(msgs: Vec<Message>, system: String) -> Option<Merged> {
                 let blocks = content
                     .into_iter()
                     .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.trim().to_string()),
-                        ContentBlock::Image { source } => {
-                            // push image to the list
-                            imgs.push(source);
+                        ContentBlock::Text { text, .. } => Some(text.trim().to_string()),
+                        ContentBlock::Image { source, .. } => {
+                            match source {
+                                ImageSource::Base64 { .. } => {
+                                    // push image to the list
+                                    imgs.push(source);
+                                }
+                                ImageSource::Url { url } => {
+                                    if let Some(source) = extract_image_from_url(&url) {
+                                        imgs.push(source);
+                                    } else {
+                                        warn!("Unsupported image url source");
+                                    }
+                                }
+                                ImageSource::File { .. } => {
+                                    warn!("Image file sources are not supported");
+                                }
+                            }
                             None
                         }
                         ContentBlock::ImageUrl { image_url } => {

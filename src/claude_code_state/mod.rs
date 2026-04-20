@@ -3,16 +3,16 @@ mod exchange;
 mod organization;
 use http::{
     HeaderValue, Method,
-    header::{ORIGIN, REFERER},
+    header::{COOKIE, ORIGIN, REFERER, USER_AGENT},
 };
 use snafu::ResultExt;
 use tracing::error;
-use wreq::{ClientBuilder, IntoUrl, RequestBuilder};
+use wreq::RequestBuilder;
 use wreq_util::Emulation;
 
 use crate::{
     claude_web_state::SUPER_CLIENT,
-    config::{CLAUDE_ENDPOINT, CLEWDR_CONFIG, CookieStatus, Reason},
+    config::{CLAUDE_CODE_USER_AGENT, CLAUDE_ENDPOINT, CLEWDR_CONFIG, CookieStatus, Reason},
     error::{ClewdrError, WreqSnafu},
     middleware::claude::ClaudeApiFormat,
     services::cookie_actor::CookieActorHandle,
@@ -30,6 +30,7 @@ pub struct ClaudeCodeState {
     pub api_format: ClaudeApiFormat,
     pub stream: bool,
     pub system_prompt_hash: Option<u64>,
+    pub anthropic_beta_header: Option<String>,
     pub usage: Usage,
 }
 
@@ -46,6 +47,7 @@ impl ClaudeCodeState {
             api_format: ClaudeApiFormat::Claude,
             stream: false,
             system_prompt_hash: None,
+            anthropic_beta_header: None,
             usage: Usage::default(),
         }
     }
@@ -67,7 +69,7 @@ impl ClaudeCodeState {
             .to_string();
         let header_value = HeaderValue::from_str(cookie_value.as_str())?;
         state.cookie_header_value = header_value.clone();
-        let mut client = ClientBuilder::new()
+        let mut client = wreq::Client::builder()
             .cookie_store(true)
             .emulation(Emulation::Chrome136);
         if let Some(ref proxy) = state.proxy {
@@ -76,7 +78,6 @@ impl ClaudeCodeState {
         state.client = client.build().context(WreqSnafu {
             msg: "Failed to build client for cookie",
         })?;
-        state.client.set_cookie(&state.endpoint, &header_value);
         Ok(state)
     }
 
@@ -95,14 +96,18 @@ impl ClaudeCodeState {
     }
 
     /// Build a request with the current cookie and proxy settings
-    pub fn build_request(&self, method: Method, url: impl IntoUrl) -> RequestBuilder {
+    pub fn build_request(&self, method: Method, url: impl ToString) -> RequestBuilder {
         // let r = SUPER_CLIENT.cloned();
-        self.client
-            .set_cookie(&self.endpoint, &self.cookie_header_value);
-        self.client
-            .request(method, url)
+        let mut req = self
+            .client
+            .request(method, url.to_string())
             .header(ORIGIN, CLAUDE_ENDPOINT)
             .header(REFERER, format!("{CLAUDE_ENDPOINT}new"))
+            .header(USER_AGENT, CLAUDE_CODE_USER_AGENT);
+        if !self.cookie_header_value.as_bytes().is_empty() {
+            req = req.header(COOKIE, self.cookie_header_value.clone());
+        }
+        req
     }
 
     /// Set the cookie header value
@@ -122,7 +127,7 @@ impl ClaudeCodeState {
         // Always pull latest proxy/endpoint before building the client
         self.proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();
         self.endpoint = CLEWDR_CONFIG.load().endpoint();
-        let mut client = ClientBuilder::new()
+        let mut client = wreq::Client::builder()
             .cookie_store(true)
             .emulation(Emulation::Chrome136);
         if let Some(ref proxy) = self.proxy {

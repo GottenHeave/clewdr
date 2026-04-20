@@ -12,11 +12,9 @@ const CookieValue: React.FC<CookieValueProps> = ({ cookie }) => {
 
   if (!cookie) return null;
 
-  // Clean cookie value for display
-  const cleanCookie = cookie.replace(/sessionKey=sk-ant-sid01-/, "");
   const displayText = isExpanded
-    ? cleanCookie
-    : `${cleanCookie.substring(0, 30)}${cleanCookie.length > 30 ? "..." : ""}`;
+    ? cookie
+    : `${cookie.substring(0, 30)}${cookie.length > 30 ? "..." : ""}`;
 
   const copyToClipboard = (text: string, event: React.MouseEvent) => {
     event.stopPropagation();
@@ -39,7 +37,7 @@ const CookieValue: React.FC<CookieValueProps> = ({ cookie }) => {
         >
           {displayText}
         </code>
-        {cleanCookie.length > 30 && (
+        {cookie.length > 30 && (
           <span className="ml-2 text-gray-500 flex-shrink-0">
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -59,7 +57,7 @@ const CookieValue: React.FC<CookieValueProps> = ({ cookie }) => {
         )}
       </div>
       <button
-        onClick={(e) => copyToClipboard(cleanCookie, e)}
+        onClick={(e) => copyToClipboard(cookie, e)}
         className="p-1 bg-gray-700 hover:bg-gray-600 rounded text-xs text-gray-300 focus:outline-none flex-shrink-0"
         title={t("cookieStatus.copy")}
       >

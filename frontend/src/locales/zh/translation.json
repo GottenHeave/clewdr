@@ -82,12 +82,6 @@
         "unknown": "未知"
       }
     },
-    "context": {
-      "label": "1M 上下文",
-      "enabled": "已启用 1M 上下文",
-      "disabled": "未开通 1M 上下文",
-      "unknown": "尚未探测 1M 上下文"
-    },
     "usage": {
       "currentInput": "本轮输入 Token",
       "currentOutput": "本轮输出 Token",
@@ -108,6 +102,14 @@
     },
     "meta": {
       "summary": "查看详情"
+    },
+    "context": {
+      "title": "1M 开关",
+      "sonnetLane": "Sonnet 1M",
+      "opusLane": "Opus 1M",
+      "modeEnabled": "开启",
+      "modeDisabled": "关闭",
+      "saving": "保存中..."
     },
     "noCookies": "没有{{type}}",
     "deleteConfirm": "您确定要删除此cookie吗？",
@@ -149,7 +151,8 @@
         "maxRetries": "最大重试次数",
         "preserveChats": "保留聊天",
         "webSearch": "网页搜索",
-        "webCountTokens": "允许 Web 渠道调用 count_tokens"
+        "webCountTokens": "允许 Web 渠道调用 count_tokens",
+        "sanitizeMessages": "消息清理（去除空白）"
       },
       "cookie": {
         "title": "Cookie设置",
@@ -165,7 +168,10 @@
         "realRoles": "使用真实角色",
         "customH": "自定义 Human（可选）",
         "customA": "自定义 Assistant（可选）",
-        "customPrompt": "自定义提示词"
+        "customPrompt": "Claude Web 自定义提示词",
+        "customPromptPlaceholder": "仅用于 Claude Web 请求体里的 prompt 字段",
+        "customSystem": "前置系统提示词（Claude Code/API）",
+        "customSystemPlaceholder": "会 prepend 到上游 system 前面；留空则关闭"
       }
     }
   },

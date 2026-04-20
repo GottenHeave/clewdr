@@ -74,8 +74,8 @@ CLEWDR_ADMIN_PASSWORD=your_admin_password
 ```
 (async function() {
   const raw = `
-sk-ant-sid01-CV27
-sk-ant-sid01-XYZ9
+sk-ant-sidXX-CV27
+sk-ant-sidXX-XYZ9
 `.trim(); // ← 替换为你的 cookie 原始输入
 
   const cookies = raw

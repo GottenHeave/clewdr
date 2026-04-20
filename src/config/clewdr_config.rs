@@ -16,7 +16,8 @@ use passwords::PasswordGenerator;
 use serde::{Deserialize, Serialize};
 use tokio::spawn;
 use tracing::error;
-use wreq::{Proxy, Url};
+use url::Url;
+use wreq::Proxy;
 
 use super::{CONFIG_PATH, ENDPOINT_URL};
 use crate::{
@@ -94,6 +95,8 @@ pub struct ClewdrConfig {
     pub web_search: bool,
     #[serde(default)]
     pub enable_web_count_tokens: bool,
+    #[serde(default)]
+    pub sanitize_messages: bool,
 
     // Cookie settings, can hot reload
     #[serde(default)]
@@ -152,6 +155,7 @@ impl Default for ClewdrConfig {
             preserve_chats: false,
             web_search: false,
             enable_web_count_tokens: false,
+            sanitize_messages: false,
             skip_first_warning: false,
             skip_second_warning: false,
             skip_restricted: false,

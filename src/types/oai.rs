@@ -57,7 +57,7 @@ impl From<CreateMessageParams> for ClaudeCreateMessageParams {
             .into_iter()
             .map(|m| m.content)
             .flat_map(|c| match c {
-                MessageContent::Text { content } => vec![ContentBlock::Text { text: content }],
+                MessageContent::Text { content } => vec![ContentBlock::text(content)],
                 MessageContent::Blocks { content } => content,
             })
             .filter_map(normalize_block)
@@ -73,6 +73,9 @@ impl From<CreateMessageParams> for ClaudeCreateMessageParams {
             system,
             messages,
             model: params.model,
+            container: None,
+            context_management: None,
+            mcp_servers: None,
             stop_sequences: params.stop,
             thinking: params
                 .thinking
@@ -84,6 +87,9 @@ impl From<CreateMessageParams> for ClaudeCreateMessageParams {
             tools: params.tools,
             tool_choice: params.tool_choice,
             metadata: params.metadata,
+            output_config: None,
+            output_format: None,
+            service_tier: None,
             n: params.n,
         }
     }
@@ -152,7 +158,7 @@ impl CreateMessageParams {
                 MessageContent::Blocks { ref content } => content
                     .iter()
                     .map(|block| match block {
-                        ContentBlock::Text { text } => text,
+                        ContentBlock::Text { text, .. } => text,
                         _ => "",
                     })
                     .collect::<String>(),

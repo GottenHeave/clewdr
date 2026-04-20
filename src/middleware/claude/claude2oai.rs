@@ -101,7 +101,7 @@ pub fn transforms_json(input: CreateMessageResponse) -> Value {
         .content
         .iter()
         .filter_map(|block| match block {
-            crate::types::claude::ContentBlock::Text { text } => Some(text.clone()),
+            crate::types::claude::ContentBlock::Text { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect::<String>();
@@ -119,7 +119,9 @@ pub fn transforms_json(input: CreateMessageResponse) -> Value {
         Some(crate::types::claude::StopReason::MaxTokens) => "length",
         Some(crate::types::claude::StopReason::StopSequence) => "stop",
         Some(crate::types::claude::StopReason::ToolUse) => "tool_calls",
+        Some(crate::types::claude::StopReason::PauseTurn) => "stop",
         Some(crate::types::claude::StopReason::Refusal) => "content_filter",
+        Some(crate::types::claude::StopReason::ModelContextWindowExceeded) => "length",
         None => "stop",
     };
 

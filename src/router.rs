@@ -1,5 +1,6 @@
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     http::Method,
     middleware::{from_extractor, map_response},
     routing::{delete, get, post},
@@ -10,7 +11,7 @@ use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 use crate::{
     api::*,
     middleware::{
-        RequireAdminAuth, RequireBearerAuth, RequireXApiKeyAuth,
+        RequireAdminAuth, RequireBearerAuth, RequireFlexibleAuth,
         claude::{add_usage_info, apply_stop_sequences, check_overloaded, to_oai},
     },
     providers::claude::ClaudeProviders,
@@ -61,7 +62,7 @@ impl RouterBuilder {
             .route("/v1/messages", post(api_claude_web))
             .layer(
                 ServiceBuilder::new()
-                    .layer(from_extractor::<RequireXApiKeyAuth>())
+                    .layer(from_extractor::<RequireFlexibleAuth>())
                     .layer(CompressionLayer::new())
                     .layer(map_response(add_usage_info))
                     .layer(map_response(apply_stop_sequences))
@@ -82,7 +83,7 @@ impl RouterBuilder {
             )
             .layer(
                 ServiceBuilder::new()
-                    .layer(from_extractor::<RequireXApiKeyAuth>())
+                    .layer(from_extractor::<RequireFlexibleAuth>())
                     .layer(CompressionLayer::new()),
             )
             .with_state(self.claude_providers.code());
@@ -94,7 +95,12 @@ impl RouterBuilder {
     fn route_admin_endpoints(mut self) -> Self {
         let cookie_router = Router::new()
             .route("/cookies", get(api_get_cookies))
-            .route("/cookie", delete(api_delete_cookie).post(api_post_cookie))
+            .route(
+                "/cookie",
+                delete(api_delete_cookie)
+                    .post(api_post_cookie)
+                    .put(api_put_cookie),
+            )
             .with_state(self.cookie_actor_handle.to_owned());
         let admin_router = Router::new()
             .route("/auth", get(api_auth))
@@ -174,7 +180,7 @@ impl RouterBuilder {
 
         let cors = CorsLayer::new()
             .allow_origin(tower_http::cors::Any)
-            .allow_methods([Method::GET, Method::POST, Method::DELETE])
+            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
             .allow_headers([
                 AUTHORIZATION,
                 CONTENT_TYPE,
@@ -197,6 +203,6 @@ impl RouterBuilder {
     /// Returns the configured router
     /// Finalizes the router configuration for use with axum
     pub fn build(self) -> Router {
-        self.inner
+        self.inner.layer(DefaultBodyLimit::max(32 * 1024 * 1024))
     }
 }

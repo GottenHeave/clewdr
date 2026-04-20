@@ -1,4 +1,5 @@
 use std::{
+    env,
     hash::{DefaultHasher, Hash, Hasher},
     mem,
     sync::LazyLock,
@@ -9,11 +10,12 @@ use axum::{
     Json,
     extract::{FromRequest, Request},
 };
-use http::header::USER_AGENT;
+use http::HeaderMap;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::{
-    config::CLEWDR_CONFIG,
+    config::{CLAUDE_CODE_BILLING_SALT, CLAUDE_CODE_VERSION, CLEWDR_CONFIG},
     error::ClewdrError,
     middleware::claude::{ClaudeApiFormat, ClaudeContext},
     types::{
@@ -62,19 +64,150 @@ pub struct ClaudeWebContext {
 /// This is a standard test message sent by clients like SillyTavern
 /// to verify connectivity. The system detects these messages and
 /// responds with a predefined test response to confirm service availability.
-static TEST_MESSAGE_CLAUDE: LazyLock<Message> = LazyLock::new(|| {
-    Message::new_blocks(
-        Role::User,
-        vec![ContentBlock::Text {
-            text: "Hi".to_string(),
-        }],
-    )
-});
+static TEST_MESSAGE_CLAUDE: LazyLock<Message> =
+    LazyLock::new(|| Message::new_blocks(Role::User, vec![ContentBlock::text("Hi")]));
 
 /// Predefined test message in OpenAI format for connection testing
 static TEST_MESSAGE_OAI: LazyLock<Message> = LazyLock::new(|| Message::new_text(Role::User, "Hi"));
 
 struct NormalizeRequest(CreateMessageParams, ClaudeApiFormat);
+
+const CLAUDE_CODE_ENTRYPOINT_ENV: &str = "CLAUDE_CODE_ENTRYPOINT";
+
+fn prepend_system_blocks(body: &mut CreateMessageParams, blocks: Vec<ContentBlock>) {
+    if blocks.is_empty() {
+        return;
+    }
+
+    let mut prefixed = blocks
+        .into_iter()
+        .map(|block| json!(block))
+        .collect::<Vec<_>>();
+    match body.system.take() {
+        Some(Value::String(text)) if !text.trim().is_empty() => {
+            prefixed.push(json!(ContentBlock::text(text)));
+        }
+        Some(Value::Array(mut systems)) => {
+            prefixed.append(&mut systems);
+        }
+        Some(Value::Null) | None => {}
+        Some(other) => prefixed.push(other),
+    }
+    body.system = Some(Value::Array(prefixed));
+}
+
+fn first_user_message_text(messages: &[Message]) -> &str {
+    messages
+        .iter()
+        .find(|message| message.role == Role::User)
+        .and_then(|message| match &message.content {
+            MessageContent::Text { content } => Some(content.as_str()),
+            MessageContent::Blocks { content } => content.iter().find_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            }),
+        })
+        .unwrap_or_default()
+}
+
+fn sample_js_code_unit(text: &str, idx: usize) -> String {
+    text.encode_utf16()
+        .nth(idx)
+        .map(|unit| String::from_utf16_lossy(&[unit]))
+        .unwrap_or_else(|| "0".to_string())
+}
+
+fn claude_code_billing_header(messages: &[Message]) -> String {
+    let sampled = [4, 7, 20]
+        .into_iter()
+        .map(|idx| sample_js_code_unit(first_user_message_text(messages), idx))
+        .collect::<String>();
+    let version_hash = hex::encode(Sha256::digest(format!(
+        "{CLAUDE_CODE_BILLING_SALT}{sampled}{CLAUDE_CODE_VERSION}"
+    )));
+    let entrypoint = env::var(CLAUDE_CODE_ENTRYPOINT_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "cli".to_string());
+
+    format!(
+        "x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION}.{}; cc_entrypoint={entrypoint}; cch=00000;",
+        &version_hash[..3]
+    )
+}
+
+fn drop_empty_system(body: &mut CreateMessageParams) {
+    let Some(system) = body.system.take() else {
+        return;
+    };
+
+    let is_empty = match &system {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(systems) => systems.is_empty()
+            || systems.iter().all(|entry| match entry {
+                Value::Null => true,
+                Value::String(text) => text.trim().is_empty(),
+                Value::Object(obj) if matches!(obj.get("type"), Some(Value::String(t)) if t == "text") => {
+                    obj.get("text")
+                        .and_then(Value::as_str)
+                        .is_none_or(|text| text.trim().is_empty())
+                }
+                _ => false,
+            }),
+        _ => false,
+    };
+
+    body.system = (!is_empty).then_some(system);
+}
+
+fn strip_ephemeral_scope_from_system(system: &mut Value) {
+    let Some(items) = system.as_array_mut() else {
+        return;
+    };
+
+    for item in items {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let Some(cache_control) = obj.get_mut("cache_control") else {
+            continue;
+        };
+        let Some(cache_obj) = cache_control.as_object_mut() else {
+            continue;
+        };
+
+        if let Some(ephemeral) = cache_obj.get_mut("ephemeral")
+            && let Some(ephemeral_obj) = ephemeral.as_object_mut()
+        {
+            ephemeral_obj.remove("scope");
+        }
+
+        if matches!(cache_obj.get("type"), Some(Value::String(t)) if t == "ephemeral") {
+            cache_obj.remove("scope");
+        }
+    }
+}
+
+fn extract_anthropic_beta_header(headers: &HeaderMap) -> Option<String> {
+    let mut parts = Vec::new();
+    for value in headers.get_all("anthropic-beta") {
+        if let Ok(raw) = value.to_str() {
+            for token in raw.split(',') {
+                let token = token.trim();
+                if !token.is_empty() {
+                    parts.push(token.to_string());
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(","))
+    }
+}
 
 fn sanitize_messages(msgs: Vec<Message>) -> Vec<Message> {
     msgs.into_iter()
@@ -92,12 +225,12 @@ fn sanitize_messages(msgs: Vec<Message>) -> Vec<Message> {
                     let mut new_blocks: Vec<ContentBlock> = content
                         .into_iter()
                         .filter_map(|b| match b {
-                            ContentBlock::Text { text } => {
+                            ContentBlock::Text { text, .. } => {
                                 let t = text.trim().to_string();
                                 if t.is_empty() {
                                     None
                                 } else {
-                                    Some(ContentBlock::Text { text: t })
+                                    Some(ContentBlock::text(t))
                                 }
                             }
                             other => Some(other),
@@ -136,12 +269,15 @@ where
             }
             ClaudeApiFormat::Claude => Json::<CreateMessageParams>::from_request(req, &()).await?,
         };
-        // Sanitize messages: trim whitespace and drop whitespace-only assistant turns
-        body.messages = sanitize_messages(body.messages);
+        if CLEWDR_CONFIG.load().sanitize_messages {
+            // Trim whitespace and drop empty assistant turns when enabled.
+            body.messages = sanitize_messages(body.messages);
+        }
         if body.model.ends_with("-thinking") {
             body.model = body.model.trim_end_matches("-thinking").to_string();
             body.thinking.get_or_insert(Thinking::new(4096));
         }
+        drop_empty_system(&mut body);
         Ok(Self(body, format))
     }
 }
@@ -190,6 +326,8 @@ pub struct ClaudeCodeContext {
     pub(super) api_format: ClaudeApiFormat,
     /// The hash of the system messages for caching purposes
     pub(super) system_prompt_hash: Option<u64>,
+    /// Optional anthropic-beta header forwarded from client request
+    pub(super) anthropic_beta: Option<String>,
     // Usage information for the request
     pub(super) usage: Usage,
 }
@@ -203,21 +341,11 @@ where
     type Rejection = ClewdrError;
 
     async fn from_request(req: Request, _: &S) -> Result<Self, Self::Rejection> {
-        let ua = req
-            .headers()
-            .get(USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_lowercase();
-        let is_from_cc = ua.contains("claude-code");
+        let anthropic_beta = extract_anthropic_beta_header(req.headers());
         let NormalizeRequest(mut body, format) = NormalizeRequest::from_request(req, &()).await?;
         // Handle thinking mode by modifying the model name
-        if (body.model.contains("opus-4-1")
-            || body.model.contains("sonnet-4-5")
-            || body.model.contains("opus-4-5"))
-            && body.temperature.is_some()
-        {
-            body.top_p = None; // temperature and top_p cannot be used together in Opus-4-1
+        if body.temperature.is_some() {
+            body.top_p = None; // temperature and top_p cannot be used together in Opus-4.x
         }
 
         // Check for test messages and respond appropriately
@@ -232,51 +360,34 @@ where
         // Determine streaming status and API format
         let stream = body.stream.unwrap_or_default();
 
-        // If the request is not from Claude Code, add a prelude to the system messages
-        if !is_from_cc {
-            // Add a prelude text block to the system messages
-            const PRELUDE_TEXT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
-            let prelude_blk = ContentBlock::Text {
-                text: CLEWDR_CONFIG
-                    .load()
-                    .custom_system
-                    .clone()
-                    .unwrap_or_else(|| PRELUDE_TEXT.to_string()),
-            };
-            match body.system {
-                Some(Value::String(ref text)) => {
-                    if text != PRELUDE_TEXT {
-                        let text_content = ContentBlock::Text {
-                            text: text.to_owned(),
-                        };
-                        body.system = Some(json!([prelude_blk, text_content]));
-                    }
-                }
-                Some(Value::Array(ref mut a)) => {
-                    if !a.first().is_some_and(|blk| blk == PRELUDE_TEXT) {
-                        a.insert(0, json!(prelude_blk));
-                        body.system = Some(json!(a));
-                    }
-                }
-                _ => {
-                    body.system = Some(json!([prelude_blk]));
-                }
-            }
+        let mut system_prefixes = vec![ContentBlock::text(claude_code_billing_header(
+            &body.messages,
+        ))];
+        if let Some(custom_system) = CLEWDR_CONFIG
+            .load()
+            .custom_system
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+        {
+            system_prefixes.push(ContentBlock::text(custom_system));
+        }
+        prepend_system_blocks(&mut body, system_prefixes);
+
+        if let Some(system) = body.system.as_mut() {
+            strip_ephemeral_scope_from_system(system);
         }
 
         let cache_systems = body
             .system
             .as_ref()
-            .ok_or(ClewdrError::BadRequest {
-                msg: "Empty system prompt",
-            })?
-            .as_array()
-            .ok_or(ClewdrError::BadRequest {
-                msg: "System prompt is not an array",
-            })?
-            .iter()
-            .filter(|s| s["cache_control"].as_object().is_some())
-            .collect::<Vec<_>>();
+            .and_then(Value::as_array)
+            .map(|systems| {
+                systems
+                    .iter()
+                    .filter(|s| s["cache_control"].as_object().is_some())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let system_prompt_hash = (!cache_systems.is_empty()).then(|| {
             let mut hasher = DefaultHasher::new();
             cache_systems.hash(&mut hasher);
@@ -289,6 +400,7 @@ where
             stream,
             api_format: format,
             system_prompt_hash,
+            anthropic_beta,
             usage: Usage {
                 input_tokens,
                 output_tokens: 0, // Placeholder for output token count
@@ -296,5 +408,70 @@ where
         };
 
         Ok(Self(body, ClaudeContext::Code(info)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_code_billing_header_matches_2176_rule() {
+        let messages = vec![Message::new_text(Role::User, "hey")];
+
+        assert_eq!(
+            claude_code_billing_header(&messages),
+            "x-anthropic-billing-header: cc_version=2.1.76.4dc; cc_entrypoint=cli; cch=00000;"
+        );
+    }
+
+    #[test]
+    fn claude_code_billing_header_uses_first_text_block_of_first_user_message() {
+        let messages = vec![
+            Message::new_blocks(
+                Role::User,
+                vec![
+                    ContentBlock::Image {
+                        source: crate::types::claude::ImageSource::Url {
+                            url: "https://example.com/a.png".to_string(),
+                        },
+                        cache_control: None,
+                    },
+                    ContentBlock::text("abcdefg"),
+                    ContentBlock::text("ignored"),
+                ],
+            ),
+            Message::new_text(Role::User, "later"),
+        ];
+
+        assert_eq!(
+            claude_code_billing_header(&messages),
+            "x-anthropic-billing-header: cc_version=2.1.76.540; cc_entrypoint=cli; cch=00000;"
+        );
+    }
+
+    #[test]
+    fn prepend_system_blocks_keeps_billing_before_custom_system() {
+        let mut body = CreateMessageParams {
+            messages: vec![Message::new_text(Role::User, "hey")],
+            model: "claude-sonnet-4-5".to_string(),
+            system: Some(json!("original system")),
+            ..Default::default()
+        };
+
+        prepend_system_blocks(
+            &mut body,
+            vec![
+                ContentBlock::text("billing"),
+                ContentBlock::text("custom system"),
+            ],
+        );
+
+        let systems = body.system.unwrap().as_array().cloned().unwrap();
+        let texts = systems
+            .iter()
+            .map(|value| value["text"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["billing", "custom system", "original system"]);
     }
 }

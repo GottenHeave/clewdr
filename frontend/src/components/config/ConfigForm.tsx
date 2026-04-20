@@ -118,7 +118,7 @@ const ConfigForm: React.FC<ConfigFormProps> = ({ config, onChange }) => {
             label={t("config.sections.api.maxRetries")}
           />
         </div>
-        <div className="flex space-x-6">
+        <div className="grid grid-cols-2 gap-x-6 gap-y-3">
           <ConfigCheckbox
             name="preserve_chats"
             checked={config.preserve_chats}
@@ -138,6 +138,13 @@ const ConfigForm: React.FC<ConfigFormProps> = ({ config, onChange }) => {
             checked={!!config.enable_web_count_tokens}
             onChange={onChange}
             label={t("config.sections.api.webCountTokens")}
+          />
+
+          <ConfigCheckbox
+            name="sanitize_messages"
+            checked={config.sanitize_messages}
+            onChange={onChange}
+            label={t("config.sections.api.sanitizeMessages")}
           />
         </div>
       </ConfigSection>
@@ -219,8 +226,20 @@ const ConfigForm: React.FC<ConfigFormProps> = ({ config, onChange }) => {
           value={config.custom_prompt}
           onChange={onChange}
           label={t("config.sections.prompt.customPrompt")}
+          placeholder={t("config.sections.prompt.customPromptPlaceholder")}
           isTextarea={true}
           rows={3}
+        />
+
+        <FormInput
+          id="custom_system"
+          name="custom_system"
+          value={config.custom_system || ""}
+          onChange={onChange}
+          label={t("config.sections.prompt.customSystem")}
+          placeholder={t("config.sections.prompt.customSystemPlaceholder")}
+          isTextarea={true}
+          rows={4}
         />
       </ConfigSection>
     </div>
