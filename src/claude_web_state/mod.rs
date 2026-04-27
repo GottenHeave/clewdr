@@ -5,7 +5,7 @@ use axum::http::{
     header::COOKIE,
 };
 use snafu::ResultExt;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 use url::Url;
 use wreq::{
     Client, Method, Proxy, RequestBuilder,
@@ -180,11 +180,5 @@ impl ClaudeWebState {
                 warn!("Failed to persist usage statistics: {}", err);
             }
         }
-    }
-
-    /// Deletes or renames the current chat conversation based on configuration
-    /// If preserve_chats is true, the chat is renamed rather than deleted
-    pub async fn clean_chat(&self) -> Result<(), ClewdrError> {
-        Ok(())
     }
 }
