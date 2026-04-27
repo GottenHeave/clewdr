@@ -1,9 +1,7 @@
 use std::sync::LazyLock;
 
-use axum::http::{
-    HeaderValue,
-    header::COOKIE,
-};
+use axum::http::{HeaderValue, header::COOKIE};
+use serde_json::Value;
 use snafu::ResultExt;
 use tracing::{debug, error, warn};
 use url::Url;
@@ -12,7 +10,6 @@ use wreq::{
     header::{ORIGIN, REFERER},
 };
 use wreq_util::Emulation;
-use serde_json::Value;
 
 use crate::{
     config::{CLAUDE_ENDPOINT, CLEWDR_CONFIG, CookieStatus, Reason},
@@ -79,6 +76,16 @@ impl ClaudeWebState {
         self
     }
 
+    fn build_client(proxy: Option<&Proxy>) -> Result<Client, wreq::Error> {
+        let mut client = Client::builder()
+            .cookie_store(true)
+            .emulation(Emulation::Chrome136);
+        if let Some(proxy) = proxy {
+            client = client.proxy(proxy.to_owned());
+        }
+        client.build()
+    }
+
     /// Build a request with the current cookie and proxy settings
     pub fn build_request(&self, method: Method, url: impl ToString) -> RequestBuilder {
         // let r = SUPER_CLIENT.cloned();
@@ -127,13 +134,7 @@ impl ClaudeWebState {
         // Always pull latest proxy/endpoint before building the client
         self.proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();
         self.endpoint = CLEWDR_CONFIG.load().endpoint();
-        let mut client = Client::builder()
-            .cookie_store(true)
-            .emulation(Emulation::Chrome136);
-        if let Some(ref proxy) = self.proxy {
-            client = client.proxy(proxy.to_owned());
-        }
-        self.client = client.build().context(WreqSnafu {
+        self.client = Self::build_client(self.proxy.as_ref()).context(WreqSnafu {
             msg: "Failed to build client with new cookie",
         })?;
         self.cookie_header_value = HeaderValue::from_str(res.cookie.to_string().as_str())?;
@@ -215,21 +216,12 @@ impl ClaudeWebState {
 
     /// Fetch usage data via the claude.ai web endpoint.
     /// Used as a fallback when the OAuth usage endpoint is not available (e.g. Without Claude Code Access).
-    pub async fn fetch_web_usage(
-        handle: CookieActorHandle,
-        cookie: CookieStatus,
-    ) -> Option<Value> {
+    pub async fn fetch_web_usage(handle: CookieActorHandle, cookie: CookieStatus) -> Option<Value> {
         let mut state = ClaudeWebState::new(handle);
         state.cookie = Some(cookie.clone());
         state.proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();
         state.endpoint = CLEWDR_CONFIG.load().endpoint();
-        let mut client = Client::builder()
-            .cookie_store(true)
-            .emulation(Emulation::Chrome136);
-        if let Some(ref proxy) = state.proxy {
-            client = client.proxy(proxy.to_owned());
-        }
-        state.client = client.build().ok()?;
+        state.client = Self::build_client(state.proxy.as_ref()).ok()?;
         state.cookie_header_value =
             HeaderValue::from_str(cookie.cookie.to_string().as_str()).ok()?;
 
@@ -252,7 +244,10 @@ impl ClaudeWebState {
             .send()
             .await
             .inspect_err(|e| {
-                warn!("fetch_web_usage: request failed for {}: {}", cookie.cookie, e);
+                warn!(
+                    "fetch_web_usage: request failed for {}: {}",
+                    cookie.cookie, e
+                );
             })
             .ok()?;
 

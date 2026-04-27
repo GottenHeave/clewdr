@@ -19,9 +19,9 @@ use super::error::ApiError;
 use crate::{
     VERSION_INFO,
     claude_code_state::ClaudeCodeState,
+    claude_web_state::ClaudeWebState,
     config::{CLEWDR_CONFIG, CookieStatus},
     services::cookie_actor::CookieActorHandle,
-    claude_web_state::ClaudeWebState,
 };
 
 /// Cache entry for cookie status responses
@@ -331,7 +331,7 @@ pub async fn api_get_models() -> Json<Value> {
 // ------------------------------
 // Ephemeral org usage enrichment
 // ------------------------------
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryFutureExt, stream};
 use http::HeaderValue;
 
 async fn augment_utilization(cookies: Vec<CookieStatus>, handle: CookieActorHandle) -> Vec<Value> {
@@ -384,27 +384,26 @@ async fn fetch_usage_percent(
     u32,
     Option<String>,
 )> {
-    // 1) Try OAuth endpoint (works for Pro / Max with Claude Code Access)
-    let usage = match try_oauth_usage(&cookie, &handle).await {
-        Some(u) => u,
-        None => {
-            // 2) Fallback to claude.ai web endpoint (works for Enterprise)
+    let oauth_handle = handle.clone();
+    let fallback_cookie = cookie.clone();
+    let fallback_cookie_name = fallback_cookie.cookie.to_string();
+    let usage = try_oauth_usage(&cookie, &oauth_handle)
+        .or_else(|_| async move {
             info!(
                 "OAuth usage unavailable for {}, trying web fallback",
-                cookie.cookie
+                fallback_cookie_name
             );
-            match ClaudeWebState::fetch_web_usage(handle, cookie.clone()).await {
-                Some(u) => u,
-                None => {
+            ClaudeWebState::fetch_web_usage(handle, fallback_cookie)
+                .await
+                .ok_or_else(|| {
                     warn!(
                         "Web usage fallback also failed for {}",
-                        cookie.cookie
+                        fallback_cookie_name
                     );
-                    return None;
-                }
-            }
-        }
-    };
+                })
+        })
+        .await
+        .ok()?;
 
     extract_usage_fields(&usage)
 }
@@ -413,29 +412,18 @@ async fn fetch_usage_percent(
 async fn try_oauth_usage(
     cookie: &CookieStatus,
     handle: &CookieActorHandle,
-) -> Option<serde_json::Value> {
-    let mut state = match ClaudeCodeState::from_cookie(handle.clone(), cookie.clone()) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(
-                "try_oauth_usage: from_cookie failed for {}: {}",
-                cookie.cookie, e
-            );
-            return None;
-        }
+) -> Result<serde_json::Value, ()> {
+    let Ok(mut state) = ClaudeCodeState::from_cookie(handle.clone(), cookie.clone()) else {
+        warn!("try_oauth_usage: from_cookie failed for {}", cookie.cookie);
+        return Err(());
     };
     let result = state.fetch_usage_metrics().await;
     state.return_cookie(None).await;
-    match result {
-        Ok(u) => Some(u),
-        Err(e) => {
-            warn!(
-                "try_oauth_usage: fetch failed for {}: {}",
-                cookie.cookie, e
-            );
-            None
-        }
-    }
+    result
+        .inspect_err(|e| {
+            warn!("try_oauth_usage: fetch failed for {}: {}", cookie.cookie, e);
+        })
+        .map_err(|_| ())
 }
 
 /// Extract the eight usage fields from the usage JSON returned by either endpoint
