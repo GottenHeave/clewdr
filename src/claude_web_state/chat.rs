@@ -2,7 +2,7 @@ use colored::Colorize;
 use futures::TryFutureExt;
 use serde_json::json;
 use snafu::ResultExt;
-use tracing::{Instrument, debug, error, info, info_span, warn};
+use tracing::{Instrument, debug, error, info, info_span};
 use wreq::{Method, Response, header::ACCEPT};
 
 use super::ClaudeWebState;
@@ -52,16 +52,9 @@ impl ClaudeWebState {
 
             match transform_res.await {
                 Ok(b) => {
-                    if let Err(e) = state.clean_chat().await {
-                        warn!("Failed to clean chat: {}", e);
-                    }
                     return Ok(b);
                 }
                 Err(e) => {
-                    // delete chat after an error
-                    if let Err(e) = state.clean_chat().await {
-                        warn!("Failed to clean chat: {}", e);
-                    }
                     error!("{e}");
                     // 429 error
                     if let ClewdrError::InvalidCookie { reason } = e {
@@ -111,12 +104,27 @@ impl ClaudeWebState {
                 org_uuid
             ))
             .expect("Url parse error");
+        let is_temporary = !CLEWDR_CONFIG.load().preserve_chats;
         let body = json!({
             "uuid": new_uuid,
-            "name": format!("ClewdR-{}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")),
+            "name": if is_temporary { "".to_string() } else { format!("ClewdR-{}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")) },
+            "is_temporary": is_temporary,
         });
 
+        let referer = if is_temporary {
+            self.endpoint
+                .join("new?incognito")
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| format!("{}new?incognito", crate::config::CLAUDE_ENDPOINT))
+        } else {
+            self.endpoint
+                .join("new")
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| format!("{}new", crate::config::CLAUDE_ENDPOINT))
+        };
+
         self.build_request(Method::POST, endpoint)
+            .header(wreq::header::REFERER, referer)
             .json(&body)
             .send()
             .await
