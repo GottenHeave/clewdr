@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use axum::http::{HeaderValue, header::COOKIE};
 use serde_json::Value;
 use snafu::ResultExt;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 use url::Url;
 use wreq::{
     Client, Method, Proxy, RequestBuilder,
@@ -182,36 +182,6 @@ impl ClaudeWebState {
                 warn!("Failed to persist usage statistics: {}", err);
             }
         }
-    }
-
-    /// Deletes or renames the current chat conversation based on configuration
-    /// If preserve_chats is true, the chat is renamed rather than deleted
-    pub async fn clean_chat(&self) -> Result<(), ClewdrError> {
-        if CLEWDR_CONFIG.load().preserve_chats {
-            return Ok(());
-        }
-        let Some(ref org_uuid) = self.org_uuid else {
-            return Ok(());
-        };
-        let Some(ref conv_uuid) = self.conv_uuid else {
-            return Ok(());
-        };
-        let endpoint = self
-            .endpoint
-            .join(&format!(
-                "api/organizations/{}/chat_conversations/{}",
-                org_uuid, conv_uuid
-            ))
-            .expect("Url parse error");
-        debug!("Deleting chat: {}", conv_uuid);
-        let _ = self
-            .build_request(Method::DELETE, endpoint)
-            .send()
-            .await
-            .context(WreqSnafu {
-                msg: "Failed to delete chat conversation",
-            });
-        Ok(())
     }
 
     /// Fetch usage data via the claude.ai web endpoint.
