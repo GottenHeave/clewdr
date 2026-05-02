@@ -19,6 +19,7 @@ use super::error::ApiError;
 use crate::{
     VERSION_INFO,
     claude_code_state::ClaudeCodeState,
+    claude_web_state::ClaudeWebState,
     config::{CLEWDR_CONFIG, CookieStatus},
     services::cookie_actor::CookieActorHandle,
 };
@@ -330,7 +331,7 @@ pub async fn api_get_models() -> Json<Value> {
 // ------------------------------
 // Ephemeral org usage enrichment
 // ------------------------------
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryFutureExt, stream};
 use http::HeaderValue;
 
 async fn augment_utilization(cookies: Vec<CookieStatus>, handle: CookieActorHandle) -> Vec<Value> {
@@ -383,9 +384,61 @@ async fn fetch_usage_percent(
     u32,
     Option<String>,
 )> {
-    let mut state = ClaudeCodeState::from_cookie(handle, cookie).ok()?;
-    let usage = state.fetch_usage_metrics().await.ok()?;
+    let oauth_handle = handle.clone();
+    let fallback_cookie = cookie.clone();
+    let fallback_cookie_name = fallback_cookie.cookie.to_string();
+    let usage = try_oauth_usage(&cookie, &oauth_handle)
+        .or_else(|_| async move {
+            info!(
+                "OAuth usage unavailable for {}, trying web fallback",
+                fallback_cookie_name
+            );
+            ClaudeWebState::fetch_web_usage(handle, fallback_cookie)
+                .await
+                .ok_or_else(|| {
+                    warn!(
+                        "Web usage fallback also failed for {}",
+                        fallback_cookie_name
+                    );
+                })
+        })
+        .await
+        .ok()?;
+
+    extract_usage_fields(&usage)
+}
+
+/// Try the OAuth endpoint (`api.anthropic.com/api/oauth/usage`)
+async fn try_oauth_usage(
+    cookie: &CookieStatus,
+    handle: &CookieActorHandle,
+) -> Result<serde_json::Value, ()> {
+    let Ok(mut state) = ClaudeCodeState::from_cookie(handle.clone(), cookie.clone()) else {
+        warn!("try_oauth_usage: from_cookie failed for {}", cookie.cookie);
+        return Err(());
+    };
+    let result = state.fetch_usage_metrics().await;
     state.return_cookie(None).await;
+    result
+        .inspect_err(|e| {
+            warn!("try_oauth_usage: fetch failed for {}: {}", cookie.cookie, e);
+        })
+        .map_err(|_| ())
+}
+
+/// Extract the eight usage fields from the usage JSON returned by either endpoint
+fn extract_usage_fields(
+    usage: &serde_json::Value,
+) -> Option<(
+    u32,
+    Option<String>,
+    u32,
+    Option<String>,
+    u32,
+    Option<String>,
+    u32,
+    Option<String>,
+)> {
     let five = usage
         .get("five_hour")
         .and_then(|o| o.get("utilization"))

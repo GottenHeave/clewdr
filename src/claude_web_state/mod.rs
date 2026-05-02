@@ -1,11 +1,9 @@
 use std::sync::LazyLock;
 
-use axum::http::{
-    HeaderValue,
-    header::COOKIE,
-};
+use axum::http::{HeaderValue, header::COOKIE};
+use serde_json::Value;
 use snafu::ResultExt;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 use url::Url;
 use wreq::{
     Client, Method, Proxy, RequestBuilder,
@@ -78,6 +76,16 @@ impl ClaudeWebState {
         self
     }
 
+    fn build_client(proxy: Option<&Proxy>) -> Result<Client, wreq::Error> {
+        let mut client = Client::builder()
+            .cookie_store(true)
+            .emulation(Emulation::Chrome136);
+        if let Some(proxy) = proxy {
+            client = client.proxy(proxy.to_owned());
+        }
+        client.build()
+    }
+
     /// Build a request with the current cookie and proxy settings
     pub fn build_request(&self, method: Method, url: impl ToString) -> RequestBuilder {
         // let r = SUPER_CLIENT.cloned();
@@ -126,13 +134,7 @@ impl ClaudeWebState {
         // Always pull latest proxy/endpoint before building the client
         self.proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();
         self.endpoint = CLEWDR_CONFIG.load().endpoint();
-        let mut client = Client::builder()
-            .cookie_store(true)
-            .emulation(Emulation::Chrome136);
-        if let Some(ref proxy) = self.proxy {
-            client = client.proxy(proxy.to_owned());
-        }
-        self.client = client.build().context(WreqSnafu {
+        self.client = Self::build_client(self.proxy.as_ref()).context(WreqSnafu {
             msg: "Failed to build client with new cookie",
         })?;
         self.cookie_header_value = HeaderValue::from_str(res.cookie.to_string().as_str())?;
@@ -182,33 +184,48 @@ impl ClaudeWebState {
         }
     }
 
-    /// Deletes or renames the current chat conversation based on configuration
-    /// If preserve_chats is true, the chat is renamed rather than deleted
-    pub async fn clean_chat(&self) -> Result<(), ClewdrError> {
-        if CLEWDR_CONFIG.load().preserve_chats {
-            return Ok(());
+    /// Fetch usage data via the claude.ai web endpoint.
+    /// Used as a fallback when the OAuth usage endpoint is not available (e.g. Without Claude Code Access).
+    pub async fn fetch_web_usage(handle: CookieActorHandle, cookie: CookieStatus) -> Option<Value> {
+        let mut state = ClaudeWebState::new(handle);
+        state.cookie = Some(cookie.clone());
+        state.proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();
+        state.endpoint = CLEWDR_CONFIG.load().endpoint();
+        state.client = Self::build_client(state.proxy.as_ref()).ok()?;
+        state.cookie_header_value =
+            HeaderValue::from_str(cookie.cookie.to_string().as_str()).ok()?;
+
+        if let Err(e) = state.bootstrap().await {
+            warn!(
+                "fetch_web_usage: bootstrap failed for {}: {}",
+                cookie.cookie, e
+            );
+            return None;
         }
-        let Some(ref org_uuid) = self.org_uuid else {
-            return Ok(());
-        };
-        let Some(ref conv_uuid) = self.conv_uuid else {
-            return Ok(());
-        };
-        let endpoint = self
+
+        let org_uuid = state.org_uuid.as_ref()?;
+        let url = state
             .endpoint
-            .join(&format!(
-                "api/organizations/{}/chat_conversations/{}",
-                org_uuid, conv_uuid
-            ))
-            .expect("Url parse error");
-        debug!("Deleting chat: {}", conv_uuid);
-        let _ = self
-            .build_request(Method::DELETE, endpoint)
+            .join(&format!("api/organizations/{}/usage", org_uuid))
+            .ok()?;
+
+        let res = state
+            .build_request(Method::GET, url)
             .send()
             .await
-            .context(WreqSnafu {
-                msg: "Failed to delete chat conversation",
-            });
-        Ok(())
+            .inspect_err(|e| {
+                warn!(
+                    "fetch_web_usage: request failed for {}: {}",
+                    cookie.cookie, e
+                );
+            })
+            .ok()?;
+
+        res.json::<Value>()
+            .await
+            .inspect_err(|e| {
+                warn!("fetch_web_usage: parse failed for {}: {}", cookie.cookie, e);
+            })
+            .ok()
     }
 }
