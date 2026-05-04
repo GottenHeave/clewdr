@@ -26,10 +26,13 @@ mod tests {
         let source = ImageSource::from_data_url(url);
         assert!(source.is_some(), "Should parse valid PNG data URI");
 
-        let source = source.unwrap();
-        assert_eq!(source.type_, "base64");
-        assert_eq!(source.media_type, "image/png");
-        assert_eq!(source.data, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==");
+        match source.unwrap() {
+            ImageSource::Base64 { media_type, data } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==");
+            }
+            other => panic!("Expected Base64 image source, got {:?}", other),
+        }
     }
 
     #[test]
@@ -39,10 +42,13 @@ mod tests {
         let source = ImageSource::from_data_url(url);
         assert!(source.is_some(), "Should parse valid JPEG data URI");
 
-        let source = source.unwrap();
-        assert_eq!(source.type_, "base64");
-        assert_eq!(source.media_type, "image/jpeg");
-        assert_eq!(source.data, "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBg==");
+        match source.unwrap() {
+            ImageSource::Base64 { media_type, data } => {
+                assert_eq!(media_type, "image/jpeg");
+                assert_eq!(data, "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBg==");
+            }
+            other => panic!("Expected Base64 image source, got {:?}", other),
+        }
     }
 
     #[test]
@@ -52,9 +58,10 @@ mod tests {
         let source = ImageSource::from_data_url(url);
         assert!(source.is_some(), "Should parse valid WebP data URI");
 
-        let source = source.unwrap();
-        assert_eq!(source.type_, "base64");
-        assert_eq!(source.media_type, "image/webp");
+        match source.unwrap() {
+            ImageSource::Base64 { media_type, .. } => assert_eq!(media_type, "image/webp"),
+            other => panic!("Expected Base64 image source, got {:?}", other),
+        }
     }
 
     #[test]
@@ -94,10 +101,13 @@ mod tests {
         let source = ImageSource::from_data_url(url);
         assert!(source.is_some(), "Should parse data URI with extra params");
 
-        let source = source.unwrap();
-        assert_eq!(source.type_, "base64");
-        assert_eq!(source.media_type, "image/png;name=test.png");
-        assert_eq!(source.data, "iVBORw0KGgo=");
+        match source.unwrap() {
+            ImageSource::Base64 { media_type, data } => {
+                assert_eq!(media_type, "image/png;name=test.png");
+                assert_eq!(data, "iVBORw0KGgo=");
+            }
+            other => panic!("Expected Base64 image source, got {:?}", other),
+        }
     }
 
     #[test]
@@ -108,15 +118,16 @@ mod tests {
         let source = ImageSource::from_data_url(url);
         assert!(source.is_some(), "Should parse uppercase BASE64");
 
-        let source = source.unwrap();
-        assert_eq!(source.type_, "base64");
-        assert_eq!(source.media_type, "image/png");
+        match source.unwrap() {
+            ImageSource::Base64 { media_type, .. } => assert_eq!(media_type, "image/png"),
+            other => panic!("Expected Base64 image source, got {:?}", other),
+        }
 
         // mixed case Base64
         let url2 = "data:image/jpeg;Base64,/9j/4AAQ=";
         let source2 = ImageSource::from_data_url(url2);
         assert!(source2.is_some(), "Should parse mixed case Base64");
-        assert_eq!(source2.unwrap().type_, "base64");
+        assert!(matches!(source2.unwrap(), ImageSource::Base64 { .. }));
     }
 
     #[test]
@@ -128,9 +139,7 @@ mod tests {
                 role: Role::User,
                 content: MessageContent::Blocks {
                     content: vec![
-                        ContentBlock::Text {
-                            text: "What's in this image?".to_string(),
-                        },
+                        ContentBlock::text("What's in this image?"),
                         ContentBlock::ImageUrl {
                             image_url: ImageUrl {
                                 url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
@@ -156,14 +165,16 @@ mod tests {
             assert_eq!(content.len(), 2);
 
             // First block should be text
-            assert!(matches!(&content[0], ContentBlock::Text { text } if text == "What's in this image?"));
+            assert!(matches!(&content[0], ContentBlock::Text { text, .. } if text == "What's in this image?"));
 
             // Second block should be converted to Image (not ImageUrl)
             match &content[1] {
-                ContentBlock::Image { source } => {
-                    assert_eq!(source.type_, "base64");
-                    assert_eq!(source.media_type, "image/png");
-                    assert_eq!(source.data, "iVBORw0KGgo=");
+                ContentBlock::Image { source, .. } => match source {
+                    ImageSource::Base64 { media_type, data } => {
+                        assert_eq!(media_type, "image/png");
+                        assert_eq!(data, "iVBORw0KGgo=");
+                    }
+                    other => panic!("Expected Base64 image source, got {:?}", other),
                 }
                 other => panic!("Expected Image block, got {:?}", other),
             }
@@ -181,9 +192,7 @@ mod tests {
                 role: Role::User,
                 content: MessageContent::Blocks {
                     content: vec![
-                        ContentBlock::Text {
-                            text: "What's in this image?".to_string(),
-                        },
+                        ContentBlock::text("What's in this image?"),
                         ContentBlock::ImageUrl {
                             image_url: ImageUrl {
                                 url: "https://example.com/image.png".to_string(),
@@ -214,11 +223,11 @@ mod tests {
                 role: Role::User,
                 content: MessageContent::Blocks {
                     content: vec![ContentBlock::Image {
-                        source: ImageSource {
-                            type_: "base64".to_string(),
+                        source: ImageSource::Base64 {
                             media_type: "image/png".to_string(),
                             data: "existing_data".to_string(),
                         },
+                        cache_control: None,
                     }],
                 },
             }],
@@ -231,8 +240,8 @@ mod tests {
         // Verify Image block is preserved as-is
         if let MessageContent::Blocks { content } = &claude_params.messages[0].content {
             match &content[0] {
-                ContentBlock::Image { source } => {
-                    assert_eq!(source.data, "existing_data");
+                ContentBlock::Image { source, .. } => {
+                    assert!(matches!(source, ImageSource::Base64 { data, .. } if data == "existing_data"));
                 }
                 other => panic!("Expected Image block, got {:?}", other),
             }

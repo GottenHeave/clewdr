@@ -467,8 +467,7 @@ impl ImageSource {
             return None;
         }
 
-        Some(Self {
-            type_: "base64".to_string(),
+        Some(Self::Base64 {
             media_type: media_type.to_string(),
             data: base64_data.to_owned(),
         })

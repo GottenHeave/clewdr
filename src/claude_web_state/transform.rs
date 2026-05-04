@@ -66,7 +66,7 @@ impl ClaudeWebState {
                     })
                     .ok()?;
                 // choose the file name based on the media type (extract main type before any params)
-                let main_type = img.media_type.split(';').next().unwrap_or(&img.media_type);
+                let main_type = media_type.split(';').next().unwrap_or(&media_type);
                 let file_name = match main_type.to_lowercase().as_str() {
                     "image/png" => "image.png",
                     "image/jpeg" => "image.jpg",
@@ -170,7 +170,7 @@ fn merge_messages(msgs: Vec<Message>, system: String) -> Option<Merged> {
                                     imgs.push(source);
                                 }
                                 ImageSource::Url { url } => {
-                                    if let Some(source) = extract_image_from_url(&url) {
+                                    if let Some(source) = ImageSource::from_data_url(&url) {
                                         imgs.push(source);
                                     } else {
                                         warn!("Unsupported image url source");
@@ -266,4 +266,3 @@ fn merge_system(sys: Value) -> String {
         _ => String::new(),
     }
 }
-

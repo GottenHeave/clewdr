@@ -11,7 +11,10 @@ fn normalize_block(block: ContentBlock) -> Option<ContentBlock> {
         ContentBlock::Text { .. } => Some(block),
         ContentBlock::Image { .. } => Some(block),
         ContentBlock::ImageUrl { image_url } => {
-            ImageSource::from_data_url(&image_url.url).map(|source| ContentBlock::Image { source })
+            ImageSource::from_data_url(&image_url.url).map(|source| ContentBlock::Image {
+                source,
+                cache_control: None,
+            })
         }
         _ => Some(block),
     }
