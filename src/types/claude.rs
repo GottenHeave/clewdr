@@ -444,32 +444,54 @@ pub enum ImageSource {
 }
 
 impl ImageSource {
+    fn normalize_image_media_type(media_type: &str) -> Option<&'static str> {
+        match media_type.trim().to_lowercase().as_str() {
+            "image/jpeg" | "image/jpg" => Some("image/jpeg"),
+            "image/png" => Some("image/png"),
+            "image/gif" => Some("image/gif"),
+            "image/webp" => Some("image/webp"),
+            _ => None,
+        }
+    }
+
     /// Parse a data URI into an ImageSource
     /// Supports format: data:<media_type>[;params];base64,<data>
     /// e.g., data:image/png;base64,iVBORw0KGgo...
     /// e.g., data:image/png;name=foo;base64,iVBORw0KGgo...
     pub fn from_data_url(url: &str) -> Option<Self> {
-        if !url.starts_with("data:") {
-            return None;
-        }
+        let url = url.trim();
         let (metadata, base64_data) = url.split_once(',')?;
         // reject empty data
         if base64_data.is_empty() {
             return None;
         }
-        let after_data = metadata.strip_prefix("data:")?;
-        // find the last ";base64" marker (case-insensitive)
-        let lower = after_data.to_lowercase();
-        let base64_pos = lower.rfind(";base64")?;
-        let media_type = &after_data[..base64_pos];
-        // reject empty media type
-        if media_type.is_empty() {
+        if metadata.len() < 5 || !metadata[..5].eq_ignore_ascii_case("data:") {
+            return None;
+        }
+        let after_data = &metadata[5..];
+        let mut parts = after_data.split(';');
+        let media_type = Self::normalize_image_media_type(parts.next()?)?;
+        if !parts.any(|part| part.eq_ignore_ascii_case("base64")) {
             return None;
         }
 
         Some(Self::Base64 {
             media_type: media_type.to_string(),
             data: base64_data.to_owned(),
+        })
+    }
+
+    /// Parse an OpenAI-compatible image URL into an ImageSource.
+    pub fn from_image_url(url: &str) -> Option<Self> {
+        let url = url.trim();
+        Self::from_data_url(url).or_else(|| {
+            if url.starts_with("https://") || url.starts_with("http://") {
+                Some(Self::Url {
+                    url: url.to_string(),
+                })
+            } else {
+                None
+            }
         })
     }
 }

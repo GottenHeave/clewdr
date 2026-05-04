@@ -9,15 +9,14 @@
 //!
 //! ## Fixed Issues
 //! - CC proxy was passing ImageUrl directly to Claude API, causing 400/422 errors
-//! - System messages with images were being filtered out
 
 #[cfg(test)]
 mod tests {
+    use clewdr::types::claude::CreateMessageParams as ClaudeCreateMessageParams;
     use clewdr::types::claude::{
         ContentBlock, ImageSource, ImageUrl, Message, MessageContent, Role,
     };
     use clewdr::types::oai::CreateMessageParams as OaiCreateMessageParams;
-    use clewdr::types::claude::CreateMessageParams as ClaudeCreateMessageParams;
 
     #[test]
     fn test_image_source_from_data_url_png() {
@@ -29,7 +28,10 @@ mod tests {
         match source.unwrap() {
             ImageSource::Base64 { media_type, data } => {
                 assert_eq!(media_type, "image/png");
-                assert_eq!(data, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==");
+                assert_eq!(
+                    data,
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                );
             }
             other => panic!("Expected Base64 image source, got {:?}", other),
         }
@@ -103,11 +105,30 @@ mod tests {
 
         match source.unwrap() {
             ImageSource::Base64 { media_type, data } => {
-                assert_eq!(media_type, "image/png;name=test.png");
+                assert_eq!(media_type, "image/png");
                 assert_eq!(data, "iVBORw0KGgo=");
             }
             other => panic!("Expected Base64 image source, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_image_source_from_data_url_normalizes_jpg() {
+        let url = "data:image/jpg;base64,/9j/4AAQ=";
+
+        let source = ImageSource::from_data_url(url);
+
+        match source.unwrap() {
+            ImageSource::Base64 { media_type, .. } => assert_eq!(media_type, "image/jpeg"),
+            other => panic!("Expected Base64 image source, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_image_source_from_data_url_rejects_unsupported_media_type() {
+        let url = "data:application/pdf;base64,JVBERi0xLjQK";
+
+        assert!(ImageSource::from_data_url(url).is_none());
     }
 
     #[test]
@@ -165,7 +186,9 @@ mod tests {
             assert_eq!(content.len(), 2);
 
             // First block should be text
-            assert!(matches!(&content[0], ContentBlock::Text { text, .. } if text == "What's in this image?"));
+            assert!(
+                matches!(&content[0], ContentBlock::Text { text, .. } if text == "What's in this image?")
+            );
 
             // Second block should be converted to Image (not ImageUrl)
             match &content[1] {
@@ -175,7 +198,7 @@ mod tests {
                         assert_eq!(data, "iVBORw0KGgo=");
                     }
                     other => panic!("Expected Base64 image source, got {:?}", other),
-                }
+                },
                 other => panic!("Expected Image block, got {:?}", other),
             }
         } else {
@@ -184,8 +207,8 @@ mod tests {
     }
 
     #[test]
-    fn test_oai_to_claude_conversion_filters_invalid_image_url() {
-        // Create OAI format request with invalid ImageUrl (http URL)
+    fn test_oai_to_claude_conversion_with_remote_image_url() {
+        // Create OAI format request with remote ImageUrl
         let oai_params = OaiCreateMessageParams {
             model: "claude-3-opus".to_string(),
             messages: vec![Message {
@@ -207,7 +230,41 @@ mod tests {
         // Convert to Claude format
         let claude_params: ClaudeCreateMessageParams = oai_params.into();
 
-        // Verify only text block remains (invalid image URL should be filtered)
+        if let MessageContent::Blocks { content } = &claude_params.messages[0].content {
+            assert_eq!(content.len(), 2);
+            assert!(matches!(&content[0], ContentBlock::Text { .. }));
+            assert!(matches!(
+                &content[1],
+                ContentBlock::Image {
+                    source: ImageSource::Url { url },
+                    ..
+                } if url == "https://example.com/image.png"
+            ));
+        }
+    }
+
+    #[test]
+    fn test_oai_to_claude_conversion_filters_invalid_image_url() {
+        let oai_params = OaiCreateMessageParams {
+            model: "claude-3-opus".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks {
+                    content: vec![
+                        ContentBlock::text("What's in this image?"),
+                        ContentBlock::ImageUrl {
+                            image_url: ImageUrl {
+                                url: "not-a-url".to_string(),
+                            },
+                        },
+                    ],
+                },
+            }],
+            ..Default::default()
+        };
+
+        let claude_params: ClaudeCreateMessageParams = oai_params.into();
+
         if let MessageContent::Blocks { content } = &claude_params.messages[0].content {
             assert_eq!(content.len(), 1, "Invalid ImageUrl should be filtered out");
             assert!(matches!(&content[0], ContentBlock::Text { .. }));
@@ -241,7 +298,9 @@ mod tests {
         if let MessageContent::Blocks { content } = &claude_params.messages[0].content {
             match &content[0] {
                 ContentBlock::Image { source, .. } => {
-                    assert!(matches!(source, ImageSource::Base64 { data, .. } if data == "existing_data"));
+                    assert!(
+                        matches!(source, ImageSource::Base64 { data, .. } if data == "existing_data")
+                    );
                 }
                 other => panic!("Expected Image block, got {:?}", other),
             }
@@ -290,7 +349,7 @@ mod tests {
                     content: MessageContent::Blocks {
                         content: vec![ContentBlock::ImageUrl {
                             image_url: ImageUrl {
-                                url: "https://invalid.com/image.png".to_string(),
+                                url: "not-a-url".to_string(),
                             },
                         }],
                     },
@@ -317,5 +376,42 @@ mod tests {
         if let MessageContent::Text { content } = &claude_params.messages[1].content {
             assert_eq!(content, "Third message");
         }
+    }
+
+    #[test]
+    fn test_oai_to_claude_system_content_keeps_only_text() {
+        let oai_params = OaiCreateMessageParams {
+            model: "claude-3-opus".to_string(),
+            messages: vec![
+                Message {
+                    role: Role::System,
+                    content: MessageContent::Blocks {
+                        content: vec![
+                            ContentBlock::text("System prompt"),
+                            ContentBlock::ImageUrl {
+                                image_url: ImageUrl {
+                                    url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+                                },
+                            },
+                        ],
+                    },
+                },
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Text {
+                        content: "Hello".to_string(),
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+
+        let claude_params: ClaudeCreateMessageParams = oai_params.into();
+        let system = claude_params.system.expect("system should be present");
+        let blocks = system.as_array().expect("system should be an array");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "System prompt");
     }
 }

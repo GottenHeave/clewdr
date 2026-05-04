@@ -11,7 +11,7 @@ fn normalize_block(block: ContentBlock) -> Option<ContentBlock> {
         ContentBlock::Text { .. } => Some(block),
         ContentBlock::Image { .. } => Some(block),
         ContentBlock::ImageUrl { image_url } => {
-            ImageSource::from_data_url(&image_url.url).map(|source| ContentBlock::Image {
+            ImageSource::from_image_url(&image_url.url).map(|source| ContentBlock::Image {
                 source,
                 cache_control: None,
             })
@@ -55,7 +55,6 @@ impl From<CreateMessageParams> for ClaudeCreateMessageParams {
             .messages
             .into_iter()
             .partition(|m| m.role == Role::System);
-        // normalize system blocks (convert ImageUrl to Image)
         let systems = systems
             .into_iter()
             .map(|m| m.content)
@@ -63,8 +62,7 @@ impl From<CreateMessageParams> for ClaudeCreateMessageParams {
                 MessageContent::Text { content } => vec![ContentBlock::text(content)],
                 MessageContent::Blocks { content } => content,
             })
-            .filter_map(normalize_block)
-            .filter(|b| matches!(b, ContentBlock::Text { .. } | ContentBlock::Image { .. }))
+            .filter(|b| matches!(b, ContentBlock::Text { .. }))
             .map(|b| json!(b))
             .collect::<Vec<_>>();
         let system = (!systems.is_empty()).then(|| json!(systems));
