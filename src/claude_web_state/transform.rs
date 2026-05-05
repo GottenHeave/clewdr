@@ -65,8 +65,9 @@ impl ClaudeWebState {
                         warn!("Failed to decode image: {}", e);
                     })
                     .ok()?;
-                // choose the file name based on the media type
-                let file_name = match media_type.to_lowercase().as_str() {
+                // choose the file name based on the media type (extract main type before any params)
+                let main_type = media_type.split(';').next().unwrap_or(&media_type);
+                let file_name = match main_type.to_lowercase().as_str() {
                     "image/png" => "image.png",
                     "image/jpeg" => "image.jpg",
                     "image/jpg" => "image.jpg",
@@ -169,7 +170,7 @@ fn merge_messages(msgs: Vec<Message>, system: String) -> Option<Merged> {
                                     imgs.push(source);
                                 }
                                 ImageSource::Url { url } => {
-                                    if let Some(source) = extract_image_from_url(&url) {
+                                    if let Some(source) = ImageSource::from_data_url(&url) {
                                         imgs.push(source);
                                     } else {
                                         warn!("Unsupported image url source");
@@ -183,7 +184,7 @@ fn merge_messages(msgs: Vec<Message>, system: String) -> Option<Merged> {
                         }
                         ContentBlock::ImageUrl { image_url } => {
                             // oai image
-                            if let Some(source) = extract_image_from_url(&image_url.url) {
+                            if let Some(source) = ImageSource::from_data_url(&image_url.url) {
                                 imgs.push(source);
                             }
                             None
@@ -264,21 +265,4 @@ fn merge_system(sys: Value) -> String {
             .join("\n"),
         _ => String::new(),
     }
-}
-
-fn extract_image_from_url(url: &str) -> Option<ImageSource> {
-    if !url.starts_with("data:") {
-        return None; // only support data URI
-    }
-    let (metadata, base64_data) = url.split_once(',')?;
-
-    let (media_type, type_) = metadata.strip_prefix("data:")?.split_once(';')?;
-    if type_ != "base64" {
-        return None;
-    }
-
-    Some(ImageSource::Base64 {
-        media_type: media_type.to_string(),
-        data: base64_data.to_owned(),
-    })
 }
