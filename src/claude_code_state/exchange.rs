@@ -18,6 +18,7 @@ use serde_json::Value;
 use snafu::{OptionExt, ResultExt};
 use url::Url;
 
+use super::chat::{CLAUDE_API_VERSION, CLAUDE_BETA_BASE};
 use crate::{
     claude_code_state::ClaudeCodeState,
     config::{
@@ -26,8 +27,6 @@ use crate::{
     },
     error::{CheckClaudeErr, ClewdrError, UnexpectedNoneSnafu, UrlSnafu, WreqSnafu},
 };
-
-use super::chat::{CLAUDE_API_VERSION, CLAUDE_BETA_BASE};
 
 type ClaudeOauthClient = Client<
     BasicErrorResponse,

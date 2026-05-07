@@ -1,3 +1,5 @@
+use std::io::IsTerminal;
+
 use clewdr::{
     self, FIG, IS_DEBUG,
     config::{CLEWDR_CONFIG, CONFIG_PATH, LOG_DIR},
@@ -6,7 +8,6 @@ use clewdr::{
 };
 use colored::Colorize;
 use mimalloc::MiMalloc;
-use std::io::IsTerminal;
 use tracing::Subscriber;
 use tracing_subscriber::{
     Layer, Registry,

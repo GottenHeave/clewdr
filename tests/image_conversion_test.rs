@@ -12,11 +12,13 @@
 
 #[cfg(test)]
 mod tests {
-    use clewdr::types::claude::CreateMessageParams as ClaudeCreateMessageParams;
-    use clewdr::types::claude::{
-        ContentBlock, ImageSource, ImageUrl, Message, MessageContent, Role,
+    use clewdr::types::{
+        claude::{
+            ContentBlock, CreateMessageParams as ClaudeCreateMessageParams, ImageSource, ImageUrl,
+            Message, MessageContent, Role,
+        },
+        oai::CreateMessageParams as OaiCreateMessageParams,
     };
-    use clewdr::types::oai::CreateMessageParams as OaiCreateMessageParams;
 
     #[test]
     fn test_image_source_from_data_url_png() {
