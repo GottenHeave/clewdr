@@ -26,11 +26,9 @@ pub struct CookieStatusApi {
     pub lifetime_usage: UsageBreakdown,
     pub session_utilization: Option<f64>,
     pub seven_day_utilization: Option<f64>,
-    pub seven_day_opus_utilization: Option<f64>,
     pub seven_day_sonnet_utilization: Option<f64>,
     pub session_resets_at: Option<String>,
     pub seven_day_resets_at: Option<String>,
-    pub seven_day_opus_resets_at: Option<String>,
     pub seven_day_sonnet_resets_at: Option<String>,
 }
 

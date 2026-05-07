@@ -41,11 +41,6 @@ pub fn UsageDetails(cookie: CookieStatus) -> impl IntoView {
             cookie.seven_day_sonnet_resets_at.as_deref(),
             "cookieStatus.quota.sevenDaySonnet",
         ),
-        (
-            cookie.seven_day_opus_utilization,
-            cookie.seven_day_opus_resets_at.as_deref(),
-            "cookieStatus.quota.sevenDayOpus",
-        ),
     ]
     .into_iter()
     .filter_map(|(val, reset, key)| {

@@ -153,13 +153,6 @@ impl CookieActor {
                 WEEKLY_WINDOW_SECS,
                 now,
             );
-            cookie_changed |= reset_if_due(
-                cookie.weekly_opus_has_reset,
-                &mut cookie.weekly_opus_resets_at,
-                &mut cookie.weekly_opus_usage,
-                WEEKLY_WINDOW_SECS,
-                now,
-            );
             cookie_changed
         };
 

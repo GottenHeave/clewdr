@@ -94,12 +94,6 @@ pub fn ExhaustedRow(cookie: CookieStatus) -> impl IntoView {
             i18n.t("cookieStatus.status.cooldownFull"),
             format_timestamp(ts)
         )
-    } else if let Some(ref s) = cookie.seven_day_opus_resets_at {
-        format!(
-            "{}: {}",
-            i18n.t("cookieStatus.status.cooldownOpus"),
-            format_iso(s)
-        )
     } else if let Some(ref s) = cookie.seven_day_sonnet_resets_at {
         format!(
             "{}: {}",
