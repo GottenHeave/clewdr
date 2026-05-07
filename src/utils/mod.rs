@@ -58,7 +58,7 @@ pub fn print_out_text(text: String, file_name: &str) {
 pub fn build_http_client(proxy: Option<&Proxy>) -> Result<Client, wreq::Error> {
     let mut builder = Client::builder()
         .cookie_store(true)
-        .emulation(Emulation::Chrome136);
+        .emulation(Emulation::Chrome145);
     if let Some(proxy) = proxy {
         builder = builder.proxy(proxy.to_owned());
     }
