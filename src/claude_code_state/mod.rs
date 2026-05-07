@@ -8,7 +8,6 @@ use http::{
 use snafu::ResultExt;
 use tracing::error;
 use wreq::RequestBuilder;
-use wreq_util::Emulation;
 
 use crate::{
     claude_web_state::SUPER_CLIENT,
@@ -17,6 +16,7 @@ use crate::{
     middleware::claude::ClaudeApiFormat,
     services::cookie_actor::CookieActorHandle,
     types::claude::Usage,
+    utils::build_http_client,
 };
 
 #[derive(Clone)]
@@ -69,13 +69,7 @@ impl ClaudeCodeState {
             .to_string();
         let header_value = HeaderValue::from_str(cookie_value.as_str())?;
         state.cookie_header_value = header_value.clone();
-        let mut client = wreq::Client::builder()
-            .cookie_store(true)
-            .emulation(Emulation::Chrome136);
-        if let Some(ref proxy) = state.proxy {
-            client = client.proxy(proxy.to_owned());
-        }
-        state.client = client.build().context(WreqSnafu {
+        state.client = build_http_client(state.proxy.as_ref()).context(WreqSnafu {
             msg: "Failed to build client for cookie",
         })?;
         Ok(state)
@@ -127,13 +121,7 @@ impl ClaudeCodeState {
         // Always pull latest proxy/endpoint before building the client
         self.proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();
         self.endpoint = CLEWDR_CONFIG.load().endpoint();
-        let mut client = wreq::Client::builder()
-            .cookie_store(true)
-            .emulation(Emulation::Chrome136);
-        if let Some(ref proxy) = self.proxy {
-            client = client.proxy(proxy.to_owned());
-        }
-        self.client = client.build().context(WreqSnafu {
+        self.client = build_http_client(self.proxy.as_ref()).context(WreqSnafu {
             msg: "Failed to build client with new cookie",
         })?;
         Ok(res)

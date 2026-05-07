@@ -2,6 +2,8 @@ use axum::body::Body;
 use colored::{ColoredString, Colorize};
 use tokio::spawn;
 use tracing::error;
+use wreq::{Client, Proxy};
+use wreq_util::Emulation;
 
 use crate::{
     config::{CLEWDR_CONFIG, LOG_DIR},
@@ -51,6 +53,16 @@ pub fn print_out_text(text: String, file_name: &str) {
             error!("Failed to write log file {}: {}", path.display(), e);
         }
     });
+}
+
+pub fn build_http_client(proxy: Option<&Proxy>) -> Result<Client, wreq::Error> {
+    let mut builder = Client::builder()
+        .cookie_store(true)
+        .emulation(Emulation::Chrome136);
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy.to_owned());
+    }
+    builder.build()
 }
 
 /// Timezone for the API

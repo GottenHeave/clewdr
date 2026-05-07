@@ -9,7 +9,6 @@ use wreq::{
     Client, Method, Proxy, RequestBuilder,
     header::{ORIGIN, REFERER},
 };
-use wreq_util::Emulation;
 
 use crate::{
     config::{CLAUDE_ENDPOINT, CLEWDR_CONFIG, CookieStatus, Reason},
@@ -17,6 +16,7 @@ use crate::{
     middleware::claude::ClaudeApiFormat,
     services::cookie_actor::CookieActorHandle,
     types::claude::{CreateMessageParams, Usage},
+    utils::build_http_client,
 };
 
 pub mod bootstrap;
@@ -77,13 +77,7 @@ impl ClaudeWebState {
     }
 
     fn build_client(proxy: Option<&Proxy>) -> Result<Client, wreq::Error> {
-        let mut client = Client::builder()
-            .cookie_store(true)
-            .emulation(Emulation::Chrome136);
-        if let Some(proxy) = proxy {
-            client = client.proxy(proxy.to_owned());
-        }
-        client.build()
+        build_http_client(proxy)
     }
 
     /// Build a request with the current cookie and proxy settings
