@@ -1,8 +1,15 @@
-FROM node:lts-slim AS frontend-builder
-WORKDIR /build/frontend
-RUN npm install -g pnpm
-COPY frontend/ .
-RUN pnpm install && pnpm run build
+FROM docker.io/lukemathwalker/cargo-chef:latest-rust-trixie AS frontend-builder
+WORKDIR /build
+RUN rustup target add wasm32-unknown-unknown && \
+    curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+# Dummy src to satisfy workspace root member
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs
+COPY Cargo.toml Cargo.lock ./
+COPY clewdr-types/ clewdr-types/
+COPY clewdr-frontend/ clewdr-frontend/
+COPY .cargo/ .cargo/
+RUN cargo binstall trunk --no-confirm && \
+    cd clewdr-frontend && trunk build --release
 
 FROM docker.io/lukemathwalker/cargo-chef:latest-rust-trixie AS chef
 WORKDIR /build

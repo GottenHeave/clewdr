@@ -28,24 +28,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          version: latest
+          targets: wasm32-unknown-unknown
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: cargo-bins/cargo-binstall@main
+
+      - name: Install trunk
+        run: cargo binstall trunk --no-confirm
+
+      - uses: Swatinem/rust-cache@v2
         with:
-          node-version: "lts/*"
-          check-latest: true
-          cache: pnpm
-          cache-dependency-path: frontend/pnpm-lock.yaml
+          workspaces: clewdr-frontend
 
       - name: Build frontend
         run: |
-          cd frontend
-          pnpm install
-          pnpm run build
+          cd clewdr-frontend
+          trunk build --release
 
       - name: Upload static directory
         uses: actions/upload-artifact@v4
