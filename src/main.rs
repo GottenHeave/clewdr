@@ -56,8 +56,6 @@ async fn main() -> Result<(), ClewdrError> {
         .install_default()
         .expect("failed to install aws-lc crypto provider");
 
-    #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap();
     #[cfg(windows)]
     {
         _ = enable_ansi_support::enable_ansi_support();

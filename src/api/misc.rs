@@ -426,19 +426,18 @@ async fn try_oauth_usage(
         .map_err(|_| ())
 }
 
+type Usage = Option<(
+    u32,
+    Option<String>,
+    u32,
+    Option<String>,
+    u32,
+    Option<String>,
+    u32,
+    Option<String>,
+)>;
 /// Extract the eight usage fields from the usage JSON returned by either endpoint
-fn extract_usage_fields(
-    usage: &serde_json::Value,
-) -> Option<(
-    u32,
-    Option<String>,
-    u32,
-    Option<String>,
-    u32,
-    Option<String>,
-    u32,
-    Option<String>,
-)> {
+fn extract_usage_fields(usage: &serde_json::Value) -> Usage {
     let five = usage
         .get("five_hour")
         .and_then(|o| o.get("utilization"))
