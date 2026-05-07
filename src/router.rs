@@ -98,8 +98,7 @@ impl RouterBuilder {
             .route(
                 "/cookie",
                 delete(api_delete_cookie)
-                    .post(api_post_cookie)
-                    .put(api_put_cookie),
+                    .post(api_post_cookie),
             )
             .with_state(self.cookie_actor_handle.to_owned());
         let admin_router = Router::new()

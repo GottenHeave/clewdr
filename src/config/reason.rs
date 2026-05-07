@@ -1,48 +1,10 @@
-use std::{
-    fmt::{Debug, Display},
-    hash::Hash,
-};
+use std::hash::Hash;
 
+pub use clewdr_types::Reason;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 use super::CookieStatus;
 use crate::config::ClewdrCookie;
-
-/// Reason why a cookie is considered useless
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Error)]
-pub enum Reason {
-    NormalPro,
-    Free,
-    Disabled,
-    Banned,
-    Null,
-    Restricted(i64),
-    TooManyRequest(i64),
-}
-
-impl Display for Reason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let format_time = |secs: i64| {
-            chrono::DateTime::from_timestamp(secs, 0)
-                .map(|t| t.format("UTC %Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or("Invalid date".to_string())
-        };
-        match self {
-            Reason::NormalPro => write!(f, "Normal Pro account"),
-            Reason::Disabled => write!(f, "Organization Disabled"),
-            Reason::Free => write!(f, "Free account"),
-            Reason::Banned => write!(f, "Banned"),
-            Reason::Null => write!(f, "Null"),
-            Reason::Restricted(i) => {
-                write!(f, "Restricted/Warning: until {}", format_time(*i))
-            }
-            Reason::TooManyRequest(i) => {
-                write!(f, "429 Too many request: until {}", format_time(*i))
-            }
-        }
-    }
-}
 
 /// A struct representing a cookie that can't be used
 /// Contains the cookie and the reason why it's considered unusable

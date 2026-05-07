@@ -229,6 +229,71 @@ impl Display for ClewdrConfig {
     }
 }
 
+impl From<&ClewdrConfig> for clewdr_types::ConfigApi {
+    fn from(c: &ClewdrConfig) -> Self {
+        Self {
+            ip: c.ip.to_string(),
+            port: c.port,
+            check_update: c.check_update,
+            auto_update: c.auto_update,
+            password: c.password.clone(),
+            admin_password: c.admin_password.clone(),
+            proxy: c.proxy.clone(),
+            rproxy: c.rproxy.as_ref().map(|u| u.to_string()),
+            max_retries: c.max_retries,
+            preserve_chats: c.preserve_chats,
+            web_search: c.web_search,
+            enable_web_count_tokens: c.enable_web_count_tokens,
+            sanitize_messages: c.sanitize_messages,
+            skip_first_warning: c.skip_first_warning,
+            skip_second_warning: c.skip_second_warning,
+            skip_restricted: c.skip_restricted,
+            skip_non_pro: c.skip_non_pro,
+            skip_rate_limit: c.skip_rate_limit,
+            skip_normal_pro: c.skip_normal_pro,
+            use_real_roles: c.use_real_roles,
+            custom_h: c.custom_h.clone(),
+            custom_a: c.custom_a.clone(),
+            custom_prompt: c.custom_prompt.clone(),
+            claude_code_client_id: c.claude_code_client_id.clone(),
+            custom_system: c.custom_system.clone(),
+        }
+    }
+}
+
+impl From<clewdr_types::ConfigApi> for ClewdrConfig {
+    fn from(c: clewdr_types::ConfigApi) -> Self {
+        Self {
+            ip: c.ip.parse().unwrap_or(default_ip()),
+            port: c.port,
+            check_update: c.check_update,
+            auto_update: c.auto_update,
+            password: c.password,
+            admin_password: c.admin_password,
+            proxy: c.proxy,
+            rproxy: c.rproxy.and_then(|s| Url::parse(&s).ok()),
+            max_retries: c.max_retries,
+            preserve_chats: c.preserve_chats,
+            web_search: c.web_search,
+            enable_web_count_tokens: c.enable_web_count_tokens,
+            sanitize_messages: c.sanitize_messages,
+            skip_first_warning: c.skip_first_warning,
+            skip_second_warning: c.skip_second_warning,
+            skip_restricted: c.skip_restricted,
+            skip_non_pro: c.skip_non_pro,
+            skip_rate_limit: c.skip_rate_limit,
+            skip_normal_pro: c.skip_normal_pro,
+            use_real_roles: c.use_real_roles,
+            custom_h: c.custom_h,
+            custom_a: c.custom_a,
+            custom_prompt: c.custom_prompt,
+            claude_code_client_id: c.claude_code_client_id,
+            custom_system: c.custom_system,
+            ..Default::default()
+        }
+    }
+}
+
 impl ClewdrConfig {
     pub fn user_auth(&self, key: &str) -> bool {
         key == self.password
@@ -293,6 +358,22 @@ impl ClewdrConfig {
     ///
     /// # Returns
     /// The URL for the API endpoint
+    pub fn ip(&self) -> IpAddr {
+        self.ip
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn password(&self) -> &str {
+        &self.password
+    }
+
+    pub fn admin_password(&self) -> &str {
+        &self.admin_password
+    }
+
     pub fn endpoint(&self) -> Url {
         if let Some(ref proxy) = self.rproxy {
             return proxy.to_owned();
