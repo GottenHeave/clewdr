@@ -315,7 +315,16 @@ impl ClewdrConfig {
         {
             tokio::fs::create_dir_all(parent).await?;
         }
-        Ok(tokio::fs::write(CONFIG_PATH.as_path(), toml::ser::to_string_pretty(self)?).await?)
+        let path = CONFIG_PATH.as_path();
+        let data = toml::ser::to_string_pretty(self)?;
+        tokio::fs::write(path, data).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            tokio::fs::set_permissions(path, perms).await?;
+        }
+        Ok(())
     }
 
     /// Validate the configuration
