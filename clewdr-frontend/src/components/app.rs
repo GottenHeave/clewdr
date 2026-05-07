@@ -88,7 +88,7 @@ pub fn App() -> impl IntoView {
                 <div class="container row-btw">
                     <div class="row">
                         <h1>"ClewdR"</h1>
-                        <span class="text-xs text-mute truncate" style="max-width:220px">{move || version.get()}</span>
+                        <span class="text-xs text-mute" style="white-space:pre-line">{move || version.get()}</span>
                     </div>
                     <div class="row-sm">
                         <ThemeToggle />
