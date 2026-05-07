@@ -5,7 +5,7 @@
 </p>
 
 ClewdR 是面向 Claude（Claude.ai、Claude Code）的 Rust 代理。  
-它提供低资源占用的多端点转发，并附带一个 React 管理界面用于管理 Cookie 和配置。
+它提供低资源占用的多端点转发，并附带一个 Leptos/WASM 管理界面用于管理 Cookie 和配置。
 
 ---
 
