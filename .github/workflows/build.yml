@@ -33,7 +33,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      - uses: cargo-bins/cargo-binstall@v1
+      - uses: cargo-bins/cargo-binstall@main
 
       - name: Install trunk
         run: cargo binstall trunk --no-confirm
