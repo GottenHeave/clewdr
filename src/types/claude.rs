@@ -1,7 +1,6 @@
-use serde::de;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 use serde_json::Value;
-use serde_with::{serde_as, DefaultOnError};
+use serde_with::{DefaultOnError, serde_as};
 use tiktoken_rs::o200k_base;
 
 #[derive(Debug)]
@@ -426,6 +425,8 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControlEphemeral>,
     },
+    #[serde(untagged)]
+    Unknown(serde_json::Value),
 }
 
 /// Source of an image
@@ -1022,8 +1023,9 @@ pub struct StreamError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn deserializes_claude_code_builtin_tools_without_input_schema() {
