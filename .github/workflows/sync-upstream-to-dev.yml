@@ -1,0 +1,208 @@
+name: Sync upstream to dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Optional upstream release tag, tag ref, or commit SHA to sync"
+        required: false
+        type: string
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches:
+      - upstream-sync-trigger
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: sync-upstream-to-dev
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_OWNER: Xerxes-2
+  UPSTREAM_REPO: clewdr
+  UPSTREAM_BRANCH: master
+  DEV_BRANCH: dev
+  TRIGGER_BRANCH: upstream-sync-trigger
+
+jobs:
+  sync:
+    name: Create Copilot sync task
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.pull_request.head.repo.full_name == 'Xerxes-2/clewdr' &&
+        github.event.pull_request.head.ref == 'master' &&
+        github.event.pull_request.base.ref == 'upstream-sync-trigger'
+      )
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve upstream release
+        id: target
+        shell: bash
+        env:
+          COPILOT_AGENT_PAT: ${{ secrets.COPILOT_AGENT_PAT }}
+          TARGET_REF_INPUT: ${{ inputs.target_ref }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${COPILOT_AGENT_PAT}" ]; then
+            echo "COPILOT_AGENT_PAT is required." >&2
+            exit 1
+          fi
+
+          git remote add upstream "https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          git fetch --tags upstream "refs/tags/v*:refs/tags/v*"
+          git fetch origin \
+            "+refs/heads/${DEV_BRANCH}:refs/remotes/origin/${DEV_BRANCH}" \
+            "+refs/heads/master:refs/remotes/origin/master"
+
+          upstream_head="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+          target_input="${TARGET_REF_INPUT:-}"
+
+          if [ -n "${target_input}" ]; then
+            target_ref="${target_input#refs/tags/}"
+            target_label="${target_ref}"
+          else
+            release_json="$(
+              curl -fsSL \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${COPILOT_AGENT_PAT}" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/releases/latest" \
+                || true
+            )"
+            target_ref="$(jq -r '.tag_name // empty' <<< "${release_json}")"
+
+            if [ -z "${target_ref}" ]; then
+              target_ref="$(git tag -l 'v*' --sort=-version:refname | head -n 1)"
+            fi
+
+            if [ -z "${target_ref}" ]; then
+              echo "No upstream release or v* tag was found."
+              echo "should_sync=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+
+            target_label="${target_ref}"
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${target_ref}^{commit}" >/dev/null; then
+            target_sha="$(git rev-list -n 1 "refs/tags/${target_ref}")"
+          else
+            target_sha="$(git rev-parse "${target_ref}^{commit}")"
+          fi
+
+          if [ -z "${target_input}" ] && [ "${target_sha}" != "${upstream_head}" ]; then
+            echo "Latest release/tag ${target_label} is not upstream/${UPSTREAM_BRANCH} HEAD."
+            echo "should_sync=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor "${target_sha}" "origin/${DEV_BRANCH}"; then
+            echo "origin/${DEV_BRANCH} already contains ${target_label} (${target_sha})."
+            echo "should_sync=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "should_sync=true" >> "${GITHUB_OUTPUT}"
+          echo "target_ref=${target_ref}" >> "${GITHUB_OUTPUT}"
+          echo "target_label=${target_label}" >> "${GITHUB_OUTPUT}"
+          echo "target_sha=${target_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Keep master on upstream release
+        if: steps.target.outputs.should_sync == 'true'
+        shell: bash
+        env:
+          COPILOT_AGENT_PAT: ${{ secrets.COPILOT_AGENT_PAT }}
+          REPO_PUSH_PAT: ${{ secrets.REPO_PUSH_PAT }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+
+          push_token="${REPO_PUSH_PAT:-${COPILOT_AGENT_PAT}}"
+          if [ -z "${push_token}" ]; then
+            echo "REPO_PUSH_PAT or COPILOT_AGENT_PAT is required to update master." >&2
+            exit 1
+          fi
+
+          cp ".github/workflows/sync-upstream-to-dev.yml" "${RUNNER_TEMP}/sync-upstream-to-dev.yml"
+
+          git config user.name "GottenHeave"
+          git config user.email "gotten-pelt-heave@duck.com"
+          git remote set-url origin "https://x-access-token:${push_token}@github.com/${GITHUB_REPOSITORY}.git"
+
+          git reset --hard "${TARGET_SHA}"
+          mkdir -p ".github/workflows"
+          cp "${RUNNER_TEMP}/sync-upstream-to-dev.yml" ".github/workflows/sync-upstream-to-dev.yml"
+          git add ".github/workflows/sync-upstream-to-dev.yml"
+          git commit -m "ci: keep upstream sync workflow"
+          git push --force-with-lease origin "HEAD:master"
+
+      - name: Validate GitHub CLI agent-task support
+        if: steps.target.outputs.should_sync == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_AGENT_PAT }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "COPILOT_AGENT_PAT is required to create a Copilot agent task." >&2
+            exit 1
+          fi
+
+          gh --version
+          gh auth status --hostname github.com
+          gh agent-task create --help >/dev/null
+
+      - name: Create Copilot agent task
+        if: steps.target.outputs.should_sync == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_AGENT_PAT }}
+          TARGET_REF: ${{ steps.target.outputs.target_ref }}
+          TARGET_LABEL: ${{ steps.target.outputs.target_label }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+
+          title="Sync upstream ${TARGET_LABEL} into ${DEV_BRANCH}"
+          open_pr_count="$(
+            gh pr list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base "${DEV_BRANCH}" \
+              --state open \
+              --search "${title} in:title" \
+              --json number \
+              --jq length
+          )"
+
+          if [ "${open_pr_count}" != "0" ]; then
+            echo "An open pull request already exists for ${TARGET_LABEL}."
+            exit 0
+          fi
+
+          prompt="$(
+            printf '%s\n\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n\n%s\n' \
+              "Open a pull request titled '${title}' targeting ${DEV_BRANCH}." \
+              "Requirements:" \
+              "- Base your work on ${DEV_BRANCH}; do not target master." \
+              "- Bring in upstream commit ${TARGET_SHA}." \
+              "- Preserve the local cache-related changes already present on ${DEV_BRANCH}." \
+              "- Resolve conflicts by keeping upstream behavior and retaining the cache feature." \
+              "- Run the relevant Rust and frontend checks that are available in this branch." \
+              "- Open a pull request targeting ${DEV_BRANCH}." \
+              "This task was created by the upstream sync workflow for ${UPSTREAM_OWNER}/${UPSTREAM_REPO}@${TARGET_LABEL}."
+          )"
+
+          gh agent-task create "${prompt}" --repo "${GITHUB_REPOSITORY}" --base "${DEV_BRANCH}"
