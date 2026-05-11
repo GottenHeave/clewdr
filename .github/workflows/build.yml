@@ -6,9 +6,11 @@ on:
       - "v[0-9]+.[0-9]+.[0-9]+"
     branches:
       - master
+      - dev
   pull_request:
     branches:
       - master
+      - dev
   workflow_dispatch:
 
 env:

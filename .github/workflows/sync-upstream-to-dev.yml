@@ -148,8 +148,46 @@ jobs:
           git commit -m "ci: keep upstream sync workflow"
           git push --force-with-lease origin "HEAD:master"
 
-      - name: Validate GitHub CLI agent-task support
+      - name: Try automatic dev sync
+        id: auto_sync
         if: steps.target.outputs.should_sync == 'true'
+        shell: bash
+        env:
+          COPILOT_AGENT_PAT: ${{ secrets.COPILOT_AGENT_PAT }}
+          REPO_PUSH_PAT: ${{ secrets.REPO_PUSH_PAT }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+
+          push_token="${REPO_PUSH_PAT:-${COPILOT_AGENT_PAT}}"
+          if [ -z "${push_token}" ]; then
+            echo "REPO_PUSH_PAT or COPILOT_AGENT_PAT is required to update dev." >&2
+            exit 1
+          fi
+
+          git config user.name "GottenHeave"
+          git config user.email "gotten-pelt-heave@duck.com"
+          git remote set-url origin "https://x-access-token:${push_token}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch origin "+refs/heads/${DEV_BRANCH}:refs/remotes/origin/${DEV_BRANCH}"
+          git switch -C "${DEV_BRANCH}" "origin/${DEV_BRANCH}"
+
+          if git rebase "${TARGET_SHA}"; then
+            if git merge-base --is-ancestor "${TARGET_SHA}" HEAD; then
+              git push --force-with-lease origin "HEAD:${DEV_BRANCH}"
+              echo "synced=true" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+
+            echo "Automatic rebase completed but ${DEV_BRANCH} does not contain ${TARGET_SHA}." >&2
+          else
+            echo "Automatic rebase failed; falling back to Copilot agent task."
+          fi
+
+          git rebase --abort 2>/dev/null || true
+          echo "synced=false" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate GitHub CLI agent-task support
+        if: steps.target.outputs.should_sync == 'true' && steps.auto_sync.outputs.synced != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.COPILOT_AGENT_PAT }}
@@ -166,7 +204,7 @@ jobs:
           gh agent-task create --help >/dev/null
 
       - name: Create Copilot agent task
-        if: steps.target.outputs.should_sync == 'true'
+        if: steps.target.outputs.should_sync == 'true' && steps.auto_sync.outputs.synced != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.COPILOT_AGENT_PAT }}
