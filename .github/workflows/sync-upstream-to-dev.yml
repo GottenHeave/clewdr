@@ -45,19 +45,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Resolve upstream release
+      - name: Resolve upstream version
         id: target
         shell: bash
         env:
-          COPILOT_AGENT_PAT: ${{ secrets.COPILOT_AGENT_PAT }}
           TARGET_REF_INPUT: ${{ inputs.target_ref }}
         run: |
           set -euo pipefail
-
-          if [ -z "${COPILOT_AGENT_PAT}" ]; then
-            echo "COPILOT_AGENT_PAT is required." >&2
-            exit 1
-          fi
 
           git remote add upstream "https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}.git" 2>/dev/null || true
           git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
@@ -72,40 +66,38 @@ jobs:
           if [ -n "${target_input}" ]; then
             target_ref="${target_input#refs/tags/}"
             target_label="${target_ref}"
-          else
-            release_json="$(
-              curl -fsSL \
-                -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer ${COPILOT_AGENT_PAT}" \
-                -H "X-GitHub-Api-Version: 2022-11-28" \
-                "https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/releases/latest" \
-                || true
-            )"
-            target_ref="$(jq -r '.tag_name // empty' <<< "${release_json}")"
-
-            if [ -z "${target_ref}" ]; then
-              target_ref="$(git tag -l 'v*' --sort=-version:refname | head -n 1)"
+            if git rev-parse -q --verify "refs/tags/${target_ref}^{commit}" >/dev/null; then
+              target_sha="$(git rev-list -n 1 "refs/tags/${target_ref}")"
+            else
+              target_sha="$(git rev-parse "${target_ref}^{commit}")"
             fi
+          else
+            upstream_version="$(
+              git show "${upstream_head}:Cargo.toml" |
+                sed -n 's/^version = "\([^"]*\)"/\1/p' |
+                head -n 1
+            )"
+            dev_version="$(
+              git show "origin/${DEV_BRANCH}:Cargo.toml" |
+                sed -n 's/^version = "\([^"]*\)"/\1/p' |
+                head -n 1
+            )"
 
-            if [ -z "${target_ref}" ]; then
-              echo "No upstream release or v* tag was found."
+            if [ -z "${upstream_version}" ] || [ -z "${dev_version}" ]; then
+              echo "Could not resolve upstream/dev Cargo.toml package versions."
               echo "should_sync=false" >> "${GITHUB_OUTPUT}"
               exit 0
             fi
 
-            target_label="${target_ref}"
-          fi
+            if [ "${upstream_version}" = "${dev_version}" ]; then
+              echo "No upstream version bump: upstream=${upstream_version}, dev=${dev_version}."
+              echo "should_sync=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
 
-          if git rev-parse -q --verify "refs/tags/${target_ref}^{commit}" >/dev/null; then
-            target_sha="$(git rev-list -n 1 "refs/tags/${target_ref}")"
-          else
-            target_sha="$(git rev-parse "${target_ref}^{commit}")"
-          fi
-
-          if [ -z "${target_input}" ] && [ "${target_sha}" != "${upstream_head}" ]; then
-            echo "Latest release/tag ${target_label} is not upstream/${UPSTREAM_BRANCH} HEAD."
-            echo "should_sync=false" >> "${GITHUB_OUTPUT}"
-            exit 0
+            target_ref="upstream/${UPSTREAM_BRANCH}"
+            target_label="v${upstream_version}"
+            target_sha="${upstream_head}"
           fi
 
           if git merge-base --is-ancestor "${target_sha}" "origin/${DEV_BRANCH}"; then
@@ -136,6 +128,7 @@ jobs:
           fi
 
           cp ".github/workflows/sync-upstream-to-dev.yml" "${RUNNER_TEMP}/sync-upstream-to-dev.yml"
+          cp ".github/workflows/build.yml" "${RUNNER_TEMP}/build.yml"
 
           git config user.name "GottenHeave"
           git config user.email "gotten-pelt-heave@duck.com"
@@ -144,7 +137,8 @@ jobs:
           git reset --hard "${TARGET_SHA}"
           mkdir -p ".github/workflows"
           cp "${RUNNER_TEMP}/sync-upstream-to-dev.yml" ".github/workflows/sync-upstream-to-dev.yml"
-          git add ".github/workflows/sync-upstream-to-dev.yml"
+          cp "${RUNNER_TEMP}/build.yml" ".github/workflows/build.yml"
+          git add ".github/workflows/sync-upstream-to-dev.yml" ".github/workflows/build.yml"
           git commit -m "ci: keep upstream sync workflow"
           git push --force-with-lease origin "HEAD:master"
 
