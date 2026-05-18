@@ -135,6 +135,11 @@ jobs:
           git remote set-url origin "https://x-access-token:${push_token}@github.com/${GITHUB_REPOSITORY}.git"
 
           git reset --hard "${TARGET_SHA}"
+          rm -rf ".github/workflows"
+          git add -A ".github/workflows"
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: disable master automation"
+          fi
           git push --force-with-lease origin "HEAD:master"
 
       - name: Try automatic dev sync
