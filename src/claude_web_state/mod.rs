@@ -12,6 +12,8 @@ use wreq::{
     header::{ORIGIN, REFERER},
 };
 
+use sha2::{Digest, Sha256};
+
 use crate::{
     config::{CLAUDE_ENDPOINT, CLEWDR_CONFIG, CookieStatus, Reason},
     error::{ClewdrError, WreqSnafu},
@@ -180,7 +182,7 @@ impl ClaudeWebState {
         if let Some(ref cookie) = self.cookie {
             // Invalidate cache for this cookie if there's a reason (cookie changed)
             if reason.is_some() {
-                self.conv_cache.invalidate_by_cookie(&cookie.cookie.to_string()).await;
+                self.conv_cache.invalidate_by_cookie(&self.cookie_id()).await;
             }
             self.cookie_actor_handle
                 .return_cookie(cookie.to_owned(), reason)
@@ -304,7 +306,11 @@ impl ClaudeWebState {
 
     fn cookie_id(&self) -> String {
         self.cookie.as_ref()
-            .map(|c| c.cookie.to_string())
+            .map(|c| {
+                let mut hasher = Sha256::new();
+                hasher.update(c.cookie.to_string());
+                hex::encode(hasher.finalize())
+            })
             .unwrap_or_default()
     }
 }
