@@ -419,3 +419,85 @@ async fn test_cache_key_isolation() {
     assert!(cache.get(&key0).await.is_none());
     assert!(cache.get(&key1).await.is_some());
 }
+
+/// Test: persistent cache reloads valid entries from disk.
+#[tokio::test]
+async fn test_persistent_cache_reloads_valid_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("conversation_cache.json");
+    let key = CacheKey { key_index: 0 };
+    let sys_hash = hash_system(&None);
+    let cookie_id = "hashed-cookie-id";
+
+    let cache = ConversationCache::persistent(&path).await;
+    let mut conv = make_cached(
+        "conv_persisted",
+        vec![CachedTurn {
+            user_hashes: vec![hash_user_message(&make_user_msg("u1"))],
+            assistant_uuid: "asst0".to_string(),
+        }],
+        sys_hash,
+    );
+    conv.cookie_id = cookie_id.to_string();
+    cache.set(key.clone(), conv).await;
+
+    let persisted = std::fs::read_to_string(&path).unwrap();
+    assert!(persisted.contains(cookie_id));
+    assert!(!persisted.contains("sessionKey="));
+
+    let reloaded = ConversationCache::persistent(&path).await;
+    let cached = reloaded.get(&key).await.unwrap();
+    assert_eq!(cached.conv_uuid, "conv_persisted");
+    assert_eq!(cached.cookie_id, cookie_id);
+    assert_eq!(cached.turns.len(), 1);
+    assert!(reloaded.is_last_stream_healthy(&key).await);
+}
+
+/// Test: persistent cache skips expired and invalid entries after restart.
+#[tokio::test]
+async fn test_persistent_cache_skips_expired_and_invalid_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("conversation_cache.json");
+    let sys_hash = hash_system(&None);
+
+    let expired_key = CacheKey { key_index: 0 };
+    let invalid_key = CacheKey { key_index: 1 };
+    let valid_key = CacheKey { key_index: 2 };
+    let cache = ConversationCache::persistent(&path).await;
+
+    let mut expired = make_cached("conv_expired", vec![], sys_hash);
+    expired.created_at = chrono::Utc::now() - chrono::Duration::days(26);
+    cache.set(expired_key.clone(), expired).await;
+
+    let mut invalid = make_cached("conv_invalid", vec![], sys_hash);
+    invalid.valid = false;
+    cache.set(invalid_key.clone(), invalid).await;
+
+    cache.set(valid_key.clone(), make_cached("conv_valid", vec![], sys_hash)).await;
+
+    let reloaded = ConversationCache::persistent(&path).await;
+    assert!(reloaded.get(&expired_key).await.is_none());
+    assert!(reloaded.get(&invalid_key).await.is_none());
+    assert_eq!(
+        reloaded.get(&valid_key).await.unwrap().conv_uuid,
+        "conv_valid"
+    );
+}
+
+/// Test: stream health is stored as a bool and restored after restart.
+#[tokio::test]
+async fn test_persistent_cache_restores_stream_health() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("conversation_cache.json");
+    let key = CacheKey { key_index: 0 };
+    let sys_hash = hash_system(&None);
+
+    let cache = ConversationCache::persistent(&path).await;
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut conv = make_cached("conv_unhealthy", vec![], sys_hash);
+    conv.last_stream_healthy = flag;
+    cache.set(key.clone(), conv).await;
+
+    let reloaded = ConversationCache::persistent(&path).await;
+    assert!(!reloaded.is_last_stream_healthy(&key).await);
+}

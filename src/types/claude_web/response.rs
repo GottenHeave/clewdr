@@ -92,6 +92,7 @@ impl ClaudeWebState {
             let endpoint = self.endpoint.clone();
             let proxy = self.proxy.clone();
             let client = self.client.clone();
+            let conv_cache = self.conv_cache.clone();
             // try to get precise input tokens via Claude Code count_tokens if enabled
             if crate::config::CLEWDR_CONFIG.load().enable_web_count_tokens
                 && let Some(tokens) = self.try_code_count_tokens().await
@@ -119,6 +120,7 @@ impl ClaudeWebState {
                 // Stream completed successfully — mark as healthy
                 if let Some(flag) = stream_health_flag.as_ref() {
                     flag.store(true, Ordering::Relaxed);
+                    conv_cache.flush().await;
                 }
                 // on end of stream, compute output tokens and persist totals
                 if !acc.is_empty() {

@@ -11,6 +11,7 @@ use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 use crate::{
     api::*,
     claude_web_state::conversation_cache::ConversationCache,
+    config::{CLEWDR_CONFIG, CONVERSATION_CACHE_PATH},
     middleware::{
         RequireAdminAuth, RequireBearerAuth, RequireFlexibleAuth,
         claude::{add_usage_info, apply_stop_sequences, check_overloaded, to_oai},
@@ -38,7 +39,11 @@ impl RouterBuilder {
             .expect("Failed to start CookieActor");
 
         // Create shared conversation cache
-        let conv_cache = ConversationCache::new();
+        let conv_cache = if CLEWDR_CONFIG.load().no_fs {
+            ConversationCache::new()
+        } else {
+            ConversationCache::persistent(CONVERSATION_CACHE_PATH.as_path()).await
+        };
 
         // Spawn periodic cleanup task (every hour)
         let cache_clone = conv_cache.clone();
@@ -50,10 +55,8 @@ impl RouterBuilder {
             }
         });
 
-        let claude_providers = crate::providers::claude::build_providers(
-            cookie_handle.clone(),
-            conv_cache,
-        );
+        let claude_providers =
+            crate::providers::claude::build_providers(cookie_handle.clone(), conv_cache);
         RouterBuilder {
             claude_providers,
             cookie_actor_handle: cookie_handle,
