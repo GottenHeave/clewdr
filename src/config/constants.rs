@@ -11,6 +11,7 @@ use url::Url;
 use crate::{Args, config::ClewdrConfig};
 
 pub const CONFIG_NAME: &str = "clewdr.toml";
+pub const CONVERSATION_CACHE_NAME: &str = "conversation_cache.json";
 pub const CLAUDE_ENDPOINT: &str = "https://api.anthropic.com/";
 #[allow(dead_code)]
 pub const CLAUDE_CONSOLE_ENDPOINT: &str = "https://console.anthropic.com/";
@@ -73,6 +74,13 @@ pub static CONFIG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
             strategy.in_config_dir(CONFIG_NAME)
         }
     }
+});
+
+pub static CONVERSATION_CACHE_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
+    CONFIG_PATH
+        .parent()
+        .map(|path| path.join(CONVERSATION_CACHE_NAME))
+        .unwrap_or_else(|| PathBuf::from(CONVERSATION_CACHE_NAME))
 });
 
 #[cfg(feature = "portable")]

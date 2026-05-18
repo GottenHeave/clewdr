@@ -60,7 +60,8 @@ RUN RUST_TARGET=$(cat /tmp/rust-target) && \
     && cp ./target/"$RUST_TARGET"/release/clewdr /build/clewdr \
     && upx --best --lzma /build/clewdr \
     && mkdir -p /etc/clewdr/log \
-    && touch /etc/clewdr/clewdr.toml
+    && touch /etc/clewdr/clewdr.toml \
+    && touch /etc/clewdr/conversation_cache.json
 
 FROM gcr.io/distroless/static-debian13
 COPY --from=backend-builder /build/clewdr /usr/local/bin/clewdr
@@ -72,5 +73,6 @@ ENV CLEWDR_AUTO_UPDATE=FALSE
 
 EXPOSE 8484
 
+# Stores clewdr.toml, logs, and conversation_cache.json across restarts.
 VOLUME [ "/etc/clewdr" ]
 CMD ["/usr/local/bin/clewdr", "--config", "/etc/clewdr/clewdr.toml", "--log-dir", "/etc/clewdr/log"]
