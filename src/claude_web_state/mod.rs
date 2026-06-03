@@ -297,10 +297,30 @@ impl ClaudeWebState {
         Ok(())
     }
 
-    fn cache_key(&self) -> CacheKey {
+    fn cache_key_for(&self, params: &CreateMessageParams) -> CacheKey {
+        let mut hasher = Sha256::new();
+        hasher.update(diff::hash_system(&params.system).to_le_bytes());
+        if let Some((_, first_user_hash)) = diff::extract_user_hashes(&params.messages).first() {
+            hasher.update(first_user_hash.to_le_bytes());
+        }
+        let digest = hasher.finalize();
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+
         CacheKey {
             key_index: self.key.map(|(_, idx)| idx).unwrap_or(0),
+            request_fingerprint: u64::from_le_bytes(bytes),
         }
+    }
+
+    fn cache_key(&self) -> CacheKey {
+        self.last_params
+            .as_ref()
+            .map(|params| self.cache_key_for(params))
+            .unwrap_or(CacheKey {
+                key_index: self.key.map(|(_, idx)| idx).unwrap_or(0),
+                request_fingerprint: 0,
+            })
     }
 
     fn cookie_id(&self) -> String {

@@ -136,7 +136,7 @@ impl ClaudeWebState {
                     Err(e) => {
                         warn!("Reuse failed, falling back to full: {}", e);
                         // invalidate on failure
-                        self.conv_cache.invalidate(&self.cache_key()).await;
+                        self.conv_cache.invalidate(&self.cache_key_for(&p)).await;
                         // fall through to full path
                     }
                 }
@@ -156,7 +156,7 @@ impl ClaudeWebState {
         &mut self,
         p: &CreateMessageParams,
     ) -> Option<Result<Response, ClewdrError>> {
-        let key = self.cache_key();
+        let key = self.cache_key_for(p);
         let cached = self.conv_cache.get(&key).await?;
 
         // Check stream health from previous request
@@ -382,7 +382,7 @@ impl ClaudeWebState {
                 .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
 
             self.pending_cache_write = Some(PendingCacheWrite::Init {
-                key: self.cache_key(),
+                key: self.cache_key_for(&p),
                 conv: CachedConversation {
                     conv_uuid: new_uuid.clone(),
                     org_uuid: org_uuid.clone(),
@@ -462,7 +462,7 @@ impl ClaudeWebState {
 
         // Prepare optimistic cache write
         self.pending_cache_write = Some(PendingCacheWrite::AppendTurn {
-            key: self.cache_key(),
+            key: self.cache_key_for(p),
             turn: CachedTurn {
                 user_hashes: new_user_hashes.to_vec(),
                 assistant_uuid,
@@ -527,7 +527,7 @@ impl ClaudeWebState {
 
         // Prepare fork cache write
         self.pending_cache_write = Some(PendingCacheWrite::ForkAndAppend {
-            key: self.cache_key(),
+            key: self.cache_key_for(p),
             fork_turn_index,
             turn: CachedTurn {
                 user_hashes: remaining_user_hashes.to_vec(),
