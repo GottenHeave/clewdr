@@ -23,7 +23,11 @@ pub fn hash_user_message(msg: &Message) -> u64 {
                         // This ensures image changes are detected
                         format!("{:?}", source).hash(&mut hasher);
                     }
-                    _ => {}
+                    other => {
+                        serde_json::to_string(other)
+                            .unwrap_or_else(|_| format!("{:?}", other))
+                            .hash(&mut hasher);
+                    }
                 }
             }
         }
