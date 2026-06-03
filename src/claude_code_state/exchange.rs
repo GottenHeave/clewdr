@@ -116,7 +116,7 @@ impl ClaudeCodeState {
         let authorize_url = CLEWDR_CONFIG
             .load()
             .endpoint()
-            .join(&format!("v1/oauth/{}/authorize", org_uuid))
+            .join(&format!("v1/oauth/{org_uuid}/authorize"))
             .expect("Url parse error");
         let cc_client_id = CLEWDR_CONFIG.load().cc_client_id();
 
@@ -164,7 +164,7 @@ impl ClaudeCodeState {
             redirect_json["redirect_uri"]
                 .as_str()
                 .ok_or_else(|| ClewdrError::Whatever {
-                    message: format!("No reditect_uri found"),
+                    message: "No reditect_uri found".to_string(),
                     source: None,
                 })?;
         let redirect_url = Url::from_str(redirect_uri).context(UrlSnafu {

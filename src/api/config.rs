@@ -30,7 +30,7 @@ pub async fn api_post_config(
         new_c
     });
     if let Err(e) = CLEWDR_CONFIG.load().save().await {
-        return Err(ApiError::internal(format!("Failed to save config: {}", e)));
+        return Err(ApiError::internal(format!("Failed to save config: {e}")));
     }
 
     Ok(Json(json!({

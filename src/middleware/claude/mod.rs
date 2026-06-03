@@ -46,6 +46,17 @@ fn thinking_summary_delta_text(data: &Value) -> Option<&str> {
         .filter(|summary| !summary.is_empty())
 }
 
+pub(crate) fn thinking_summary_delta_index(data: &str) -> Option<usize> {
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return None;
+    };
+    thinking_summary_delta_text(&value)?;
+    value
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+}
+
 pub(crate) fn normalize_claude_web_stream_event(data: &str) -> Option<String> {
     let Ok(mut value) = serde_json::from_str::<Value>(data) else {
         return Some(data.to_owned());

@@ -21,11 +21,11 @@ pub fn hash_user_message(msg: &Message) -> u64 {
                         // Hash the image source for change detection
                         // For base64: hash the data
                         // This ensures image changes are detected
-                        format!("{:?}", source).hash(&mut hasher);
+                        format!("{source:?}").hash(&mut hasher);
                     }
                     other => {
                         serde_json::to_string(other)
-                            .unwrap_or_else(|_| format!("{:?}", other))
+                            .unwrap_or_else(|_| format!("{other:?}"))
                             .hash(&mut hasher);
                     }
                 }
@@ -39,7 +39,7 @@ pub fn hash_user_message(msg: &Message) -> u64 {
 pub fn hash_system(system: &Option<Value>) -> u64 {
     let mut hasher = DefaultHasher::new();
     match system {
-        Some(v) => format!("{}", v).hash(&mut hasher),
+        Some(v) => format!("{v}").hash(&mut hasher),
         None => 0u64.hash(&mut hasher),
     }
     hasher.finish()
@@ -282,7 +282,7 @@ mod tests {
                 assert_eq!(new_user_hashes.len(), 1);
                 assert_eq!(new_user_hashes[0], hashes[2].1);
             }
-            _ => panic!("Expected Append, got {:?}", result),
+            _ => panic!("Expected Append, got {result:?}"),
         }
     }
 
@@ -364,7 +364,7 @@ mod tests {
                 assert!(remaining_user_indices.contains(&1));
                 assert!(remaining_user_indices.contains(&2));
             }
-            _ => panic!("Expected Fork, got {:?}", result),
+            _ => panic!("Expected Fork, got {result:?}"),
         }
     }
 
