@@ -68,9 +68,13 @@ fn normalize_stream(
 ) -> impl Stream<Item = EventResult<Event>> {
     try_stream!({
         let mut started_thinking_indexes = std::collections::HashSet::new();
+        let mut stopped_thinking_indexes = std::collections::HashSet::new();
         for await event in stream {
             let event = event?;
             let summary_delta_index = thinking_summary_delta_index(&event.data);
+            if summary_delta_index.is_some_and(|index| stopped_thinking_indexes.contains(&index)) {
+                continue;
+            }
             let new_event = source_event_template(&event);
             let Some(data) = normalize_claude_web_stream_event(&event.data) else {
                 continue;
@@ -85,6 +89,11 @@ fn normalize_stream(
             } = &parsed
             {
                 started_thinking_indexes.insert(*index);
+            }
+            if let StreamEvent::ContentBlockStop { index } = &parsed {
+                if started_thinking_indexes.contains(index) {
+                    stopped_thinking_indexes.insert(*index);
+                }
             }
             if let Some(index) = summary_delta_index {
                 if started_thinking_indexes.insert(index) {
@@ -225,6 +234,34 @@ mod tests {
                 .and_then(|delta| delta.get("thinking"))
                 .and_then(Value::as_str),
             Some("确认端口已改，更新草稿回复。")
+        );
+    }
+
+    #[test]
+    fn rewrites_web_thinking_block_start_events() {
+        let data = r#"{"type":"content_block_start","index":0,"content_block":{"start_timestamp":"2026-06-03T21:21:00.547429Z","stop_timestamp":null,"flags":null,"type":"thinking","thinking":"","summaries":[],"cut_off":false,"truncated":false,"alternative_display_type":null}}"#;
+        let normalized = normalize_claude_web_stream_event(data).unwrap();
+        let normalized: Value = serde_json::from_str(&normalized).unwrap();
+
+        assert_eq!(
+            normalized
+                .get("content_block")
+                .and_then(|block| block.get("type"))
+                .and_then(Value::as_str),
+            Some("thinking")
+        );
+        assert_eq!(
+            normalized
+                .get("content_block")
+                .and_then(|block| block.get("signature"))
+                .and_then(Value::as_str),
+            Some("")
+        );
+        assert!(
+            normalized
+                .get("content_block")
+                .and_then(|block| block.get("summaries"))
+                .is_none()
         );
     }
 

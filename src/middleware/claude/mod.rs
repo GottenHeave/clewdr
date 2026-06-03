@@ -46,15 +46,28 @@ fn thinking_summary_delta_text(data: &Value) -> Option<&str> {
         .filter(|summary| !summary.is_empty())
 }
 
+fn content_block_index(value: &Value) -> Option<usize> {
+    value
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+}
+
+fn is_thinking_block_start(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("content_block_start")
+        && value
+            .get("content_block")
+            .and_then(|block| block.get("type"))
+            .and_then(Value::as_str)
+            == Some("thinking")
+}
+
 pub(crate) fn thinking_summary_delta_index(data: &str) -> Option<usize> {
     let Ok(value) = serde_json::from_str::<Value>(data) else {
         return None;
     };
     thinking_summary_delta_text(&value)?;
-    value
-        .get("index")
-        .and_then(Value::as_u64)
-        .and_then(|index| usize::try_from(index).ok())
+    content_block_index(&value)
 }
 
 pub(crate) fn normalize_claude_web_stream_event(data: &str) -> Option<String> {
@@ -64,6 +77,17 @@ pub(crate) fn normalize_claude_web_stream_event(data: &str) -> Option<String> {
 
     if value.get("type").and_then(Value::as_str) == Some("message_limit") {
         return None;
+    }
+
+    if is_thinking_block_start(&value) {
+        if let Some(content_block) = value.get_mut("content_block") {
+            *content_block = serde_json::json!({
+                "type": "thinking",
+                "signature": "",
+                "thinking": "",
+            });
+        }
+        return Some(value.to_string());
     }
 
     let Some(summary) = thinking_summary_delta_text(&value).map(str::to_owned) else {
