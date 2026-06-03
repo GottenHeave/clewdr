@@ -260,10 +260,7 @@ impl ClaudeWebState {
         let new_uuid = uuid::Uuid::new_v4().to_string();
         let endpoint = self
             .endpoint
-            .join(&format!(
-                "api/organizations/{}/chat_conversations",
-                org_uuid
-            ))
+            .join(&format!("api/organizations/{org_uuid}/chat_conversations"))
             .map_err(|e| ClewdrError::Whatever {
                 message: format!("Parse URL error: {e}"),
                 source: Some(Box::new(e)),
@@ -313,8 +310,7 @@ impl ClaudeWebState {
         let endpoint = self
             .endpoint
             .join(&format!(
-                "api/organizations/{}/chat_conversations/{}",
-                org_uuid, new_uuid
+                "api/organizations/{org_uuid}/chat_conversations/{new_uuid}"
             ))
             .map_err(|e| ClewdrError::Whatever {
                 message: format!("Parse URL error: {e}"),
@@ -352,8 +348,7 @@ impl ClaudeWebState {
         let endpoint = self
             .endpoint
             .join(&format!(
-                "api/organizations/{}/chat_conversations/{}/completion",
-                org_uuid, new_uuid
+                "api/organizations/{org_uuid}/chat_conversations/{new_uuid}/completion"
             ))
             .expect("Url parse error");
 

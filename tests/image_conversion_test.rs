@@ -35,7 +35,7 @@ mod tests {
                     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
                 );
             }
-            other => panic!("Expected Base64 image source, got {:?}", other),
+            other => panic!("Expected Base64 image source, got {other:?}"),
         }
     }
 
@@ -51,7 +51,7 @@ mod tests {
                 assert_eq!(media_type, "image/jpeg");
                 assert_eq!(data, "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBg==");
             }
-            other => panic!("Expected Base64 image source, got {:?}", other),
+            other => panic!("Expected Base64 image source, got {other:?}"),
         }
     }
 
@@ -64,7 +64,7 @@ mod tests {
 
         match source.unwrap() {
             ImageSource::Base64 { media_type, .. } => assert_eq!(media_type, "image/webp"),
-            other => panic!("Expected Base64 image source, got {:?}", other),
+            other => panic!("Expected Base64 image source, got {other:?}"),
         }
     }
 
@@ -110,7 +110,7 @@ mod tests {
                 assert_eq!(media_type, "image/png");
                 assert_eq!(data, "iVBORw0KGgo=");
             }
-            other => panic!("Expected Base64 image source, got {:?}", other),
+            other => panic!("Expected Base64 image source, got {other:?}"),
         }
     }
 
@@ -122,7 +122,7 @@ mod tests {
 
         match source.unwrap() {
             ImageSource::Base64 { media_type, .. } => assert_eq!(media_type, "image/jpeg"),
-            other => panic!("Expected Base64 image source, got {:?}", other),
+            other => panic!("Expected Base64 image source, got {other:?}"),
         }
     }
 
@@ -143,7 +143,7 @@ mod tests {
 
         match source.unwrap() {
             ImageSource::Base64 { media_type, .. } => assert_eq!(media_type, "image/png"),
-            other => panic!("Expected Base64 image source, got {:?}", other),
+            other => panic!("Expected Base64 image source, got {other:?}"),
         }
 
         // mixed case Base64
@@ -199,9 +199,9 @@ mod tests {
                         assert_eq!(media_type, "image/png");
                         assert_eq!(data, "iVBORw0KGgo=");
                     }
-                    other => panic!("Expected Base64 image source, got {:?}", other),
+                    other => panic!("Expected Base64 image source, got {other:?}"),
                 },
-                other => panic!("Expected Image block, got {:?}", other),
+                other => panic!("Expected Image block, got {other:?}"),
             }
         } else {
             panic!("Expected Blocks content");
@@ -304,7 +304,7 @@ mod tests {
                         matches!(source, ImageSource::Base64 { data, .. } if data == "existing_data")
                     );
                 }
-                other => panic!("Expected Image block, got {:?}", other),
+                other => panic!("Expected Image block, got {other:?}"),
             }
         }
     }

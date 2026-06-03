@@ -76,7 +76,7 @@ async fn test_sequential_requests_use_cache() {
             assert_eq!(new_user_indices, vec![3]);
             assert_eq!(new_user_hashes.len(), 1);
         }
-        _ => panic!("Expected Append, got {:?}", result),
+        _ => panic!("Expected Append, got {result:?}"),
     }
 
     // Simulate successful append: update cache
@@ -111,7 +111,7 @@ async fn test_sequential_requests_use_cache() {
             assert_eq!(parent_uuid, "asst1");
             assert_eq!(new_user_indices, vec![4]);
         }
-        _ => panic!("Expected Append, got {:?}", result),
+        _ => panic!("Expected Append, got {result:?}"),
     }
 }
 
@@ -214,7 +214,7 @@ async fn test_edit_scenario_fork_multi_turn() {
             assert!(remaining_user_indices.contains(&3)); // u4_edited
             assert!(remaining_user_indices.contains(&4)); // u5
         }
-        _ => panic!("Expected Fork, got {:?}", result),
+        _ => panic!("Expected Fork, got {result:?}"),
     }
 }
 

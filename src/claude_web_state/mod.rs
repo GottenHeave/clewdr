@@ -242,7 +242,7 @@ impl ClaudeWebState {
         let org_uuid = state.org_uuid.as_ref()?;
         let url = state
             .endpoint
-            .join(&format!("api/organizations/{}/usage", org_uuid))
+            .join(&format!("api/organizations/{org_uuid}/usage"))
             .ok()?;
 
         let res = state
@@ -282,8 +282,7 @@ impl ClaudeWebState {
         let endpoint = self
             .endpoint
             .join(&format!(
-                "api/organizations/{}/chat_conversations/{}",
-                org_uuid, conv_uuid
+                "api/organizations/{org_uuid}/chat_conversations/{conv_uuid}"
             ))
             .expect("Url parse error");
         debug!("Deleting chat: {}", conv_uuid);

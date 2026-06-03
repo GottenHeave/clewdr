@@ -1,18 +1,24 @@
+use async_stream::try_stream;
 use axum::{
     Json,
     body::{self, Body},
-    response::{IntoResponse, Response, Sse},
+    response::{IntoResponse, Response, Sse, sse::Event},
 };
-use eventsource_stream::Eventsource;
-use futures::TryStreamExt;
+use eventsource_stream::{Event as SourceEvent, Eventsource};
+use futures::Stream;
 use http::header::CONTENT_TYPE;
 use tracing::warn;
 
 use super::{ClaudeApiFormat, transform_stream};
 use crate::{
-    middleware::claude::{ClaudeContext, normalize_claude_web_stream_event, transforms_json},
-    types::claude::{CreateMessageResponse, StreamEvent},
+    middleware::claude::{
+        ClaudeContext, normalize_claude_web_stream_event, thinking_summary_delta_index,
+        transforms_json,
+    },
+    types::claude::{ContentBlock, CreateMessageResponse, StreamEvent},
 };
+
+type EventResult<T> = Result<T, eventsource_stream::EventStreamError<axum::Error>>;
 
 async fn parse_response<T>(resp: Response) -> Result<T, Response>
 where
@@ -31,6 +37,81 @@ where
             .unwrap());
     };
     Ok(parsed)
+}
+
+fn source_event_template(event: &SourceEvent) -> Event {
+    let new_event = Event::default()
+        .event(event.event.clone())
+        .id(event.id.clone());
+    if let Some(retry) = event.retry {
+        new_event.retry(retry)
+    } else {
+        new_event
+    }
+}
+
+fn thinking_block_start(index: usize) -> Event {
+    Event::default()
+        .json_data(StreamEvent::ContentBlockStart {
+            index,
+            content_block: ContentBlock::Thinking {
+                signature: String::new(),
+                thinking: String::new(),
+            },
+        })
+        .unwrap()
+}
+
+fn normalize_stream(
+    usage: crate::types::claude::Usage,
+    stream: impl Stream<Item = EventResult<SourceEvent>>,
+) -> impl Stream<Item = EventResult<Event>> {
+    try_stream!({
+        let mut started_thinking_indexes = std::collections::HashSet::new();
+        for await event in stream {
+            let event = event?;
+            let summary_delta_index = thinking_summary_delta_index(&event.data);
+            let new_event = source_event_template(&event);
+            let Some(data) = normalize_claude_web_stream_event(&event.data) else {
+                continue;
+            };
+            let Ok(parsed) = serde_json::from_str::<StreamEvent>(&data) else {
+                yield new_event.data(data);
+                continue;
+            };
+            if let StreamEvent::ContentBlockStart {
+                index,
+                content_block: ContentBlock::Thinking { .. },
+            } = &parsed
+            {
+                started_thinking_indexes.insert(*index);
+            }
+            if let Some(index) = summary_delta_index {
+                if started_thinking_indexes.insert(index) {
+                    yield thinking_block_start(index);
+                }
+            }
+            let event = match parsed {
+                StreamEvent::MessageStart { mut message } => {
+                    message.usage.get_or_insert(usage.to_owned());
+                    new_event
+                        .json_data(StreamEvent::MessageStart { message })
+                        .unwrap()
+                }
+                StreamEvent::MessageDelta { delta, usage } => {
+                    let usage = usage.unwrap_or_default();
+                    new_event
+                        .json_data(StreamEvent::MessageDelta {
+                            delta,
+                            usage: Some(usage),
+                        })
+                        .unwrap()
+                }
+                _ => new_event.data(data),
+            };
+            yield event;
+        }
+    })
 }
 
 /// Transforms responses to ensure compatibility with the OpenAI API format
@@ -86,45 +167,8 @@ pub async fn add_usage_info(resp: Response) -> impl IntoResponse {
         response.usage = Some(usage);
         return Json(response).into_response();
     }
-    let stream = resp
-        .into_body()
-        .into_data_stream()
-        .eventsource()
-        .try_filter_map(move |event| {
-            let new_event = axum::response::sse::Event::default()
-                .event(event.event.clone())
-                .id(event.id.clone());
-            let new_event = if let Some(retry) = event.retry {
-                new_event.retry(retry)
-            } else {
-                new_event
-            };
-            let Some(data) = normalize_claude_web_stream_event(&event.data) else {
-                return futures::future::ready(Ok(None));
-            };
-            let Ok(parsed) = serde_json::from_str::<StreamEvent>(&data) else {
-                return futures::future::ready(Ok(Some(new_event.data(data))));
-            };
-            let event = match parsed {
-                StreamEvent::MessageStart { mut message } => {
-                    message.usage.get_or_insert(usage.to_owned());
-                    new_event
-                        .json_data(StreamEvent::MessageStart { message })
-                        .unwrap()
-                }
-                StreamEvent::MessageDelta { delta, usage } => {
-                    let usage = usage.unwrap_or_default();
-                    new_event
-                        .json_data(StreamEvent::MessageDelta {
-                            delta,
-                            usage: Some(usage),
-                        })
-                        .unwrap()
-                }
-                _ => new_event.data(data),
-            };
-            futures::future::ready(Ok(Some(event)))
-        });
+    let stream = resp.into_body().into_data_stream().eventsource();
+    let stream = normalize_stream(usage, stream);
 
     Sse::new(stream)
         .keep_alive(Default::default())

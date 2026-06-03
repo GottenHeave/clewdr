@@ -79,10 +79,7 @@ pub async fn api_post_cookie(
         }
         Err(e) => {
             error!("Failed to submit cookie: {}", e);
-            Err(ApiError::internal(format!(
-                "Failed to submit cookie: {}",
-                e
-            )))
+            Err(ApiError::internal(format!("Failed to submit cookie: {e}")))
         }
     }
 }
@@ -172,8 +169,7 @@ pub async fn api_get_cookies(
             Ok((headers, Json(response_data)))
         }
         Err(e) => Err(ApiError::internal(format!(
-            "Failed to get cookie status: {}",
-            e
+            "Failed to get cookie status: {e}"
         ))),
     }
 }
@@ -207,10 +203,7 @@ pub async fn api_delete_cookie(
         }
         Err(e) => {
             error!("Failed to delete cookie: {}", e);
-            Err(ApiError::internal(format!(
-                "Failed to delete cookie: {}",
-                e
-            )))
+            Err(ApiError::internal(format!("Failed to delete cookie: {e}")))
         }
     }
 }

@@ -38,17 +38,12 @@ mod tests {
 
             assert!(
                 !display_text.contains(ANSI_ESCAPE_PATTERN),
-                "Reason::{:?} Display contains ANSI escape codes: {}",
-                reason,
-                display_text
+                "Reason::{reason:?} Display contains ANSI escape codes: {display_text}"
             );
 
             assert!(
                 display_text.contains(expected_substring),
-                "Reason::{:?} Display doesn't contain expected text '{}': {}",
-                reason,
-                expected_substring,
-                display_text
+                "Reason::{reason:?} Display doesn't contain expected text '{expected_substring}': {display_text}"
             );
         }
     }
