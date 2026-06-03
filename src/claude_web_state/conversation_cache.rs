@@ -176,7 +176,15 @@ impl ConversationCache {
             persist_lock: Arc::new(Mutex::new(())),
         }
     }
+}
 
+impl Default for ConversationCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConversationCache {
     pub async fn persistent(path: impl Into<PathBuf>) -> Self {
         let persist_path = path.into();
         let inner = match Self::load_from_path(&persist_path).await {
