@@ -1,5 +1,5 @@
-use std::sync::LazyLock;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
 
 use axum::http::{HeaderValue, header::COOKIE};
@@ -42,10 +42,7 @@ pub enum PendingCacheWrite {
         conv: CachedConversation,
     },
     /// Subsequent request: append a new turn
-    AppendTurn {
-        key: CacheKey,
-        turn: CachedTurn,
-    },
+    AppendTurn { key: CacheKey, turn: CachedTurn },
     /// Fork: truncate and append
     ForkAndAppend {
         key: CacheKey,
@@ -182,7 +179,9 @@ impl ClaudeWebState {
         if let Some(ref cookie) = self.cookie {
             // Invalidate cache for this cookie if there's a reason (cookie changed)
             if reason.is_some() {
-                self.conv_cache.invalidate_by_cookie(&self.cookie_id()).await;
+                self.conv_cache
+                    .invalidate_by_cookie(&self.cookie_id())
+                    .await;
             }
             self.cookie_actor_handle
                 .return_cookie(cookie.to_owned(), reason)
@@ -305,7 +304,8 @@ impl ClaudeWebState {
     }
 
     fn cookie_id(&self) -> String {
-        self.cookie.as_ref()
+        self.cookie
+            .as_ref()
             .map(|c| {
                 let mut hasher = Sha256::new();
                 hasher.update(c.cookie.to_string());

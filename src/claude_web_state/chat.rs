@@ -1,5 +1,5 @@
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use colored::Colorize;
 use futures::TryFutureExt;
@@ -18,7 +18,7 @@ use crate::{
     config::{CLAUDE_ENDPOINT, CLEWDR_CONFIG},
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     types::claude::{ContentBlock, CreateMessageParams, ImageSource, Message, MessageContent},
-    types::claude_web::request::TurnMessageUuids,
+    types::claude_web::request::{Attachment, TurnMessageUuids},
     utils::{TIME_ZONE, print_out_json},
 };
 
@@ -26,8 +26,8 @@ use crate::{
 struct BundledMessages {
     /// Short content goes into prompt
     prompt: String,
-    /// Long content goes into attachments
-    attachments: Vec<serde_json::Value>,
+    /// Text document content goes into Claude Web attachments
+    attachments: Vec<Attachment>,
     /// Extracted images (if any)
     #[allow(dead_code)]
     images: Vec<ImageSource>,
@@ -64,8 +64,8 @@ impl ClaudeWebState {
             let p = p.to_owned();
 
             // Create shared stream health flag for monitoring SSE completion
-            let can_reuse = CLEWDR_CONFIG.load().reuse_conversation
-                && !CLEWDR_CONFIG.load().preserve_chats;
+            let can_reuse =
+                CLEWDR_CONFIG.load().reuse_conversation && !CLEWDR_CONFIG.load().preserve_chats;
             if can_reuse {
                 let flag = Arc::new(AtomicBool::new(false));
                 state.stream_health_flag = Some(flag.clone());
@@ -126,8 +126,8 @@ impl ClaudeWebState {
                 msg: "Organization UUID is not set",
             })?;
 
-        let can_reuse = CLEWDR_CONFIG.load().reuse_conversation
-            && !CLEWDR_CONFIG.load().preserve_chats;
+        let can_reuse =
+            CLEWDR_CONFIG.load().reuse_conversation && !CLEWDR_CONFIG.load().preserve_chats;
 
         if can_reuse {
             if let Some(result) = self.try_reuse_conversation(&p).await {
@@ -192,19 +192,47 @@ impl ClaudeWebState {
         let diff = diff::diff_messages(&cached, sys_hash, &user_hashes);
 
         match diff {
-            DiffResult::Append { parent_uuid, new_user_indices, new_user_hashes } => {
-                info!("[CACHE HIT] appending {} new user message(s)", new_user_indices.len());
-                let result = self.send_incremental(
-                    &cached, &parent_uuid, &new_user_indices, &new_user_hashes, p
-                ).await;
+            DiffResult::Append {
+                parent_uuid,
+                new_user_indices,
+                new_user_hashes,
+            } => {
+                info!(
+                    "[CACHE HIT] appending {} new user message(s)",
+                    new_user_indices.len()
+                );
+                let result = self
+                    .send_incremental(
+                        &cached,
+                        &parent_uuid,
+                        &new_user_indices,
+                        &new_user_hashes,
+                        p,
+                    )
+                    .await;
                 Some(result)
             }
-            DiffResult::Fork { parent_uuid, fork_turn_index, remaining_user_indices, remaining_user_hashes } => {
-                info!("[CACHE FORK] forking at turn {}, {} user message(s)", fork_turn_index, remaining_user_indices.len());
-                let result = self.send_incremental_fork(
-                    &cached, &parent_uuid, fork_turn_index,
-                    &remaining_user_indices, &remaining_user_hashes, p
-                ).await;
+            DiffResult::Fork {
+                parent_uuid,
+                fork_turn_index,
+                remaining_user_indices,
+                remaining_user_hashes,
+            } => {
+                info!(
+                    "[CACHE FORK] forking at turn {}, {} user message(s)",
+                    fork_turn_index,
+                    remaining_user_indices.len()
+                );
+                let result = self
+                    .send_incremental_fork(
+                        &cached,
+                        &parent_uuid,
+                        fork_turn_index,
+                        &remaining_user_indices,
+                        &remaining_user_hashes,
+                        p,
+                    )
+                    .await;
                 Some(result)
             }
             DiffResult::FullRebuild => {
@@ -250,11 +278,13 @@ impl ClaudeWebState {
         });
 
         let referer = if is_temporary {
-            self.endpoint.join("new?incognito")
+            self.endpoint
+                .join("new?incognito")
                 .map(|u| u.to_string())
                 .unwrap_or_else(|_| format!("{CLAUDE_ENDPOINT}new?incognito"))
         } else {
-            self.endpoint.join("new")
+            self.endpoint
+                .join("new")
                 .map(|u| u.to_string())
                 .unwrap_or_else(|_| format!("{CLAUDE_ENDPOINT}new"))
         };
@@ -297,9 +327,11 @@ impl ClaudeWebState {
             .await;
 
         // === Transform and send ===
-        let mut body = self.transform_request(p.clone()).ok_or(ClewdrError::BadRequest {
-            msg: "Request body is empty",
-        })?;
+        let mut body = self
+            .transform_request(p.clone())
+            .ok_or(ClewdrError::BadRequest {
+                msg: "Request body is empty",
+            })?;
 
         // Generate turn_message_uuids
         let human_uuid = uuid::Uuid::new_v4().to_string();
@@ -340,9 +372,13 @@ impl ClaudeWebState {
         // === Prepare cache write ===
         if write_cache {
             let user_hashes = extract_user_hashes(&p.messages)
-                .iter().map(|(_, h)| *h).collect();
+                .iter()
+                .map(|(_, h)| *h)
+                .collect();
             let sys_hash = hash_system(&p.system);
-            let stream_flag = self.stream_health_flag.clone()
+            let stream_flag = self
+                .stream_health_flag
+                .clone()
                 .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
 
             self.pending_cache_write = Some(PendingCacheWrite::Init {
@@ -386,7 +422,8 @@ impl ClaudeWebState {
         self.update_paprika(&cached.conv_uuid, need_thinking).await;
 
         // Extract new user messages from original messages array
-        let new_user_msgs: Vec<&Message> = new_user_indices.iter()
+        let new_user_msgs: Vec<&Message> = new_user_indices
+            .iter()
             .map(|&idx| &p.messages[idx])
             .collect();
 
@@ -397,9 +434,9 @@ impl ClaudeWebState {
         let human_uuid = uuid::Uuid::new_v4().to_string();
         let assistant_uuid = uuid::Uuid::new_v4().to_string();
 
-        let body = self.build_incremental_body(
-            &bundled, parent_uuid, &human_uuid, &assistant_uuid, p,
-        );
+        let body = self
+            .build_incremental_body(&bundled, parent_uuid, &human_uuid, &assistant_uuid, p)
+            .await;
 
         print_out_json(&body, "claude_web_incremental_req.json");
 
@@ -453,7 +490,8 @@ impl ClaudeWebState {
         self.update_paprika(&cached.conv_uuid, need_thinking).await;
 
         // Extract remaining user messages
-        let remaining_user_msgs: Vec<&Message> = remaining_user_indices.iter()
+        let remaining_user_msgs: Vec<&Message> = remaining_user_indices
+            .iter()
             .map(|&idx| &p.messages[idx])
             .collect();
 
@@ -463,9 +501,9 @@ impl ClaudeWebState {
         let human_uuid = uuid::Uuid::new_v4().to_string();
         let assistant_uuid = uuid::Uuid::new_v4().to_string();
 
-        let body = self.build_incremental_body(
-            &bundled, parent_uuid, &human_uuid, &assistant_uuid, p,
-        );
+        let body = self
+            .build_incremental_body(&bundled, parent_uuid, &human_uuid, &assistant_uuid, p)
+            .await;
 
         let endpoint = self
             .endpoint
@@ -502,12 +540,17 @@ impl ClaudeWebState {
 
     /// PUT paprika_mode setting on existing conversation
     async fn update_paprika(&self, conv_uuid: &str, need_thinking: bool) {
-        let paprika = if need_thinking { "extended".into() } else { json!(null) };
+        let paprika = if need_thinking {
+            "extended".into()
+        } else {
+            json!(null)
+        };
         let endpoint = self
             .endpoint
             .join(&format!(
                 "api/organizations/{}/chat_conversations/{}",
-                self.org_uuid.as_ref().unwrap(), conv_uuid
+                self.org_uuid.as_ref().unwrap(),
+                conv_uuid
             ))
             .expect("Url parse error");
         let body = json!({ "settings": { "paprika_mode": paprika } });
@@ -519,7 +562,7 @@ impl ClaudeWebState {
     }
 
     /// Build the completion request body for incremental sends
-    fn build_incremental_body(
+    async fn build_incremental_body(
         &self,
         bundled: &BundledMessages,
         parent_uuid: &str,
@@ -527,6 +570,7 @@ impl ClaudeWebState {
         assistant_uuid: &str,
         p: &CreateMessageParams,
     ) -> serde_json::Value {
+        let files = self.upload_images(bundled.images.clone()).await;
         let mut body = json!({
             "prompt": bundled.prompt,
             "parent_message_uuid": parent_uuid,
@@ -536,7 +580,7 @@ impl ClaudeWebState {
                 "assistant_message_uuid": assistant_uuid,
             },
             "attachments": bundled.attachments,
-            "files": [],
+            "files": files,
             "rendering_mode": if p.stream.unwrap_or_default() { "messages" } else { "raw" },
         });
         // Model (only for pro)
@@ -555,11 +599,9 @@ impl ClaudeWebState {
     }
 
     /// Merge user messages into prompt or attachment based on length
-    fn bundle_user_messages(
-        &self,
-        user_msgs: &[&Message],
-    ) -> BundledMessages {
+    fn bundle_user_messages(&self, user_msgs: &[&Message]) -> BundledMessages {
         let mut texts: Vec<String> = vec![];
+        let mut attachments: Vec<Attachment> = vec![];
         let mut images: Vec<ImageSource> = vec![];
 
         for msg in user_msgs {
@@ -576,6 +618,58 @@ impl ClaudeWebState {
                             ContentBlock::Image { source, .. } => {
                                 images.push(source.clone());
                             }
+                            ContentBlock::Document { source, .. } => {
+                                let source_type = source
+                                    .get("type")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default();
+                                if source_type == "text" {
+                                    if let Some(text) = source
+                                        .get("data")
+                                        .or_else(|| source.get("text"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::trim)
+                                        .filter(|text| !text.is_empty())
+                                    {
+                                        attachments.push(Attachment::new(text.to_string()));
+                                    }
+                                } else if source_type == "file" {
+                                    if let Some(file_id) = source
+                                        .get("file_id")
+                                        .or_else(|| source.get("id"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::trim)
+                                        .filter(|file_id| !file_id.is_empty())
+                                    {
+                                        images.push(ImageSource::File {
+                                            file_id: file_id.to_string(),
+                                        });
+                                    }
+                                } else if source_type == "base64"
+                                    && let (Some(media_type), Some(data)) = (
+                                        source
+                                            .get("media_type")
+                                            .and_then(serde_json::Value::as_str)
+                                            .map(str::trim)
+                                            .filter(|media_type| !media_type.is_empty()),
+                                        source
+                                            .get("data")
+                                            .and_then(serde_json::Value::as_str)
+                                            .map(str::trim)
+                                            .filter(|data| !data.is_empty()),
+                                    )
+                                {
+                                    images.push(ImageSource::Base64 {
+                                        media_type: media_type.to_string(),
+                                        data: data.to_string(),
+                                    });
+                                }
+                            }
+                            ContentBlock::ContainerUpload { file_id, .. } => {
+                                images.push(ImageSource::File {
+                                    file_id: file_id.clone(),
+                                });
+                            }
                             _ => {}
                         }
                     }
@@ -590,23 +684,24 @@ impl ClaudeWebState {
         const PROMPT_THRESHOLD: usize = 4000;
 
         if combined.len() <= PROMPT_THRESHOLD {
+            let mut prompt = combined;
+            if prompt.is_empty() && (!attachments.is_empty() || !images.is_empty()) {
+                prompt = "Please answer using the attached content.".to_string();
+            }
             BundledMessages {
-                prompt: combined,
-                attachments: vec![],
+                prompt,
+                attachments,
                 images,
             }
         } else {
-            // Use attachment for long content
-            // prompt gets the custom_prompt polyfill or a short summary
-            let p_str = CLEWDR_CONFIG.load().custom_prompt.clone();
+            attachments.push(Attachment::new(combined));
+            let mut p_str = CLEWDR_CONFIG.load().custom_prompt.clone();
+            if p_str.is_empty() {
+                p_str = "Please answer using the attached content.".to_string();
+            }
             BundledMessages {
                 prompt: p_str,
-                attachments: vec![json!({
-                    "extracted_content": combined,
-                    "file_name": "paste.txt",
-                    "file_size": combined.len(),
-                    "file_type": "text/plain",
-                })],
+                attachments,
                 images,
             }
         }
@@ -624,16 +719,28 @@ impl ClaudeWebState {
                 self.conv_cache.append_turn(&key, turn).await;
                 // Update stream health flag for the new request
                 if let Some(flag) = self.stream_health_flag.as_ref() {
-                    self.conv_cache.update_stream_health(&key, flag.clone()).await;
+                    self.conv_cache
+                        .update_stream_health(&key, flag.clone())
+                        .await;
                 }
             }
-            PendingCacheWrite::ForkAndAppend { key, fork_turn_index, turn } => {
-                info!("[CACHE] forked at turn {}, new assistant={}",
-                    fork_turn_index, turn.assistant_uuid);
-                self.conv_cache.fork_and_append(&key, fork_turn_index, turn).await;
+            PendingCacheWrite::ForkAndAppend {
+                key,
+                fork_turn_index,
+                turn,
+            } => {
+                info!(
+                    "[CACHE] forked at turn {}, new assistant={}",
+                    fork_turn_index, turn.assistant_uuid
+                );
+                self.conv_cache
+                    .fork_and_append(&key, fork_turn_index, turn)
+                    .await;
                 // Update stream health flag for the new request
                 if let Some(flag) = self.stream_health_flag.as_ref() {
-                    self.conv_cache.update_stream_health(&key, flag.clone()).await;
+                    self.conv_cache
+                        .update_stream_health(&key, flag.clone())
+                        .await;
                 }
             }
         }
