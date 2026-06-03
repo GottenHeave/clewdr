@@ -75,6 +75,8 @@ impl CachedConversation {
 pub struct CacheKey {
     /// Index of the downstream API key in config (from self.key)
     pub key_index: usize,
+    /// Request-family fingerprint used to isolate auxiliary requests.
+    pub request_fingerprint: u64,
 }
 
 #[serde_as]
