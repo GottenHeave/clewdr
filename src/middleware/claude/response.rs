@@ -10,7 +10,7 @@ use tracing::warn;
 
 use super::{ClaudeApiFormat, transform_stream};
 use crate::{
-    middleware::claude::{ClaudeContext, transforms_json},
+    middleware::claude::{ClaudeContext, normalize_claude_web_stream_event, transforms_json},
     types::claude::{CreateMessageResponse, StreamEvent},
 };
 
@@ -90,19 +90,22 @@ pub async fn add_usage_info(resp: Response) -> impl IntoResponse {
         .into_body()
         .into_data_stream()
         .eventsource()
-        .map_ok(move |event| {
+        .try_filter_map(move |event| {
             let new_event = axum::response::sse::Event::default()
-                .event(event.event)
-                .id(event.id);
+                .event(event.event.clone())
+                .id(event.id.clone());
             let new_event = if let Some(retry) = event.retry {
                 new_event.retry(retry)
             } else {
                 new_event
             };
-            let Ok(parsed) = serde_json::from_str::<StreamEvent>(&event.data) else {
-                return new_event.data(event.data);
+            let Some(data) = normalize_claude_web_stream_event(&event.data) else {
+                return futures::future::ready(Ok(None));
             };
-            match parsed {
+            let Ok(parsed) = serde_json::from_str::<StreamEvent>(&data) else {
+                return futures::future::ready(Ok(Some(new_event.data(data))));
+            };
+            let event = match parsed {
                 StreamEvent::MessageStart { mut message } => {
                     message.usage.get_or_insert(usage.to_owned());
                     new_event
@@ -118,8 +121,9 @@ pub async fn add_usage_info(resp: Response) -> impl IntoResponse {
                         })
                         .unwrap()
                 }
-                _ => new_event.data(event.data),
-            }
+                _ => new_event.data(data),
+            };
+            futures::future::ready(Ok(Some(event)))
         });
 
     Sse::new(stream)
@@ -143,4 +147,50 @@ pub async fn check_overloaded(mut resp: Response) -> Response {
         resp.extensions_mut().remove::<ClaudeContext>();
     }
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use crate::middleware::claude::normalize_claude_web_stream_event;
+
+    #[test]
+    fn drops_web_only_message_limit_events() {
+        let data = r#"{"type":"message_limit","message_limit":{"type":"within_limit"}}"#;
+
+        assert!(normalize_claude_web_stream_event(data).is_none());
+    }
+
+    #[test]
+    fn rewrites_thinking_summary_delta_events() {
+        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_summary_delta","summary":{"summary":"确认端口已改，更新草稿回复。"}}}"#;
+        let normalized = normalize_claude_web_stream_event(data).unwrap();
+        let normalized: Value = serde_json::from_str(&normalized).unwrap();
+
+        assert_eq!(
+            normalized
+                .get("delta")
+                .and_then(|delta| delta.get("type"))
+                .and_then(Value::as_str),
+            Some("thinking_delta")
+        );
+        assert_eq!(
+            normalized
+                .get("delta")
+                .and_then(|delta| delta.get("thinking"))
+                .and_then(Value::as_str),
+            Some("确认端口已改，更新草稿回复。")
+        );
+    }
+
+    #[test]
+    fn keeps_regular_content_deltas() {
+        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#;
+
+        assert_eq!(
+            normalize_claude_web_stream_event(data).as_deref(),
+            Some(data)
+        );
+    }
 }

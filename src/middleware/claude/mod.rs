@@ -6,6 +6,7 @@ mod stop_sequences;
 pub(crate) use claude2oai::*;
 pub use request::*;
 pub use response::*;
+use serde_json::Value;
 pub use stop_sequences::*;
 use strum::Display;
 
@@ -22,6 +23,50 @@ pub enum ClaudeApiFormat {
     Claude,
     /// OpenAI compatible format
     OpenAI,
+}
+
+fn thinking_summary_delta_text(data: &Value) -> Option<&str> {
+    if data.get("type").and_then(Value::as_str) != Some("content_block_delta") {
+        return None;
+    }
+
+    let delta = data.get("delta")?;
+    if delta.get("type").and_then(Value::as_str) != Some("thinking_summary_delta") {
+        return None;
+    }
+
+    delta
+        .get("summary")
+        .and_then(|summary| {
+            summary
+                .get("summary")
+                .and_then(Value::as_str)
+                .or_else(|| summary.as_str())
+        })
+        .filter(|summary| !summary.is_empty())
+}
+
+pub(crate) fn normalize_claude_web_stream_event(data: &str) -> Option<String> {
+    let Ok(mut value) = serde_json::from_str::<Value>(data) else {
+        return Some(data.to_owned());
+    };
+
+    if value.get("type").and_then(Value::as_str) == Some("message_limit") {
+        return None;
+    }
+
+    let Some(summary) = thinking_summary_delta_text(&value).map(str::to_owned) else {
+        return Some(data.to_owned());
+    };
+
+    if let Some(delta) = value.get_mut("delta") {
+        *delta = serde_json::json!({
+            "type": "thinking_delta",
+            "thinking": summary,
+        });
+    }
+
+    Some(value.to_string())
 }
 
 #[derive(Debug, Clone)]

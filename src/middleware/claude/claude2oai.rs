@@ -3,7 +3,10 @@ use futures::{Stream, TryStreamExt};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::types::claude::{ContentBlockDelta, CreateMessageResponse, StreamEvent};
+use crate::{
+    middleware::claude::normalize_claude_web_stream_event,
+    types::claude::{ContentBlockDelta, CreateMessageResponse, StreamEvent},
+};
 
 /// Represents the data structure for streaming events in OpenAI API format
 /// Contains a choices array with deltas of content
@@ -76,6 +79,9 @@ where
     I: Stream<Item = Result<eventsource_stream::Event, E>>,
 {
     s.try_filter_map(async |eventsource_stream::Event { data, .. }| {
+        let Some(data) = normalize_claude_web_stream_event(&data) else {
+            return Ok(None);
+        };
         let Ok(parsed) = serde_json::from_str::<StreamEvent>(&data) else {
             return Ok(None);
         };
