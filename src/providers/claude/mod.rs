@@ -218,6 +218,9 @@ impl LLMProvider for ClaudeCodeProvider {
     }
 }
 
-pub fn build_providers(cookie_actor_handle: CookieActorHandle, conv_cache: ConversationCache) -> ClaudeProviders {
+pub fn build_providers(
+    cookie_actor_handle: CookieActorHandle,
+    conv_cache: ConversationCache,
+) -> ClaudeProviders {
     ClaudeProviders::new(cookie_actor_handle, conv_cache)
 }

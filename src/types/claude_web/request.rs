@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::types::claude::ImageSource;
 
 /// Claude.ai attachment
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct Attachment {
     extracted_content: String,
     file_name: String,
