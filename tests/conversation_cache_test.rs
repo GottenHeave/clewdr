@@ -37,7 +37,11 @@ async fn test_sequential_requests_use_cache() {
     let sys_hash = hash_system(&None);
 
     // Request 1: full messages [u1, u2, u3]
-    let msgs1 = vec![make_user_msg("u1"), make_user_msg("u2"), make_user_msg("u3")];
+    let msgs1 = vec![
+        make_user_msg("u1"),
+        make_user_msg("u2"),
+        make_user_msg("u3"),
+    ];
     let hashes1 = extract_user_hashes(&msgs1);
     let conv = make_cached(
         "conv1",
@@ -50,12 +54,21 @@ async fn test_sequential_requests_use_cache() {
     cache.set(key.clone(), conv).await;
 
     // Request 2: same prefix + new message [u1, u2, u3, u4]
-    let msgs2 = vec![make_user_msg("u1"), make_user_msg("u2"), make_user_msg("u3"), make_user_msg("u4")];
+    let msgs2 = vec![
+        make_user_msg("u1"),
+        make_user_msg("u2"),
+        make_user_msg("u3"),
+        make_user_msg("u4"),
+    ];
     let hashes2 = extract_user_hashes(&msgs2);
     let cached = cache.get(&key).await.unwrap();
     let result = diff::diff_messages(&cached, sys_hash, &hashes2);
     match result {
-        DiffResult::Append { parent_uuid, new_user_indices, new_user_hashes } => {
+        DiffResult::Append {
+            parent_uuid,
+            new_user_indices,
+            new_user_hashes,
+        } => {
             assert_eq!(parent_uuid, "asst0");
             assert_eq!(new_user_indices, vec![3]);
             assert_eq!(new_user_hashes.len(), 1);
@@ -64,19 +77,34 @@ async fn test_sequential_requests_use_cache() {
     }
 
     // Simulate successful append: update cache
-    cache.append_turn(&key, CachedTurn {
-        user_hashes: vec![hashes2[3].1],
-        assistant_uuid: "asst1".to_string(),
-    }).await;
+    cache
+        .append_turn(
+            &key,
+            CachedTurn {
+                user_hashes: vec![hashes2[3].1],
+                assistant_uuid: "asst1".to_string(),
+            },
+        )
+        .await;
 
     // Request 3: same prefix + another new message [u1, u2, u3, u4, u5]
-    let msgs3 = vec![make_user_msg("u1"), make_user_msg("u2"), make_user_msg("u3"), make_user_msg("u4"), make_user_msg("u5")];
+    let msgs3 = vec![
+        make_user_msg("u1"),
+        make_user_msg("u2"),
+        make_user_msg("u3"),
+        make_user_msg("u4"),
+        make_user_msg("u5"),
+    ];
     let hashes3 = extract_user_hashes(&msgs3);
     let cached = cache.get(&key).await.unwrap();
     assert_eq!(cached.turns.len(), 2);
     let result = diff::diff_messages(&cached, sys_hash, &hashes3);
     match result {
-        DiffResult::Append { parent_uuid, new_user_indices, .. } => {
+        DiffResult::Append {
+            parent_uuid,
+            new_user_indices,
+            ..
+        } => {
             assert_eq!(parent_uuid, "asst1");
             assert_eq!(new_user_indices, vec![4]);
         }
@@ -92,7 +120,11 @@ async fn test_edit_scenario_fork() {
     let sys_hash = hash_system(&None);
 
     // Initial: [u1, u2, u3]
-    let msgs1 = vec![make_user_msg("u1"), make_user_msg("u2"), make_user_msg("u3")];
+    let msgs1 = vec![
+        make_user_msg("u1"),
+        make_user_msg("u2"),
+        make_user_msg("u3"),
+    ];
     let hashes1 = extract_user_hashes(&msgs1);
     let conv = make_cached(
         "conv1",
@@ -105,7 +137,11 @@ async fn test_edit_scenario_fork() {
     cache.set(key.clone(), conv).await;
 
     // Edit: [u1, u2_edited, u3]
-    let msgs2 = vec![make_user_msg("u1"), make_user_msg("u2_edited"), make_user_msg("u3")];
+    let msgs2 = vec![
+        make_user_msg("u1"),
+        make_user_msg("u2_edited"),
+        make_user_msg("u3"),
+    ];
     let hashes2 = extract_user_hashes(&msgs2);
     let cached = cache.get(&key).await.unwrap();
     let result = diff::diff_messages(&cached, sys_hash, &hashes2);
@@ -122,7 +158,11 @@ async fn test_edit_scenario_fork_multi_turn() {
     let sys_hash = hash_system(&None);
 
     // Turn 0: [u1, u2, u3], Turn 1: [u4]
-    let msgs1 = vec![make_user_msg("u1"), make_user_msg("u2"), make_user_msg("u3")];
+    let msgs1 = vec![
+        make_user_msg("u1"),
+        make_user_msg("u2"),
+        make_user_msg("u3"),
+    ];
     let hashes1 = extract_user_hashes(&msgs1);
     let u4_hash = hash_user_message(&make_user_msg("u4"));
     let conv = make_cached(
@@ -143,15 +183,23 @@ async fn test_edit_scenario_fork_multi_turn() {
 
     // Edit u4 → [u1, u2, u3, u4_edited, u5]
     let msgs2 = vec![
-        make_user_msg("u1"), make_user_msg("u2"), make_user_msg("u3"),
-        make_user_msg("u4_edited"), make_user_msg("u5"),
+        make_user_msg("u1"),
+        make_user_msg("u2"),
+        make_user_msg("u3"),
+        make_user_msg("u4_edited"),
+        make_user_msg("u5"),
     ];
     let hashes2 = extract_user_hashes(&msgs2);
     let cached = cache.get(&key).await.unwrap();
     let result = diff::diff_messages(&cached, sys_hash, &hashes2);
 
     match result {
-        DiffResult::Fork { parent_uuid, fork_turn_index, remaining_user_indices, .. } => {
+        DiffResult::Fork {
+            parent_uuid,
+            fork_turn_index,
+            remaining_user_indices,
+            ..
+        } => {
             assert_eq!(parent_uuid, "asst0");
             assert_eq!(fork_turn_index, 1);
             assert!(remaining_user_indices.contains(&3)); // u4_edited
@@ -240,7 +288,11 @@ async fn test_incremental_failure_fallback() {
     assert!(cache.get(&key).await.is_none());
 
     // Caller falls back to send_full and creates new cache entry
-    let new_msgs = vec![make_user_msg("u1"), make_user_msg("u2"), make_user_msg("u3")];
+    let new_msgs = vec![
+        make_user_msg("u1"),
+        make_user_msg("u2"),
+        make_user_msg("u3"),
+    ];
     let new_hashes = extract_user_hashes(&new_msgs);
     let new_conv = make_cached(
         "conv2",
@@ -473,7 +525,12 @@ async fn test_persistent_cache_skips_expired_and_invalid_entries() {
     invalid.valid = false;
     cache.set(invalid_key.clone(), invalid).await;
 
-    cache.set(valid_key.clone(), make_cached("conv_valid", vec![], sys_hash)).await;
+    cache
+        .set(
+            valid_key.clone(),
+            make_cached("conv_valid", vec![], sys_hash),
+        )
+        .await;
 
     let reloaded = ConversationCache::persistent(&path).await;
     assert!(reloaded.get(&expired_key).await.is_none());

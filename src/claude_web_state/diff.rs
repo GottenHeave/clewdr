@@ -1,7 +1,7 @@
-use std::hash::{DefaultHasher, Hash, Hasher};
-use serde_json::Value;
-use crate::types::claude::{Message, MessageContent, ContentBlock, Role};
 use super::conversation_cache::CachedConversation;
+use crate::types::claude::{ContentBlock, Message, MessageContent, Role};
+use serde_json::Value;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Hash a single user message's text content
 pub fn hash_user_message(msg: &Message) -> u64 {
@@ -43,7 +43,9 @@ pub fn hash_system(system: &Option<Value>) -> u64 {
 
 /// Extract (message_ref, hash) pairs for all Role::User messages in order
 pub fn extract_user_hashes(messages: &[Message]) -> Vec<(usize, u64)> {
-    messages.iter().enumerate()
+    messages
+        .iter()
+        .enumerate()
         .filter(|(_, m)| m.role == Role::User)
         .map(|(idx, m)| (idx, hash_user_message(m)))
         .collect()
@@ -133,8 +135,10 @@ pub fn diff_messages(
                 let rewind_count = hash_idx_in_turn;
                 let fork_cursor = cursor - rewind_count;
 
-                let remaining_user_indices: Vec<usize> =
-                    user_hashes[fork_cursor..].iter().map(|(idx, _)| *idx).collect();
+                let remaining_user_indices: Vec<usize> = user_hashes[fork_cursor..]
+                    .iter()
+                    .map(|(idx, _)| *idx)
+                    .collect();
                 let remaining_user_hashes: Vec<u64> =
                     user_hashes[fork_cursor..].iter().map(|(_, h)| *h).collect();
 
@@ -159,10 +163,8 @@ pub fn diff_messages(
 
     // Remaining messages are new → Append
     let parent_uuid = cached.turns.last().unwrap().assistant_uuid.clone();
-    let new_user_indices: Vec<usize> =
-        user_hashes[cursor..].iter().map(|(idx, _)| *idx).collect();
-    let new_user_hashes: Vec<u64> =
-        user_hashes[cursor..].iter().map(|(_, h)| *h).collect();
+    let new_user_indices: Vec<usize> = user_hashes[cursor..].iter().map(|(idx, _)| *idx).collect();
+    let new_user_hashes: Vec<u64> = user_hashes[cursor..].iter().map(|(_, h)| *h).collect();
 
     DiffResult::Append {
         parent_uuid,
@@ -174,13 +176,17 @@ pub fn diff_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::claude::Message;
     use crate::claude_web_state::conversation_cache::{CachedConversation, CachedTurn};
+    use crate::types::claude::Message;
     use chrono::Utc;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    fn make_cached(conv_uuid: &str, turns: Vec<CachedTurn>, system_hash: u64) -> CachedConversation {
+    fn make_cached(
+        conv_uuid: &str,
+        turns: Vec<CachedTurn>,
+        system_hash: u64,
+    ) -> CachedConversation {
         CachedConversation {
             conv_uuid: conv_uuid.to_string(),
             org_uuid: "org".to_string(),
@@ -243,18 +249,30 @@ mod tests {
 
     #[test]
     fn test_diff_messages_append() {
-        let msgs = vec![make_user_msg("u1"), make_user_msg("u2"), make_user_msg("u3")];
+        let msgs = vec![
+            make_user_msg("u1"),
+            make_user_msg("u2"),
+            make_user_msg("u3"),
+        ];
         let hashes = extract_user_hashes(&msgs);
         let sys_hash = hash_system(&None);
 
-        let cached = make_cached("conv1", vec![CachedTurn {
-            user_hashes: vec![hashes[0].1, hashes[1].1],
-            assistant_uuid: "asst1".to_string(),
-        }], sys_hash);
+        let cached = make_cached(
+            "conv1",
+            vec![CachedTurn {
+                user_hashes: vec![hashes[0].1, hashes[1].1],
+                assistant_uuid: "asst1".to_string(),
+            }],
+            sys_hash,
+        );
 
         let result = diff_messages(&cached, sys_hash, &hashes);
         match result {
-            DiffResult::Append { parent_uuid, new_user_indices, new_user_hashes } => {
+            DiffResult::Append {
+                parent_uuid,
+                new_user_indices,
+                new_user_hashes,
+            } => {
                 assert_eq!(parent_uuid, "asst1");
                 assert_eq!(new_user_indices, vec![2]);
                 assert_eq!(new_user_hashes.len(), 1);
@@ -271,10 +289,14 @@ mod tests {
         let sys_hash1 = hash_system(&Some(serde_json::json!("sys1")));
         let sys_hash2 = hash_system(&Some(serde_json::json!("sys2")));
 
-        let cached = make_cached("conv1", vec![CachedTurn {
-            user_hashes: vec![hashes[0].1],
-            assistant_uuid: "asst1".to_string(),
-        }], sys_hash1);
+        let cached = make_cached(
+            "conv1",
+            vec![CachedTurn {
+                user_hashes: vec![hashes[0].1],
+                assistant_uuid: "asst1".to_string(),
+            }],
+            sys_hash1,
+        );
 
         let result = diff_messages(&cached, sys_hash2, &hashes);
         assert!(matches!(result, DiffResult::FullRebuild));
@@ -285,10 +307,14 @@ mod tests {
         let msgs = vec![make_user_msg("u1_changed")];
         let hashes = extract_user_hashes(&msgs);
 
-        let cached = make_cached("conv1", vec![CachedTurn {
-            user_hashes: vec![12345u64], // mismatching hash
-            assistant_uuid: "asst1".to_string(),
-        }], hash_system(&None));
+        let cached = make_cached(
+            "conv1",
+            vec![CachedTurn {
+                user_hashes: vec![12345u64], // mismatching hash
+                assistant_uuid: "asst1".to_string(),
+            }],
+            hash_system(&None),
+        );
 
         let result = diff_messages(&cached, hash_system(&None), &hashes);
         assert!(matches!(result, DiffResult::FullRebuild));
@@ -296,25 +322,38 @@ mod tests {
 
     #[test]
     fn test_diff_messages_fork() {
-        let msgs = vec![make_user_msg("u1"), make_user_msg("u2"), make_user_msg("u3_edited")];
+        let msgs = vec![
+            make_user_msg("u1"),
+            make_user_msg("u2"),
+            make_user_msg("u3_edited"),
+        ];
         let hashes = extract_user_hashes(&msgs);
 
         // turn 0 has u1, turn 1 has u2_original
         let u2_original_hash = hash_user_message(&make_user_msg("u2_original"));
-        let cached = make_cached("conv1", vec![
-            CachedTurn {
-                user_hashes: vec![hashes[0].1],
-                assistant_uuid: "asst0".to_string(),
-            },
-            CachedTurn {
-                user_hashes: vec![u2_original_hash], // mismatch at turn 1
-                assistant_uuid: "asst1".to_string(),
-            },
-        ], hash_system(&None));
+        let cached = make_cached(
+            "conv1",
+            vec![
+                CachedTurn {
+                    user_hashes: vec![hashes[0].1],
+                    assistant_uuid: "asst0".to_string(),
+                },
+                CachedTurn {
+                    user_hashes: vec![u2_original_hash], // mismatch at turn 1
+                    assistant_uuid: "asst1".to_string(),
+                },
+            ],
+            hash_system(&None),
+        );
 
         let result = diff_messages(&cached, hash_system(&None), &hashes);
         match result {
-            DiffResult::Fork { parent_uuid, fork_turn_index, remaining_user_indices, .. } => {
+            DiffResult::Fork {
+                parent_uuid,
+                fork_turn_index,
+                remaining_user_indices,
+                ..
+            } => {
                 assert_eq!(parent_uuid, "asst0");
                 assert_eq!(fork_turn_index, 1);
                 // remaining starts from u2 in the new messages
@@ -331,10 +370,14 @@ mod tests {
         let hashes = extract_user_hashes(&msgs);
         let sys_hash = hash_system(&None);
 
-        let cached = make_cached("conv1", vec![CachedTurn {
-            user_hashes: vec![hashes[0].1],
-            assistant_uuid: "asst1".to_string(),
-        }], sys_hash);
+        let cached = make_cached(
+            "conv1",
+            vec![CachedTurn {
+                user_hashes: vec![hashes[0].1],
+                assistant_uuid: "asst1".to_string(),
+            }],
+            sys_hash,
+        );
 
         // Same messages, no new ones → FullRebuild
         let result = diff_messages(&cached, sys_hash, &hashes);
@@ -348,16 +391,20 @@ mod tests {
         let sys_hash = hash_system(&None);
 
         // Cache has more turns than new messages
-        let cached = make_cached("conv1", vec![
-            CachedTurn {
-                user_hashes: vec![hashes[0].1],
-                assistant_uuid: "asst0".to_string(),
-            },
-            CachedTurn {
-                user_hashes: vec![99999u64], // additional turn that new messages don't have
-                assistant_uuid: "asst1".to_string(),
-            },
-        ], sys_hash);
+        let cached = make_cached(
+            "conv1",
+            vec![
+                CachedTurn {
+                    user_hashes: vec![hashes[0].1],
+                    assistant_uuid: "asst0".to_string(),
+                },
+                CachedTurn {
+                    user_hashes: vec![99999u64], // additional turn that new messages don't have
+                    assistant_uuid: "asst1".to_string(),
+                },
+            ],
+            sys_hash,
+        );
 
         let result = diff_messages(&cached, sys_hash, &hashes);
         assert!(matches!(result, DiffResult::FullRebuild));

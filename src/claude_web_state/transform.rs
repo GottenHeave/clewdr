@@ -4,7 +4,7 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use futures::{StreamExt, stream};
 use itertools::Itertools;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, warn};
 use wreq::multipart::{Form, Part};
 
 use crate::{
@@ -30,7 +30,7 @@ impl ClaudeWebState {
         }
         Some(WebRequestBody {
             max_tokens_to_sample: value.max_tokens,
-            attachments: vec![Attachment::new(merged.paste)],
+            attachments: merged.attachments,
             files: vec![],
             model: if self.is_pro() {
                 Some(value.model)
@@ -57,6 +57,9 @@ impl ClaudeWebState {
         stream::iter(imgs)
             .filter_map(async |img| {
                 let ImageSource::Base64 { media_type, data } = img else {
+                    if let ImageSource::File { file_id } = img {
+                        return Some(file_id);
+                    }
                     warn!("Image type is not base64");
                     return None;
                 };
@@ -118,7 +121,7 @@ impl ClaudeWebState {
 /// Merged messages and images
 #[derive(Default, Debug)]
 struct Merged {
-    pub paste: String,
+    pub attachments: Vec<Attachment>,
     pub prompt: String,
     pub images: Vec<ImageSource>,
 }
@@ -151,6 +154,8 @@ fn merge_messages(msgs: Vec<Message>, system: String) -> Option<Merged> {
     let line_breaks = if user_real_roles { "\n\n\x08" } else { "\n\n" };
     let system = system.trim().to_string();
     let mut w = String::new();
+    let mut prompt_parts: Vec<(Role, String)> = vec![];
+    let mut attachments: Vec<Attachment> = vec![];
 
     let mut imgs: Vec<ImageSource> = vec![];
 
@@ -177,7 +182,7 @@ fn merge_messages(msgs: Vec<Message>, system: String) -> Option<Merged> {
                                     }
                                 }
                                 ImageSource::File { .. } => {
-                                    warn!("Image file sources are not supported");
+                                    imgs.push(source);
                                 }
                             }
                             None
@@ -187,6 +192,22 @@ fn merge_messages(msgs: Vec<Message>, system: String) -> Option<Merged> {
                             if let Some(source) = ImageSource::from_data_url(&image_url.url) {
                                 imgs.push(source);
                             }
+                            None
+                        }
+                        ContentBlock::Document { source, .. } => {
+                            if let Some(text) = extract_document_text(&source) {
+                                attachments.push(Attachment::new(text));
+                            } else if let Some(file_id) = extract_file_id(&source) {
+                                imgs.push(ImageSource::File { file_id });
+                            } else if let Some((media_type, data)) = extract_base64_file(&source) {
+                                imgs.push(ImageSource::Base64 { media_type, data });
+                            } else {
+                                debug!("Unsupported document source for Claude Web request");
+                            }
+                            None
+                        }
+                        ContentBlock::ContainerUpload { file_id, .. } => {
+                            imgs.push(ImageSource::File { file_id });
                             None
                         }
                         _ => None,
@@ -212,18 +233,25 @@ fn merge_messages(msgs: Vec<Message>, system: String) -> Option<Merged> {
         // chunk by role
         .chunk_by(|m| m.0);
     // join same role with new line
-    let mut msgs = chunks.into_iter().map(|(role, grp)| {
-        let txt = grp.into_iter().map(|m| m.1).collect::<Vec<_>>().join("\n");
-        (role, txt)
-    });
-    // first message does not need prefix
+    let mut msgs = chunks
+        .into_iter()
+        .map(|(role, grp)| {
+            let txt = grp.into_iter().map(|m| m.1).collect::<Vec<_>>().join("\n");
+            (role, txt)
+        })
+        .collect::<Vec<_>>();
+
     if !system.is_empty() {
         w += system.as_str();
-    } else {
-        let first = msgs.next()?;
-        w += first.1.as_str();
+        prompt_parts.push((Role::System, system.clone()));
+    } else if let Some((_, first_text)) = msgs.first() {
+        w += first_text.as_str();
+        prompt_parts.push((Role::User, first_text.clone()));
     }
-    for (role, text) in msgs {
+    for (idx, (role, text)) in msgs.drain(..).enumerate() {
+        if system.is_empty() && idx == 0 {
+            continue;
+        }
         let prefix = match role {
             Role::System => {
                 warn!("System message should be merged into the first message");
@@ -233,17 +261,83 @@ fn merge_messages(msgs: Vec<Message>, system: String) -> Option<Merged> {
             Role::Assistant => format!("{a}: "),
         };
         write!(w, "{line_breaks}{prefix}{text}").ok()?;
+        prompt_parts.push((role, text));
     }
-    print_out_text(w.to_owned(), "paste.txt");
+    if !w.is_empty() {
+        print_out_text(w.to_owned(), "paste.txt");
+    }
 
-    // prompt polyfill
-    let p = CLEWDR_CONFIG.load().custom_prompt.to_owned();
+    let mut prompt = prompt_parts
+        .into_iter()
+        .map(|(role, text)| match role {
+            Role::System => text,
+            Role::User => text,
+            Role::Assistant => format!("{a}: {text}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+        .trim()
+        .to_string();
+    if prompt.is_empty() {
+        prompt = CLEWDR_CONFIG.load().custom_prompt.to_owned();
+    }
+    if prompt.is_empty() && (!attachments.is_empty() || !imgs.is_empty()) {
+        prompt = "Please answer using the attached content.".to_string();
+    }
 
     Some(Merged {
-        paste: w,
-        prompt: p,
+        attachments,
+        prompt,
         images: imgs,
     })
+}
+
+fn extract_document_text(source: &Value) -> Option<String> {
+    let source_type = source.get("type").and_then(Value::as_str)?;
+    if source_type != "text" {
+        return None;
+    }
+    let text = source
+        .get("data")
+        .or_else(|| source.get("text"))
+        .and_then(Value::as_str)?
+        .trim()
+        .to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn extract_file_id(source: &Value) -> Option<String> {
+    let source_type = source.get("type").and_then(Value::as_str)?;
+    if source_type != "file" {
+        return None;
+    }
+    source
+        .get("file_id")
+        .or_else(|| source.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn extract_base64_file(source: &Value) -> Option<(String, String)> {
+    let source_type = source.get("type").and_then(Value::as_str)?;
+    if source_type != "base64" {
+        return None;
+    }
+    let media_type = source
+        .get("media_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|media_type| !media_type.is_empty())?
+        .to_string();
+    let data = source
+        .get("data")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|data| !data.is_empty())?
+        .to_string();
+    Some((media_type, data))
 }
 
 /// Merges system message content into a single string
