@@ -10,6 +10,11 @@ on:
     branches:
       - dev
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional vX.Y.Z tag name to publish release artifacts from dev"
+        required: false
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -206,7 +211,7 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     steps:
       - uses: actions/checkout@v6
         with:
@@ -225,7 +230,8 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: artifacts/**/${{ env.BIN_NAME }}*.zip
-          name: ${{ github.ref_name }}
+          name: ${{ inputs.release_tag || github.ref_name }}
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
           body_path: RELEASE_NOTES.md # Use release notes file
           draft: false
           prerelease: false

@@ -2,6 +2,11 @@ name: Build and publish Docker image
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional vX.Y.Z tag name to publish image tags from dev"
+        required: false
+        type: string
 
   push:
     branches: ["dev"]
@@ -56,7 +61,8 @@ jobs:
             type=ref,event=branch
             type=ref,event=tag
             type=sha
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=${{ inputs.release_tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.release_tag != '' }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') }}
           flavor: |
             suffix=-${{ matrix.arch }}
 
@@ -101,7 +107,8 @@ jobs:
             type=ref,event=branch
             type=ref,event=tag
             type=sha
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=${{ inputs.release_tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.release_tag != '' }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') }}
 
       - name: Create manifest list
         shell: bash
