@@ -56,7 +56,12 @@ impl ClaudeWebState {
         // upload images
         stream::iter(imgs)
             .filter_map(async |img| {
-                let ImageSource::Base64 { media_type, data } = img else {
+                let ImageSource::Base64 {
+                    media_type,
+                    data,
+                    file_name,
+                } = img
+                else {
                     if let ImageSource::File { file_id } = img {
                         return Some(file_id);
                     }
@@ -72,15 +77,10 @@ impl ClaudeWebState {
                     .ok()?;
                 // choose the file name based on the media type (extract main type before any params)
                 let main_type = media_type.split(';').next().unwrap_or(&media_type);
-                let file_name = match main_type.to_lowercase().as_str() {
-                    "image/png" => "image.png",
-                    "image/jpeg" => "image.jpg",
-                    "image/jpg" => "image.jpg",
-                    "image/gif" => "image.gif",
-                    "image/webp" => "image.webp",
-                    "application/pdf" => "document.pdf",
-                    _ => "file",
-                };
+                let file_name = file_name
+                    .as_deref()
+                    .and_then(normalize_file_name)
+                    .unwrap_or_else(|| default_upload_file_name(main_type).to_string());
                 // create the part and form
                 let part = Part::bytes(bytes).file_name(file_name);
                 let form = Form::new().part("file", part);
@@ -194,13 +194,23 @@ fn merge_messages(msgs: Vec<Message>, system: String) -> Option<Merged> {
                             }
                             None
                         }
-                        ContentBlock::Document { source, .. } => {
+                        ContentBlock::Document { source, title, .. } => {
+                            let file_name = extract_document_file_name(&source, title.as_deref());
                             if let Some(text) = extract_document_text(&source) {
-                                attachments.push(Attachment::new(text));
+                                attachments.push(match file_name {
+                                    Some(file_name) => {
+                                        Attachment::new_with_file_name(text, file_name)
+                                    }
+                                    None => Attachment::new(text),
+                                });
                             } else if let Some(file_id) = extract_file_id(&source) {
                                 imgs.push(ImageSource::File { file_id });
                             } else if let Some((media_type, data)) = extract_base64_file(&source) {
-                                imgs.push(ImageSource::Base64 { media_type, data });
+                                imgs.push(ImageSource::Base64 {
+                                    media_type,
+                                    data,
+                                    file_name,
+                                });
                             } else {
                                 debug!("Unsupported document source for Claude Web request");
                             }
@@ -292,7 +302,32 @@ fn merge_messages(msgs: Vec<Message>, system: String) -> Option<Merged> {
     })
 }
 
-fn extract_document_text(source: &Value) -> Option<String> {
+fn default_upload_file_name(media_type: &str) -> &'static str {
+    match media_type.to_lowercase().as_str() {
+        "image/png" => "image.png",
+        "image/jpeg" => "image.jpg",
+        "image/jpg" => "image.jpg",
+        "image/gif" => "image.gif",
+        "image/webp" => "image.webp",
+        "application/pdf" => "document.pdf",
+        _ => "file",
+    }
+}
+
+pub(super) fn extract_document_file_name(source: &Value, title: Option<&str>) -> Option<String> {
+    title.and_then(normalize_file_name).or_else(|| {
+        ["file_name", "filename", "name", "title"]
+            .into_iter()
+            .find_map(|key| {
+                source
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .and_then(normalize_file_name)
+            })
+    })
+}
+
+pub(super) fn extract_document_text(source: &Value) -> Option<String> {
     let source_type = source.get("type").and_then(Value::as_str)?;
     if source_type != "text" {
         return None;
@@ -306,7 +341,7 @@ fn extract_document_text(source: &Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn extract_file_id(source: &Value) -> Option<String> {
+pub(super) fn extract_file_id(source: &Value) -> Option<String> {
     let source_type = source.get("type").and_then(Value::as_str)?;
     if source_type != "file" {
         return None;
@@ -320,7 +355,7 @@ fn extract_file_id(source: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn extract_base64_file(source: &Value) -> Option<(String, String)> {
+pub(super) fn extract_base64_file(source: &Value) -> Option<(String, String)> {
     let source_type = source.get("type").and_then(Value::as_str)?;
     if source_type != "base64" {
         return None;
@@ -338,6 +373,90 @@ fn extract_base64_file(source: &Value) -> Option<(String, String)> {
         .filter(|data| !data.is_empty())?
         .to_string();
     Some((media_type, data))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::types::claude::{ContentBlock, CreateMessageParams, Message, MessageContent, Role};
+
+    #[tokio::test]
+    async fn merge_messages_preserves_text_document_title_as_attachment_file_name() {
+        let params = CreateMessageParams {
+            max_tokens: 1024,
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks {
+                    content: vec![ContentBlock::Document {
+                        source: json!({
+                            "type": "text",
+                            "data": "Quarterly notes",
+                        }),
+                        cache_control: None,
+                        citations: None,
+                        context: None,
+                        title: Some("quarterly-notes.md".to_string()),
+                    }],
+                },
+            }],
+            ..Default::default()
+        };
+
+        let merged = merge_messages(params.messages, String::new()).expect("message should merge");
+
+        assert_eq!(merged.attachments.len(), 1);
+        let attachment = serde_json::to_value(&merged.attachments[0]).unwrap();
+        assert_eq!(attachment["file_name"], "quarterly-notes.md");
+    }
+
+    #[tokio::test]
+    async fn merge_messages_preserves_base64_document_title_for_upload_file_name() {
+        let params = CreateMessageParams {
+            max_tokens: 1024,
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks {
+                    content: vec![ContentBlock::Document {
+                        source: json!({
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": "JVBERi0xLjQK",
+                        }),
+                        cache_control: None,
+                        citations: None,
+                        context: None,
+                        title: Some("proposal.pdf".to_string()),
+                    }],
+                },
+            }],
+            ..Default::default()
+        };
+
+        let merged = merge_messages(params.messages, String::new()).expect("message should merge");
+
+        assert_eq!(merged.images.len(), 1);
+        let upload = serde_json::to_value(&merged.images[0]).unwrap();
+        assert_eq!(upload["file_name"], "proposal.pdf");
+    }
+
+    #[test]
+    fn extract_document_file_name_uses_source_file_name_when_title_is_absent() {
+        let source = json!({
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": "JVBERi0xLjQK",
+            "file_name": "/tmp/uploaded/report.pdf",
+        });
+
+        assert_eq!(
+            extract_document_file_name(&source, None).as_deref(),
+            Some("report.pdf")
+        );
+    }
 }
 
 /// Merges system message content into a single string

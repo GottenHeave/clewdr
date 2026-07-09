@@ -28,7 +28,9 @@ mod tests {
         assert!(source.is_some(), "Should parse valid PNG data URI");
 
         match source.unwrap() {
-            ImageSource::Base64 { media_type, data } => {
+            ImageSource::Base64 {
+                media_type, data, ..
+            } => {
                 assert_eq!(media_type, "image/png");
                 assert_eq!(
                     data,
@@ -47,7 +49,9 @@ mod tests {
         assert!(source.is_some(), "Should parse valid JPEG data URI");
 
         match source.unwrap() {
-            ImageSource::Base64 { media_type, data } => {
+            ImageSource::Base64 {
+                media_type, data, ..
+            } => {
                 assert_eq!(media_type, "image/jpeg");
                 assert_eq!(data, "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBg==");
             }
@@ -106,7 +110,9 @@ mod tests {
         assert!(source.is_some(), "Should parse data URI with extra params");
 
         match source.unwrap() {
-            ImageSource::Base64 { media_type, data } => {
+            ImageSource::Base64 {
+                media_type, data, ..
+            } => {
                 assert_eq!(media_type, "image/png");
                 assert_eq!(data, "iVBORw0KGgo=");
             }
@@ -195,7 +201,9 @@ mod tests {
             // Second block should be converted to Image (not ImageUrl)
             match &content[1] {
                 ContentBlock::Image { source, .. } => match source {
-                    ImageSource::Base64 { media_type, data } => {
+                    ImageSource::Base64 {
+                        media_type, data, ..
+                    } => {
                         assert_eq!(media_type, "image/png");
                         assert_eq!(data, "iVBORw0KGgo=");
                     }
@@ -285,6 +293,7 @@ mod tests {
                         source: ImageSource::Base64 {
                             media_type: "image/png".to_string(),
                             data: "existing_data".to_string(),
+                            file_name: None,
                         },
                         cache_control: None,
                     }],

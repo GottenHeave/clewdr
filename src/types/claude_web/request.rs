@@ -20,13 +20,46 @@ impl Attachment {
     /// # Returns
     /// A new Attachment instance configured as a text file
     pub fn new(content: String) -> Self {
+        Self::new_with_file_name(content, "paste.txt")
+    }
+
+    pub fn new_with_file_name(content: String, file_name: impl AsRef<str>) -> Self {
+        let file_name =
+            normalize_file_name(file_name.as_ref()).unwrap_or_else(|| "paste.txt".to_string());
+        let file_type = file_type_from_file_name(&file_name).unwrap_or_else(|| "txt".to_string());
+
         Attachment {
             file_size: content.len() as u64,
             extracted_content: content,
-            file_name: "paste.txt".to_string(),
-            file_type: "txt".to_string(),
+            file_name,
+            file_type,
         }
     }
+}
+
+pub fn normalize_file_name(file_name: &str) -> Option<String> {
+    let file_name = file_name
+        .trim()
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if file_name.is_empty() {
+        return None;
+    }
+
+    let normalized = file_name
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>();
+    let normalized = normalized.trim();
+    (!normalized.is_empty()).then(|| normalized.to_string())
+}
+
+fn file_type_from_file_name(file_name: &str) -> Option<String> {
+    file_name
+        .rsplit_once('.')
+        .and_then(|(_, extension)| normalize_file_name(extension))
 }
 
 /// Client-generated UUIDs for a single turn's messages

@@ -440,7 +440,12 @@ pub enum ContentBlock {
 pub enum ImageSource {
     /// Base64-encoded image data
     #[serde(rename = "base64")]
-    Base64 { media_type: String, data: String },
+    Base64 {
+        media_type: String,
+        data: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_name: Option<String>,
+    },
     /// Remote image URL
     #[serde(rename = "url")]
     Url { url: String },
@@ -484,6 +489,7 @@ impl ImageSource {
         Some(Self::Base64 {
             media_type: media_type.to_string(),
             data: base64_data.to_owned(),
+            file_name: None,
         })
     }
 
@@ -937,6 +943,7 @@ impl ContentBlock {
             _ => ImageSource::Base64 {
                 media_type: media_type.into(),
                 data: data.into(),
+                file_name: None,
             },
         };
         Self::Image {

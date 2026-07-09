@@ -11,7 +11,12 @@ use wreq::{
     header::{ACCEPT, REFERER},
 };
 
-use super::{ClaudeWebState, PendingCacheWrite};
+use super::{
+    ClaudeWebState, PendingCacheWrite,
+    transform::{
+        extract_base64_file, extract_document_file_name, extract_document_text, extract_file_id,
+    },
+};
 use crate::{
     claude_web_state::conversation_cache::{CachedConversation, CachedTurn},
     claude_web_state::diff::{self, DiffResult, extract_user_hashes, hash_system},
@@ -613,50 +618,24 @@ impl ClaudeWebState {
                             ContentBlock::Image { source, .. } => {
                                 images.push(source.clone());
                             }
-                            ContentBlock::Document { source, .. } => {
-                                let source_type = source
-                                    .get("type")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or_default();
-                                if source_type == "text" {
-                                    if let Some(text) = source
-                                        .get("data")
-                                        .or_else(|| source.get("text"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(str::trim)
-                                        .filter(|text| !text.is_empty())
-                                    {
-                                        attachments.push(Attachment::new(text.to_string()));
-                                    }
-                                } else if source_type == "file" {
-                                    if let Some(file_id) = source
-                                        .get("file_id")
-                                        .or_else(|| source.get("id"))
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(str::trim)
-                                        .filter(|file_id| !file_id.is_empty())
-                                    {
-                                        images.push(ImageSource::File {
-                                            file_id: file_id.to_string(),
-                                        });
-                                    }
-                                } else if source_type == "base64"
-                                    && let (Some(media_type), Some(data)) = (
-                                        source
-                                            .get("media_type")
-                                            .and_then(serde_json::Value::as_str)
-                                            .map(str::trim)
-                                            .filter(|media_type| !media_type.is_empty()),
-                                        source
-                                            .get("data")
-                                            .and_then(serde_json::Value::as_str)
-                                            .map(str::trim)
-                                            .filter(|data| !data.is_empty()),
-                                    )
+                            ContentBlock::Document { source, title, .. } => {
+                                let file_name =
+                                    extract_document_file_name(source, title.as_deref());
+                                if let Some(text) = extract_document_text(source) {
+                                    attachments.push(match file_name {
+                                        Some(file_name) => {
+                                            Attachment::new_with_file_name(text, file_name)
+                                        }
+                                        None => Attachment::new(text),
+                                    });
+                                } else if let Some(file_id) = extract_file_id(source) {
+                                    images.push(ImageSource::File { file_id });
+                                } else if let Some((media_type, data)) = extract_base64_file(source)
                                 {
                                     images.push(ImageSource::Base64 {
-                                        media_type: media_type.to_string(),
-                                        data: data.to_string(),
+                                        media_type,
+                                        data,
+                                        file_name,
                                     });
                                 }
                             }
