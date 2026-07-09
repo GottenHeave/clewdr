@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::claude::ImageSource;
+use crate::types::claude::{ImageSource, OutputEffort, ThinkingMode};
 
 /// Claude.ai attachment
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -77,6 +77,10 @@ pub struct WebRequestBody {
     pub files: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<OutputEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_mode: Option<ThinkingMode>,
     pub rendering_mode: String,
     pub prompt: String,
     pub timezone: String,
@@ -104,5 +108,36 @@ impl Tool {
             name: "web_search".to_string(),
             type_: "web_search_v0".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn web_request_body_serializes_effort_and_thinking_mode() {
+        let body = WebRequestBody {
+            max_tokens_to_sample: 1024,
+            attachments: vec![],
+            files: vec![],
+            model: Some("claude-opus-4-8".to_string()),
+            effort: Some(OutputEffort::Max),
+            thinking_mode: Some(ThinkingMode::Auto),
+            rendering_mode: "messages".to_string(),
+            prompt: "hi".to_string(),
+            timezone: "UTC".to_string(),
+            images: vec![],
+            tools: vec![],
+            parent_message_uuid: None,
+            turn_message_uuids: None,
+        };
+
+        let value = serde_json::to_value(body).unwrap();
+
+        assert_eq!(value["effort"], json!("max"));
+        assert_eq!(value["thinking_mode"], json!("auto"));
     }
 }

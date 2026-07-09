@@ -40,13 +40,27 @@ fn normalize_message(msg: Message) -> Option<Message> {
     })
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum Effort {
-    Low = 256,
+    Low,
     #[default]
-    Medium = 256 * 8,
-    High = 256 * 8 * 8,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl From<Effort> for OutputEffort {
+    fn from(value: Effort) -> Self {
+        match value {
+            Effort::Low => OutputEffort::Low,
+            Effort::Medium => OutputEffort::Medium,
+            Effort::High => OutputEffort::High,
+            Effort::Xhigh => OutputEffort::Xhigh,
+            Effort::Max => OutputEffort::Max,
+        }
+    }
 }
 
 impl From<CreateMessageParams> for ClaudeCreateMessageParams {
@@ -80,7 +94,9 @@ impl From<CreateMessageParams> for ClaudeCreateMessageParams {
             stop_sequences: params.stop,
             thinking: params
                 .thinking
-                .or_else(|| params.reasoning_effort.map(|e| Thinking::new(e as u64))),
+                .or_else(|| params.reasoning_effort.map(|_| Thinking::adaptive())),
+            effort: None,
+            thinking_mode: None,
             temperature: params.temperature,
             stream: params.stream,
             top_k: params.top_k,
@@ -88,7 +104,10 @@ impl From<CreateMessageParams> for ClaudeCreateMessageParams {
             tools: params.tools,
             tool_choice: params.tool_choice,
             metadata: params.metadata,
-            output_config: None,
+            output_config: params.reasoning_effort.map(|effort| OutputConfig {
+                effort: Some(effort.into()),
+                format: None,
+            }),
             output_format: None,
             service_tier: None,
             n: params.n,
@@ -167,5 +186,26 @@ impl CreateMessageParams {
             .collect::<Vec<_>>()
             .join("\n");
         bpe.encode_with_special_tokens(&messages).len() as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_effort_maps_to_output_config_effort() {
+        let params = CreateMessageParams {
+            max_tokens: Some(1024),
+            messages: vec![Message::new_text(Role::User, "hi")],
+            model: "claude-opus-4-8".to_string(),
+            reasoning_effort: Some(Effort::Xhigh),
+            ..Default::default()
+        };
+
+        let claude: ClaudeCreateMessageParams = params.into();
+
+        assert_eq!(claude.output_effort(), Some(OutputEffort::Xhigh));
+        assert_eq!(claude.thinking, Some(Thinking::adaptive()));
     }
 }

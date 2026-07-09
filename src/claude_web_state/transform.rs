@@ -28,6 +28,8 @@ impl ClaudeWebState {
         if CLEWDR_CONFIG.load().web_search {
             tools.push(Tool::web_search());
         }
+        let effort = value.web_thinking_effort();
+        let thinking_mode = value.web_thinking_mode();
         Some(WebRequestBody {
             max_tokens_to_sample: value.max_tokens,
             attachments: merged.attachments,
@@ -37,6 +39,8 @@ impl ClaudeWebState {
             } else {
                 None
             },
+            effort,
+            thinking_mode,
             rendering_mode: if value.stream.unwrap_or_default() {
                 "messages".to_string()
             } else {

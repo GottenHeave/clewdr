@@ -241,20 +241,26 @@ const MODEL_LIST: &[&str] = &[
     "claude-sonnet-4-20250514-1M-thinking",
     "claude-sonnet-4-5-20250929",
     "claude-sonnet-4-5-20250929-thinking",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-5-thinking",
     "claude-sonnet-4-5-20250929-1M",
     "claude-sonnet-4-5-20250929-1M-thinking",
     "claude-sonnet-4-6",
     "claude-sonnet-4-6-thinking",
     "claude-sonnet-4-6-1M",
     "claude-sonnet-4-6-1M-thinking",
-    "claude-sonnet-5-20260422",
-    "claude-sonnet-5-20260422-thinking",
     "claude-sonnet-5",
     "claude-sonnet-5-thinking",
+    "claude-haiku-4-5-20251001",
+    "claude-haiku-4-5-20251001-thinking",
+    "claude-haiku-4-5",
+    "claude-haiku-4-5-thinking",
     "claude-opus-4-20250514",
     "claude-opus-4-20250514-thinking",
     "claude-opus-4-1-20250805",
     "claude-opus-4-1-20250805-thinking",
+    "claude-opus-4-1",
+    "claude-opus-4-1-thinking",
     "claude-opus-4-5-20251101",
     "claude-opus-4-5-20251101-thinking",
     "claude-opus-4-5",
@@ -263,12 +269,8 @@ const MODEL_LIST: &[&str] = &[
     "claude-opus-4-6-thinking",
     "claude-opus-4-6-1M",
     "claude-opus-4-6-1M-thinking",
-    "claude-opus-4-7-20260105",
-    "claude-opus-4-7-20260105-thinking",
     "claude-opus-4-7",
     "claude-opus-4-7-thinking",
-    "claude-opus-4-8-20260312",
-    "claude-opus-4-8-20260312-thinking",
     "claude-opus-4-8",
     "claude-opus-4-8-thinking",
 ];
@@ -298,19 +300,34 @@ mod tests {
     use super::MODEL_LIST;
 
     #[test]
-    fn model_list_includes_sonnet_5_and_opus_4_7_4_8() {
+    fn model_list_includes_current_official_models() {
         for model in [
-            "claude-sonnet-5-20260422",
             "claude-sonnet-5",
             "claude-sonnet-5-thinking",
-            "claude-opus-4-7-20260105",
+            "claude-haiku-4-5-20251001",
+            "claude-haiku-4-5",
+            "claude-sonnet-4-5",
+            "claude-opus-4-1",
             "claude-opus-4-7",
             "claude-opus-4-7-thinking",
-            "claude-opus-4-8-20260312",
             "claude-opus-4-8",
             "claude-opus-4-8-thinking",
         ] {
             assert!(MODEL_LIST.contains(&model), "{model} should be listed");
+        }
+    }
+
+    #[test]
+    fn model_list_excludes_unconfirmed_dated_new_model_ids() {
+        for model in [
+            "claude-sonnet-5-20260422",
+            "claude-opus-4-7-20260105",
+            "claude-opus-4-8-20260312",
+        ] {
+            assert!(
+                !MODEL_LIST.contains(&model),
+                "{model} should not be advertised"
+            );
         }
     }
 }

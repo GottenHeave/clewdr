@@ -38,6 +38,18 @@ struct BundledMessages {
     images: Vec<ImageSource>,
 }
 
+fn model_selector_state_body(p: &CreateMessageParams) -> serde_json::Value {
+    let mut body = json!({ "model": p.model });
+    if let (Some(effort), Some(mode)) = (p.web_thinking_effort(), p.web_thinking_mode()) {
+        body["thinking"] = json!({
+            "type": "effort_and_mode",
+            "effort": effort,
+            "mode": mode,
+        });
+    }
+    body
+}
+
 impl ClaudeWebState {
     /// Attempts to send a chat message to Claude API with retry mechanism
     ///
@@ -261,6 +273,8 @@ impl ClaudeWebState {
                 msg: "Organization UUID is not set",
             })?;
 
+        self.sync_model_selector_state(&p).await?;
+
         // === Create new conversation ===
         let new_uuid = uuid::Uuid::new_v4().to_string();
         let endpoint = self
@@ -306,8 +320,12 @@ impl ClaudeWebState {
 
         // === PUT settings ===
         self.last_params = Some(p.clone());
-        let paprika = if p.thinking.is_some() && self.is_pro() {
-            "extended".into()
+        let paprika = if p
+            .web_thinking_mode()
+            .is_some_and(|mode| mode == crate::types::claude::ThinkingMode::Auto)
+            && self.is_pro()
+        {
+            "auto".into()
         } else {
             json!(null)
         };
@@ -417,8 +435,13 @@ impl ClaudeWebState {
         self.conv_uuid = Some(cached.conv_uuid.clone());
         self.last_params = Some(p.clone());
 
+        self.sync_model_selector_state(p).await?;
+
         // Update paprika_mode if needed
-        let need_thinking = p.thinking.is_some() && self.is_pro();
+        let need_thinking = p
+            .web_thinking_mode()
+            .is_some_and(|mode| mode == crate::types::claude::ThinkingMode::Auto)
+            && self.is_pro();
         self.update_paprika(&cached.conv_uuid, need_thinking).await;
 
         // Extract new user messages from original messages array
@@ -485,8 +508,13 @@ impl ClaudeWebState {
         self.conv_uuid = Some(cached.conv_uuid.clone());
         self.last_params = Some(p.clone());
 
+        self.sync_model_selector_state(p).await?;
+
         // Update paprika_mode if needed
-        let need_thinking = p.thinking.is_some() && self.is_pro();
+        let need_thinking = p
+            .web_thinking_mode()
+            .is_some_and(|mode| mode == crate::types::claude::ThinkingMode::Auto)
+            && self.is_pro();
         self.update_paprika(&cached.conv_uuid, need_thinking).await;
 
         // Extract remaining user messages
@@ -541,7 +569,7 @@ impl ClaudeWebState {
     /// PUT paprika_mode setting on existing conversation
     async fn update_paprika(&self, conv_uuid: &str, need_thinking: bool) {
         let paprika = if need_thinking {
-            "extended".into()
+            "auto".into()
         } else {
             json!(null)
         };
@@ -559,6 +587,37 @@ impl ClaudeWebState {
             .json(&body)
             .send()
             .await;
+    }
+
+    async fn sync_model_selector_state(&self, p: &CreateMessageParams) -> Result<(), ClewdrError> {
+        if !self.is_pro() {
+            return Ok(());
+        }
+        let org_uuid = self.org_uuid.as_ref().ok_or(ClewdrError::UnexpectedNone {
+            msg: "Organization UUID is not set",
+        })?;
+        let endpoint = self
+            .endpoint
+            .join(&format!(
+                "api/organizations/{org_uuid}/model_selector_state/chat"
+            ))
+            .map_err(|e| ClewdrError::Whatever {
+                message: format!("Parse URL error: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+        let body = model_selector_state_body(p);
+
+        self.build_request(Method::PATCH, endpoint)
+            .json(&body)
+            .send()
+            .await
+            .context(WreqSnafu {
+                msg: "Failed to sync Claude Web model selector",
+            })?
+            .check_claude()
+            .await?;
+
+        Ok(())
     }
 
     /// Build the completion request body for incremental sends
@@ -586,6 +645,12 @@ impl ClaudeWebState {
         // Model (only for pro)
         if self.is_pro() {
             body["model"] = json!(p.model);
+        }
+        if let Some(effort) = p.web_thinking_effort() {
+            body["effort"] = json!(effort);
+        }
+        if let Some(mode) = p.web_thinking_mode() {
+            body["thinking_mode"] = json!(mode);
         }
         // Tools (same as full request)
         let mut tools = vec![];
@@ -718,5 +783,63 @@ impl ClaudeWebState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::types::claude::{OutputConfig, OutputEffort, Role, Thinking, ThinkingMode};
+
+    #[test]
+    fn model_selector_state_body_uses_effort_and_mode_shape() {
+        let params = CreateMessageParams {
+            model: "claude-opus-4-8".to_string(),
+            messages: vec![Message::new_text(Role::User, "hi")],
+            output_config: Some(OutputConfig {
+                effort: Some(OutputEffort::Max),
+                format: None,
+            }),
+            thinking: Some(Thinking::adaptive()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            model_selector_state_body(&params),
+            json!({
+                "model": "claude-opus-4-8",
+                "thinking": {
+                    "type": "effort_and_mode",
+                    "effort": "max",
+                    "mode": "auto"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn model_selector_state_body_keeps_off_mode() {
+        let params = CreateMessageParams {
+            model: "claude-opus-4-8".to_string(),
+            messages: vec![Message::new_text(Role::User, "hi")],
+            output_config: Some(OutputConfig {
+                effort: Some(OutputEffort::Xhigh),
+                format: None,
+            }),
+            thinking: Some(Thinking::Disabled),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            model_selector_state_body(&params)["thinking"],
+            json!({
+                "type": "effort_and_mode",
+                "effort": "xhigh",
+                "mode": "off"
+            })
+        );
+        assert_eq!(params.web_thinking_mode(), Some(ThinkingMode::Off));
     }
 }

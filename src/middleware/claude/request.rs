@@ -276,6 +276,7 @@ where
             body.model = body.model.trim_end_matches("-thinking").to_string();
             body.thinking.get_or_insert(Thinking::new(4096));
         }
+        body.normalize_thinking_controls();
         drop_empty_system(&mut body);
         Ok(Self(body, format))
     }

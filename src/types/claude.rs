@@ -14,7 +14,7 @@ pub(super) fn default_max_tokens() -> u32 {
     8192
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct OutputConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<OutputEffort>,
@@ -22,13 +22,27 @@ pub struct OutputConfig {
     pub format: Option<OutputFormat>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputEffort {
     Low,
     Medium,
     High,
+    Xhigh,
     Max,
+}
+
+impl OutputEffort {
+    pub fn default_for_web_thinking() -> Self {
+        Self::High
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingMode {
+    Auto,
+    Off,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -93,6 +107,12 @@ pub struct CreateMessageParams {
     #[serde_as(deserialize_as = "DefaultOnError")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<Thinking>,
+    /// Claude Web completion effort. Normalized into output_config before API forwarding.
+    #[serde(default, skip_serializing)]
+    pub effort: Option<OutputEffort>,
+    /// Claude Web thinking mode. Normalized into thinking before API forwarding.
+    #[serde(default, skip_serializing)]
+    pub thinking_mode: Option<ThinkingMode>,
     /// Top-k sampling
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
@@ -123,6 +143,60 @@ pub struct CreateMessageParams {
 }
 
 impl CreateMessageParams {
+    pub fn normalize_thinking_controls(&mut self) {
+        let top_level_effort = self.effort.take();
+        if let Some(effort) = top_level_effort {
+            self.output_config
+                .get_or_insert_with(OutputConfig::default)
+                .effort = Some(effort);
+        }
+
+        if let Some(mode) = self.thinking_mode.take()
+            && self.thinking.is_none()
+        {
+            self.thinking = Some(match mode {
+                ThinkingMode::Auto => Thinking::Adaptive { display: None },
+                ThinkingMode::Off => Thinking::Disabled,
+            });
+        }
+
+        if let Some(Thinking::EffortAndMode { effort, mode }) = self.thinking.clone() {
+            self.output_config
+                .get_or_insert_with(OutputConfig::default)
+                .effort = Some(effort);
+            self.thinking = Some(match mode {
+                ThinkingMode::Auto => Thinking::Adaptive { display: None },
+                ThinkingMode::Off => Thinking::Disabled,
+            });
+        }
+    }
+
+    pub fn output_effort(&self) -> Option<OutputEffort> {
+        self.output_config.as_ref().and_then(|config| config.effort)
+    }
+
+    pub fn web_thinking_mode(&self) -> Option<ThinkingMode> {
+        match &self.thinking {
+            Some(Thinking::Disabled) => Some(ThinkingMode::Off),
+            Some(Thinking::Enabled { .. }) | Some(Thinking::Adaptive { .. }) => {
+                Some(ThinkingMode::Auto)
+            }
+            Some(Thinking::EffortAndMode { mode, .. }) => Some(*mode),
+            None => self.output_effort().map(|_| ThinkingMode::Auto),
+        }
+    }
+
+    pub fn web_thinking_effort(&self) -> Option<OutputEffort> {
+        if self.web_thinking_mode().is_some() {
+            Some(
+                self.output_effort()
+                    .unwrap_or_else(OutputEffort::default_for_web_thinking),
+            )
+        } else {
+            None
+        }
+    }
+
     pub fn count_tokens(&self) -> u32 {
         let bpe = o200k_base().expect("Failed to get encoding");
         let systems = match self.system {
@@ -151,7 +225,7 @@ impl CreateMessageParams {
 }
 
 /// Thinking mode in Claude API Request
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Thinking {
     Enabled {
@@ -162,11 +236,19 @@ pub enum Thinking {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display: Option<String>,
     },
+    EffortAndMode {
+        effort: OutputEffort,
+        mode: ThinkingMode,
+    },
 }
 
 impl Thinking {
     pub fn new(budget_tokens: u64) -> Self {
         Self::Enabled { budget_tokens }
+    }
+
+    pub fn adaptive() -> Self {
+        Self::Adaptive { display: None }
     }
 }
 
@@ -1077,5 +1159,54 @@ mod tests {
 
         let params: CreateMessageParams = serde_json::from_value(body).unwrap();
         assert!(matches!(params.tool_choice, Some(ToolChoice::Auto { .. })));
+    }
+
+    #[test]
+    fn normalizes_effort_and_mode_thinking_for_api_forwarding() {
+        let body = json!({
+            "max_tokens": 1024,
+            "messages": [
+                { "role": "user", "content": "hi" }
+            ],
+            "model": "claude-opus-4-8",
+            "thinking": {
+                "type": "effort_and_mode",
+                "effort": "xhigh",
+                "mode": "auto"
+            }
+        });
+
+        let mut params: CreateMessageParams = serde_json::from_value(body).unwrap();
+        params.normalize_thinking_controls();
+
+        assert_eq!(params.output_effort(), Some(OutputEffort::Xhigh));
+        assert_eq!(params.thinking, Some(Thinking::Adaptive { display: None }));
+
+        let value = serde_json::to_value(&params).unwrap();
+        assert_eq!(value["output_config"]["effort"], "xhigh");
+        assert_eq!(value["thinking"]["type"], "adaptive");
+        assert!(value.get("effort").is_none());
+        assert!(value.get("thinking_mode").is_none());
+    }
+
+    #[test]
+    fn normalizes_top_level_web_thinking_fields() {
+        let body = json!({
+            "max_tokens": 1024,
+            "messages": [
+                { "role": "user", "content": "hi" }
+            ],
+            "model": "claude-opus-4-8",
+            "effort": "max",
+            "thinking_mode": "off"
+        });
+
+        let mut params: CreateMessageParams = serde_json::from_value(body).unwrap();
+        params.normalize_thinking_controls();
+
+        assert_eq!(params.output_effort(), Some(OutputEffort::Max));
+        assert_eq!(params.thinking, Some(Thinking::Disabled));
+        assert_eq!(params.web_thinking_effort(), Some(OutputEffort::Max));
+        assert_eq!(params.web_thinking_mode(), Some(ThinkingMode::Off));
     }
 }
