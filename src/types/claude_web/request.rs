@@ -69,6 +69,18 @@ pub struct TurnMessageUuids {
     pub assistant_message_uuid: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreateConversationParams {
+    pub name: String,
+    pub model: String,
+    pub include_conversation_preferences: bool,
+    pub paprika_mode: Option<String>,
+    pub compass_mode: Option<String>,
+    pub tool_search_mode: String,
+    pub is_temporary: bool,
+    pub enabled_imagine: bool,
+}
+
 /// Request body to be sent to the Claude.ai
 #[derive(Deserialize, Serialize, Debug)]
 pub struct WebRequestBody {
@@ -93,6 +105,8 @@ pub struct WebRequestBody {
     /// Client-generated UUIDs for this turn's messages
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_message_uuids: Option<TurnMessageUuids>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_conversation_params: Option<CreateConversationParams>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -133,6 +147,7 @@ mod tests {
             tools: vec![],
             parent_message_uuid: None,
             turn_message_uuids: None,
+            create_conversation_params: None,
         };
 
         let value = serde_json::to_value(body).unwrap();

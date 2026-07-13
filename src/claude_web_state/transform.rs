@@ -1,15 +1,17 @@
 use std::{fmt::Write, mem};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use serde_json::Value;
 use tracing::{debug, warn};
+use url::Url;
 use wreq::multipart::{Form, Part};
 
 use crate::{
     claude_web_state::ClaudeWebState,
     config::CLEWDR_CONFIG,
+    error::CheckClaudeErr,
     types::{
         claude::{ContentBlock, CreateMessageParams, ImageSource, Message, MessageContent, Role},
         claude_web::request::*,
@@ -52,74 +54,97 @@ impl ClaudeWebState {
             tools,
             parent_message_uuid: None,
             turn_message_uuids: None,
+            create_conversation_params: None,
         })
     }
 
-    /// Upload images to the Claude.ai
-    pub async fn upload_images(&self, imgs: Vec<ImageSource>) -> Vec<String> {
-        // upload images
-        stream::iter(imgs)
-            .filter_map(async |img| {
-                let ImageSource::Base64 {
-                    media_type,
-                    data,
-                    file_name,
-                } = img
-                else {
-                    if let ImageSource::File { file_id } = img {
-                        return Some(file_id);
+    /// Upload files through the conversation-scoped Claude.ai file service.
+    pub async fn upload_files(
+        &self,
+        files: Vec<ImageSource>,
+        org_uuid: &str,
+        conversation_uuid: &str,
+    ) -> Result<Vec<String>, crate::error::ClewdrError> {
+        let endpoint = conversation_upload_endpoint(&self.endpoint, org_uuid, conversation_uuid)
+            .map_err(|source| crate::error::ClewdrError::Whatever {
+                message: "Failed to build conversation upload URL".to_string(),
+                source: Some(Box::new(source)),
+            })?;
+
+        stream::iter(files)
+            .map(|file| {
+                let endpoint = endpoint.clone();
+                async move {
+                    let ImageSource::Base64 {
+                        media_type,
+                        data,
+                        file_name,
+                    } = file
+                    else {
+                        if let ImageSource::File { file_id } = file {
+                            return Ok(file_id);
+                        }
+                        return Err(crate::error::ClewdrError::BadRequest {
+                            msg: "Unsupported URL file source",
+                        });
+                    };
+                    let bytes = BASE64_STANDARD.decode(data).map_err(|error| {
+                        warn!("Failed to decode uploaded file: {error}");
+                        crate::error::ClewdrError::BadRequest {
+                            msg: "Invalid base64 file data",
+                        }
+                    })?;
+                    let main_type = media_type.split(';').next().unwrap_or(&media_type);
+                    let file_name = file_name
+                        .as_deref()
+                        .and_then(normalize_file_name)
+                        .unwrap_or_else(|| default_upload_file_name(main_type).to_string());
+                    let part = Part::bytes(bytes)
+                        .file_name(file_name)
+                        .mime_str(main_type)
+                        .map_err(|error| crate::error::ClewdrError::Whatever {
+                            message: "Invalid uploaded file media type".to_string(),
+                            source: Some(Box::new(error)),
+                        })?;
+                    let form = Form::new().part("file", part);
+                    let response = self
+                        .build_request(http::Method::POST, endpoint)
+                        .multipart(form)
+                        .send()
+                        .await
+                        .map_err(|source| crate::error::ClewdrError::WreqError {
+                            msg: "Failed to upload file",
+                            source,
+                        })?
+                        .check_claude()
+                        .await?;
+                    #[derive(serde::Deserialize)]
+                    struct UploadResponse {
+                        file_uuid: String,
                     }
-                    warn!("Image type is not base64");
-                    return None;
-                };
-                // decode the image
-                let bytes = BASE64_STANDARD
-                    .decode(data)
-                    .inspect_err(|e| {
-                        warn!("Failed to decode image: {}", e);
-                    })
-                    .ok()?;
-                // choose the file name based on the media type (extract main type before any params)
-                let main_type = media_type.split(';').next().unwrap_or(&media_type);
-                let file_name = file_name
-                    .as_deref()
-                    .and_then(normalize_file_name)
-                    .unwrap_or_else(|| default_upload_file_name(main_type).to_string());
-                // create the part and form
-                let part = Part::bytes(bytes).file_name(file_name);
-                let form = Form::new().part("file", part);
-                let endpoint = self
-                    .endpoint
-                    .join(&format!("api/{}/upload", self.org_uuid.as_ref()?))
-                    .expect("Url parse error");
-                // send the request into future
-                let res = self
-                    .build_request(http::Method::POST, endpoint)
-                    .multipart(form)
-                    .send()
-                    .await
-                    .inspect_err(|e| {
-                        warn!("Failed to upload image: {}", e);
-                    })
-                    .ok()?;
-                #[derive(serde::Deserialize)]
-                struct UploadResponse {
-                    file_uuid: String,
+                    let upload = response.json::<UploadResponse>().await.map_err(|source| {
+                        crate::error::ClewdrError::WreqError {
+                            msg: "Failed to parse file upload response",
+                            source,
+                        }
+                    })?;
+                    Ok(upload.file_uuid)
                 }
-                // get the response json
-                let json = res
-                    .json::<UploadResponse>()
-                    .await
-                    .inspect_err(|e| {
-                        warn!("Failed to parse image response: {}", e);
-                    })
-                    .ok()?;
-                // extract the file_uuid
-                Some(json.file_uuid)
             })
-            .collect::<Vec<_>>()
+            .buffered(5)
+            .try_collect()
             .await
     }
+}
+
+fn conversation_upload_endpoint(
+    endpoint: &Url,
+    org_uuid: &str,
+    conversation_uuid: &str,
+) -> Result<Url, url::ParseError> {
+    endpoint.join(&format!(
+        "api/organizations/{org_uuid}/conversations/{conversation_uuid}/wiggle/upload-file"
+    ))
 }
 
 /// Merged messages and images
@@ -382,6 +407,7 @@ pub(super) fn extract_base64_file(source: &Value) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use url::Url;
 
     use super::*;
     use crate::types::claude::{ContentBlock, CreateMessageParams, Message, MessageContent, Role};
@@ -459,6 +485,20 @@ mod tests {
         assert_eq!(
             extract_document_file_name(&source, None).as_deref(),
             Some("report.pdf")
+        );
+    }
+
+    #[test]
+    fn upload_endpoint_matches_claude_web_conversation_upload() {
+        let endpoint = Url::parse("https://claude.ai/").unwrap();
+
+        let upload_endpoint =
+            conversation_upload_endpoint(&endpoint, "organization-id", "conversation-id").unwrap();
+
+        assert_eq!(
+            upload_endpoint.as_str(),
+            "https://claude.ai/api/organizations/organization-id/conversations/\
+conversation-id/wiggle/upload-file"
         );
     }
 }

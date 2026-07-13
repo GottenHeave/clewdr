@@ -6,10 +6,7 @@ use futures::TryFutureExt;
 use serde_json::json;
 use snafu::ResultExt;
 use tracing::{Instrument, debug, error, info, info_span, warn};
-use wreq::{
-    Method, Response,
-    header::{ACCEPT, REFERER},
-};
+use wreq::{Method, Response, header::ACCEPT};
 
 use super::{
     ClaudeWebState, PendingCacheWrite,
@@ -20,10 +17,10 @@ use super::{
 use crate::{
     claude_web_state::conversation_cache::{CachedConversation, CachedTurn},
     claude_web_state::diff::{self, DiffResult, extract_user_hashes, hash_system},
-    config::{CLAUDE_ENDPOINT, CLEWDR_CONFIG},
+    config::CLEWDR_CONFIG,
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     types::claude::{ContentBlock, CreateMessageParams, ImageSource, Message, MessageContent},
-    types::claude_web::request::{Attachment, TurnMessageUuids},
+    types::claude_web::request::{Attachment, CreateConversationParams, TurnMessageUuids},
     utils::{TIME_ZONE, print_out_json},
 };
 
@@ -48,6 +45,30 @@ fn model_selector_state_body(p: &CreateMessageParams) -> serde_json::Value {
         });
     }
     body
+}
+
+fn create_conversation_params(
+    p: &CreateMessageParams,
+    is_temporary: bool,
+    is_pro: bool,
+) -> CreateConversationParams {
+    CreateConversationParams {
+        name: if is_temporary {
+            String::new()
+        } else {
+            format!("ClewdR-{}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"))
+        },
+        model: p.model.clone(),
+        include_conversation_preferences: true,
+        paprika_mode: p
+            .web_thinking_mode()
+            .is_some_and(|mode| mode == crate::types::claude::ThinkingMode::Auto && is_pro)
+            .then(|| "auto".to_string()),
+        compass_mode: None,
+        tool_search_mode: "auto".to_string(),
+        is_temporary,
+        enabled_imagine: true,
+    }
 }
 
 impl ClaudeWebState {
@@ -275,75 +296,13 @@ impl ClaudeWebState {
 
         self.sync_model_selector_state(&p).await?;
 
-        // === Create new conversation ===
+        // Claude Web generates the UUID client-side and creates the conversation
+        // as part of the first completion request.
         let new_uuid = uuid::Uuid::new_v4().to_string();
-        let endpoint = self
-            .endpoint
-            .join(&format!("api/organizations/{org_uuid}/chat_conversations"))
-            .map_err(|e| ClewdrError::Whatever {
-                message: format!("Parse URL error: {e}"),
-                source: Some(Box::new(e)),
-            })?;
         let is_temporary = !CLEWDR_CONFIG.load().preserve_chats;
-        let body = json!({
-            "uuid": new_uuid,
-            "name": if is_temporary { "".to_string() } else {
-                format!("ClewdR-{}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"))
-            },
-            "is_temporary": is_temporary,
-        });
-
-        let referer = if is_temporary {
-            self.endpoint
-                .join("new?incognito")
-                .map(|u| u.to_string())
-                .unwrap_or_else(|_| format!("{CLAUDE_ENDPOINT}new?incognito"))
-        } else {
-            self.endpoint
-                .join("new")
-                .map(|u| u.to_string())
-                .unwrap_or_else(|_| format!("{CLAUDE_ENDPOINT}new"))
-        };
-
-        self.build_request(Method::POST, endpoint)
-            .header(REFERER, referer)
-            .json(&body)
-            .send()
-            .await
-            .context(WreqSnafu {
-                msg: "Failed to create new conversation",
-            })?
-            .check_claude()
-            .await?;
-        self.conv_uuid = Some(new_uuid.to_string());
-        debug!("New conversation created: {}", new_uuid);
-
-        // === PUT settings ===
+        self.conv_uuid = Some(new_uuid.clone());
         self.last_params = Some(p.clone());
-        let paprika = if p
-            .web_thinking_mode()
-            .is_some_and(|mode| mode == crate::types::claude::ThinkingMode::Auto)
-            && self.is_pro()
-        {
-            "auto".into()
-        } else {
-            json!(null)
-        };
-        let settings_body = json!({ "settings": { "paprika_mode": paprika } });
-        let endpoint = self
-            .endpoint
-            .join(&format!(
-                "api/organizations/{org_uuid}/chat_conversations/{new_uuid}"
-            ))
-            .map_err(|e| ClewdrError::Whatever {
-                message: format!("Parse URL error: {e}"),
-                source: Some(Box::new(e)),
-            })?;
-        let _ = self
-            .build_request(Method::PUT, endpoint)
-            .json(&settings_body)
-            .send()
-            .await;
+        debug!("Generated conversation UUID: {}", new_uuid);
 
         // === Transform and send ===
         let mut body = self
@@ -351,6 +310,8 @@ impl ClaudeWebState {
             .ok_or(ClewdrError::BadRequest {
                 msg: "Request body is empty",
             })?;
+        body.create_conversation_params =
+            Some(create_conversation_params(&p, is_temporary, self.is_pro()));
 
         // Generate turn_message_uuids
         let human_uuid = uuid::Uuid::new_v4().to_string();
@@ -362,8 +323,7 @@ impl ClaudeWebState {
 
         let images = body.images.drain(..).collect::<Vec<_>>();
 
-        // upload images
-        let files = self.upload_images(images).await;
+        let files = self.upload_files(images, &org_uuid, &new_uuid).await?;
         body.files = files;
 
         // send the request
@@ -458,8 +418,16 @@ impl ClaudeWebState {
         let assistant_uuid = uuid::Uuid::new_v4().to_string();
 
         let body = self
-            .build_incremental_body(&bundled, parent_uuid, &human_uuid, &assistant_uuid, p)
-            .await;
+            .build_incremental_body(
+                &bundled,
+                &cached.org_uuid,
+                &cached.conv_uuid,
+                parent_uuid,
+                &human_uuid,
+                &assistant_uuid,
+                p,
+            )
+            .await?;
 
         print_out_json(&body, "claude_web_incremental_req.json");
 
@@ -530,8 +498,16 @@ impl ClaudeWebState {
         let assistant_uuid = uuid::Uuid::new_v4().to_string();
 
         let body = self
-            .build_incremental_body(&bundled, parent_uuid, &human_uuid, &assistant_uuid, p)
-            .await;
+            .build_incremental_body(
+                &bundled,
+                &cached.org_uuid,
+                &cached.conv_uuid,
+                parent_uuid,
+                &human_uuid,
+                &assistant_uuid,
+                p,
+            )
+            .await?;
 
         let endpoint = self
             .endpoint
@@ -624,12 +600,16 @@ impl ClaudeWebState {
     async fn build_incremental_body(
         &self,
         bundled: &BundledMessages,
+        org_uuid: &str,
+        conversation_uuid: &str,
         parent_uuid: &str,
         human_uuid: &str,
         assistant_uuid: &str,
         p: &CreateMessageParams,
-    ) -> serde_json::Value {
-        let files = self.upload_images(bundled.images.clone()).await;
+    ) -> Result<serde_json::Value, ClewdrError> {
+        let files = self
+            .upload_files(bundled.images.clone(), org_uuid, conversation_uuid)
+            .await?;
         let mut body = json!({
             "prompt": bundled.prompt,
             "parent_message_uuid": parent_uuid,
@@ -660,7 +640,7 @@ impl ClaudeWebState {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
-        body
+        Ok(body)
     }
 
     /// Merge user messages into prompt or attachment based on length
@@ -841,5 +821,29 @@ mod tests {
             })
         );
         assert_eq!(params.web_thinking_mode(), Some(ThinkingMode::Off));
+    }
+
+    #[test]
+    fn create_conversation_params_match_claude_web_first_completion() {
+        let params = CreateMessageParams {
+            model: "claude-opus-4-8".to_string(),
+            messages: vec![Message::new_text(Role::User, "hi")],
+            thinking: Some(Thinking::adaptive()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            serde_json::to_value(create_conversation_params(&params, true, true)).unwrap(),
+            json!({
+                "name": "",
+                "model": "claude-opus-4-8",
+                "include_conversation_preferences": true,
+                "paprika_mode": "auto",
+                "compass_mode": null,
+                "tool_search_mode": "auto",
+                "is_temporary": true,
+                "enabled_imagine": true
+            })
+        );
     }
 }
