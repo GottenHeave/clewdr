@@ -72,10 +72,22 @@ pub(crate) fn thinking_summary_delta_index(data: &str) -> Option<usize> {
 
 pub(crate) fn normalize_claude_web_stream_event(data: &str) -> Option<String> {
     let Ok(mut value) = serde_json::from_str::<Value>(data) else {
-        return Some(data.to_owned());
+        return None;
     };
 
-    if value.get("type").and_then(Value::as_str) == Some("message_limit") {
+    let event_type = value.get("type").and_then(Value::as_str)?;
+    // Review this allowlist when upgrading the Anthropic SDK stream schema.
+    if !matches!(
+        event_type,
+        "message_start"
+            | "content_block_start"
+            | "content_block_delta"
+            | "content_block_stop"
+            | "message_delta"
+            | "message_stop"
+            | "ping"
+            | "error"
+    ) {
         return None;
     }
 

@@ -52,6 +52,7 @@ fn source_event_template(event: &SourceEvent) -> Event {
 
 fn thinking_block_start(index: usize) -> Event {
     Event::default()
+        .event("content_block_start")
         .json_data(StreamEvent::ContentBlockStart {
             index,
             content_block: ContentBlock::Thinking {
@@ -80,7 +81,7 @@ fn normalize_stream(
                 continue;
             };
             let Ok(parsed) = serde_json::from_str::<StreamEvent>(&data) else {
-                yield new_event.data(data);
+                warn!("Dropping malformed Anthropic stream event after normalization");
                 continue;
             };
             if let StreamEvent::ContentBlockStart {
@@ -204,15 +205,47 @@ pub async fn check_overloaded(mut resp: Response) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use axum::{body, response::IntoResponse, response::Sse};
+    use eventsource_stream::Event as SourceEvent;
+    use futures::{StreamExt, stream};
     use serde_json::Value;
 
-    use crate::middleware::claude::normalize_claude_web_stream_event;
+    use super::{EventResult, normalize_stream};
+    use crate::{middleware::claude::normalize_claude_web_stream_event, types::claude::Usage};
+
+    fn source_event(data: &str) -> SourceEvent {
+        SourceEvent {
+            event: String::new(),
+            data: data.to_owned(),
+            id: String::new(),
+            retry: None,
+        }
+    }
 
     #[test]
     fn drops_web_only_message_limit_events() {
         let data = r#"{"type":"message_limit","message_limit":{"type":"within_limit"}}"#;
 
         assert!(normalize_claude_web_stream_event(data).is_none());
+    }
+
+    #[test]
+    fn drops_web_only_conversation_ready_events() {
+        let data = r#"{"type":"conversation_ready"}"#;
+
+        assert!(normalize_claude_web_stream_event(data).is_none());
+    }
+
+    #[test]
+    fn drops_unknown_web_metadata_events() {
+        let data = r#"{"type":"future_web_metadata","value":true}"#;
+
+        assert!(normalize_claude_web_stream_event(data).is_none());
+    }
+
+    #[test]
+    fn drops_non_json_stream_data() {
+        assert!(normalize_claude_web_stream_event("[DONE]").is_none());
     }
 
     #[test]
@@ -234,6 +267,21 @@ mod tests {
                 .and_then(|delta| delta.get("thinking"))
                 .and_then(Value::as_str),
             Some("确认端口已改，更新草稿回复。")
+        );
+    }
+
+    #[test]
+    fn rewrites_flat_thinking_summary_delta_events() {
+        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_summary_delta","summary":"checked the request"}}"#;
+        let normalized = normalize_claude_web_stream_event(data).unwrap();
+        let normalized: Value = serde_json::from_str(&normalized).unwrap();
+
+        assert_eq!(
+            normalized
+                .get("delta")
+                .and_then(|delta| delta.get("thinking"))
+                .and_then(Value::as_str),
+            Some("checked the request")
         );
     }
 
@@ -273,5 +321,51 @@ mod tests {
             normalize_claude_web_stream_event(data).as_deref(),
             Some(data)
         );
+    }
+
+    #[test]
+    fn keeps_all_anthropic_stream_event_types() {
+        for event_type in [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+            "ping",
+            "error",
+        ] {
+            let data = format!(r#"{{"type":"{event_type}"}}"#);
+            assert_eq!(
+                normalize_claude_web_stream_event(&data).as_deref(),
+                Some(data.as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn drops_known_events_that_fail_anthropic_deserialization() {
+        let input: Vec<EventResult<SourceEvent>> = vec![Ok(source_event(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta"}}"#,
+        ))];
+        let output = normalize_stream(Usage::default(), stream::iter(input));
+        futures::pin_mut!(output);
+
+        assert!(output.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn synthetic_thinking_start_has_anthropic_sse_event_name() {
+        let input: Vec<EventResult<SourceEvent>> = vec![Ok(source_event(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_summary_delta","summary":"checked"}}"#,
+        ))];
+        let response =
+            Sse::new(normalize_stream(Usage::default(), stream::iter(input))).into_response();
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body.contains("event: content_block_start"));
     }
 }
