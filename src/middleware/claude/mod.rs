@@ -70,13 +70,26 @@ pub(crate) fn thinking_summary_delta_index(data: &str) -> Option<usize> {
     content_block_index(&value)
 }
 
-pub(crate) fn normalize_claude_web_stream_event(data: &str) -> Option<String> {
+pub(crate) fn normalize_claude_web_stream_event(data: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<Value>(data) else {
-        return Some(data.to_owned());
+        return data.to_owned();
     };
 
-    if value.get("type").and_then(Value::as_str) == Some("message_limit") {
-        return None;
+    let Some(event_type) = value.get("type").and_then(Value::as_str) else {
+        return data.to_owned();
+    };
+    if !matches!(
+        event_type,
+        "message_start"
+            | "content_block_start"
+            | "content_block_delta"
+            | "content_block_stop"
+            | "message_delta"
+            | "message_stop"
+            | "ping"
+            | "error"
+    ) {
+        return data.to_owned();
     }
 
     if is_thinking_block_start(&value) {
@@ -87,11 +100,11 @@ pub(crate) fn normalize_claude_web_stream_event(data: &str) -> Option<String> {
                 "thinking": "",
             });
         }
-        return Some(value.to_string());
+        return value.to_string();
     }
 
     let Some(summary) = thinking_summary_delta_text(&value).map(str::to_owned) else {
-        return Some(data.to_owned());
+        return data.to_owned();
     };
 
     if let Some(delta) = value.get_mut("delta") {
@@ -101,7 +114,7 @@ pub(crate) fn normalize_claude_web_stream_event(data: &str) -> Option<String> {
         });
     }
 
-    Some(value.to_string())
+    value.to_string()
 }
 
 #[derive(Debug, Clone)]

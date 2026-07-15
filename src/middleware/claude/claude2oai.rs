@@ -79,9 +79,7 @@ where
     I: Stream<Item = Result<eventsource_stream::Event, E>>,
 {
     s.try_filter_map(async |eventsource_stream::Event { data, .. }| {
-        let Some(data) = normalize_claude_web_stream_event(&data) else {
-            return Ok(None);
-        };
+        let data = normalize_claude_web_stream_event(&data);
         let Ok(parsed) = serde_json::from_str::<StreamEvent>(&data) else {
             return Ok(None);
         };
