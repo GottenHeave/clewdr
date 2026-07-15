@@ -77,11 +77,9 @@ fn normalize_stream(
                 continue;
             }
             let new_event = source_event_template(&event);
-            let Some(data) = normalize_claude_web_stream_event(&event.data) else {
-                continue;
-            };
+            let data = normalize_claude_web_stream_event(&event.data);
             let Ok(parsed) = serde_json::from_str::<StreamEvent>(&data) else {
-                warn!("Dropping malformed Anthropic stream event after normalization");
+                yield new_event.data(data);
                 continue;
             };
             if let StreamEvent::ContentBlockStart {
@@ -207,7 +205,7 @@ pub async fn check_overloaded(mut resp: Response) -> Response {
 mod tests {
     use axum::{body, response::IntoResponse, response::Sse};
     use eventsource_stream::Event as SourceEvent;
-    use futures::{StreamExt, stream};
+    use futures::stream;
     use serde_json::Value;
 
     use super::{EventResult, normalize_stream};
@@ -223,35 +221,35 @@ mod tests {
     }
 
     #[test]
-    fn drops_web_only_message_limit_events() {
+    fn keeps_web_only_message_limit_events() {
         let data = r#"{"type":"message_limit","message_limit":{"type":"within_limit"}}"#;
 
-        assert!(normalize_claude_web_stream_event(data).is_none());
+        assert_eq!(normalize_claude_web_stream_event(data), data);
     }
 
     #[test]
-    fn drops_web_only_conversation_ready_events() {
+    fn keeps_web_only_conversation_ready_events() {
         let data = r#"{"type":"conversation_ready"}"#;
 
-        assert!(normalize_claude_web_stream_event(data).is_none());
+        assert_eq!(normalize_claude_web_stream_event(data), data);
     }
 
     #[test]
-    fn drops_unknown_web_metadata_events() {
+    fn keeps_unknown_web_metadata_events() {
         let data = r#"{"type":"future_web_metadata","value":true}"#;
 
-        assert!(normalize_claude_web_stream_event(data).is_none());
+        assert_eq!(normalize_claude_web_stream_event(data), data);
     }
 
     #[test]
-    fn drops_non_json_stream_data() {
-        assert!(normalize_claude_web_stream_event("[DONE]").is_none());
+    fn keeps_non_json_stream_data() {
+        assert_eq!(normalize_claude_web_stream_event("[DONE]"), "[DONE]");
     }
 
     #[test]
     fn rewrites_thinking_summary_delta_events() {
         let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_summary_delta","summary":{"summary":"确认端口已改，更新草稿回复。"}}}"#;
-        let normalized = normalize_claude_web_stream_event(data).unwrap();
+        let normalized = normalize_claude_web_stream_event(data);
         let normalized: Value = serde_json::from_str(&normalized).unwrap();
 
         assert_eq!(
@@ -273,7 +271,7 @@ mod tests {
     #[test]
     fn rewrites_flat_thinking_summary_delta_events() {
         let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_summary_delta","summary":"checked the request"}}"#;
-        let normalized = normalize_claude_web_stream_event(data).unwrap();
+        let normalized = normalize_claude_web_stream_event(data);
         let normalized: Value = serde_json::from_str(&normalized).unwrap();
 
         assert_eq!(
@@ -288,7 +286,7 @@ mod tests {
     #[test]
     fn rewrites_web_thinking_block_start_events() {
         let data = r#"{"type":"content_block_start","index":0,"content_block":{"start_timestamp":"2026-06-03T21:21:00.547429Z","stop_timestamp":null,"flags":null,"type":"thinking","thinking":"","summaries":[],"cut_off":false,"truncated":false,"alternative_display_type":null}}"#;
-        let normalized = normalize_claude_web_stream_event(data).unwrap();
+        let normalized = normalize_claude_web_stream_event(data);
         let normalized: Value = serde_json::from_str(&normalized).unwrap();
 
         assert_eq!(
@@ -317,10 +315,7 @@ mod tests {
     fn keeps_regular_content_deltas() {
         let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#;
 
-        assert_eq!(
-            normalize_claude_web_stream_event(data).as_deref(),
-            Some(data)
-        );
+        assert_eq!(normalize_claude_web_stream_event(data), data);
     }
 
     #[test]
@@ -336,22 +331,22 @@ mod tests {
             "error",
         ] {
             let data = format!(r#"{{"type":"{event_type}"}}"#);
-            assert_eq!(
-                normalize_claude_web_stream_event(&data).as_deref(),
-                Some(data.as_str())
-            );
+            assert_eq!(normalize_claude_web_stream_event(&data), data);
         }
     }
 
     #[tokio::test]
-    async fn drops_known_events_that_fail_anthropic_deserialization() {
-        let input: Vec<EventResult<SourceEvent>> = vec![Ok(source_event(
-            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta"}}"#,
-        ))];
-        let output = normalize_stream(Usage::default(), stream::iter(input));
-        futures::pin_mut!(output);
+    async fn keeps_known_events_that_fail_anthropic_deserialization() {
+        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta"}}"#;
+        let input: Vec<EventResult<SourceEvent>> = vec![Ok(source_event(data))];
+        let response =
+            Sse::new(normalize_stream(Usage::default(), stream::iter(input))).into_response();
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
 
-        assert!(output.next().await.is_none());
+        assert!(body.contains(&format!("data: {data}")));
     }
 
     #[tokio::test]
