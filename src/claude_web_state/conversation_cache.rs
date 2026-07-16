@@ -9,9 +9,21 @@ use serde_with::{TimestampSecondsWithFrac, serde_as};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::warn;
 
+use super::explicit_session::{
+    ExplicitConversation, ExplicitSessionState, ExplicitTurn, PendingExplicitTurn,
+};
+use crate::protocol::ProtocolError;
 use crate::utils::write_json_atomically;
 
 const CACHE_FILE_VERSION: u32 = 1;
+
+fn explicit_missing(message: impl Into<String>) -> ProtocolError {
+    ProtocolError::new(
+        http::StatusCode::CONFLICT,
+        "conversation_reuse_failed",
+        message,
+    )
+}
 
 /// Represents one round-trip (ClewdR request → Claude response) in a cached conversation
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,12 +63,24 @@ pub struct CachedConversation {
     /// Shared flag set to true when the SSE stream completes with a stop signal.
     /// Checked on next reuse; if still false, the previous stream was incomplete.
     pub last_stream_healthy: Arc<AtomicBool>,
+    /// Strict client-managed session state. Legacy cache entries leave this unset.
+    pub explicit: Option<ExplicitConversation>,
 }
 
 impl CachedConversation {
     /// Check if this cached conversation has expired (conservative 25-day TTL)
     pub fn is_expired(&self) -> bool {
         Utc::now() - self.created_at > Duration::days(25)
+    }
+
+    fn should_retain(&self) -> bool {
+        match self.explicit.as_ref().map(|explicit| explicit.state) {
+            Some(ExplicitSessionState::Tombstoned) => {
+                Utc::now() - self.last_used <= Duration::days(25)
+            }
+            Some(_) => true,
+            None => self.valid && !self.is_expired(),
+        }
     }
 
     /// Get the last assistant UUID (parent for next turn)
@@ -115,6 +139,8 @@ struct PersistedConversation {
     last_used: DateTime<Utc>,
     valid: bool,
     last_stream_healthy: bool,
+    #[serde(default)]
+    explicit: Option<ExplicitConversation>,
 }
 
 impl From<&CachedConversation> for PersistedConversation {
@@ -131,6 +157,7 @@ impl From<&CachedConversation> for PersistedConversation {
             last_used: conv.last_used,
             valid: conv.valid,
             last_stream_healthy: conv.last_stream_healthy.load(Ordering::Relaxed),
+            explicit: conv.explicit.clone(),
         }
     }
 }
@@ -149,6 +176,7 @@ impl From<PersistedConversation> for CachedConversation {
             last_used: conv.last_used,
             valid: conv.valid,
             last_stream_healthy: Arc::new(AtomicBool::new(conv.last_stream_healthy)),
+            explicit: conv.explicit,
         }
     }
 }
@@ -239,7 +267,7 @@ impl ConversationCache {
 
     async fn get_stored(&self, key: &StoredCacheKey) -> Option<CachedConversation> {
         let map = self.inner.lock().await;
-        map.get(key).filter(|c| c.valid && !c.is_expired()).cloned()
+        map.get(key).filter(|c| c.should_retain()).cloned()
     }
 
     pub async fn lock_operation(&self, key: &CacheKey) -> OwnedMutexGuard<()> {
@@ -252,8 +280,28 @@ impl ConversationCache {
             .await
     }
 
+    pub async fn try_lock_explicit_operation(
+        &self,
+        key: &ExplicitSessionKey,
+    ) -> Result<OwnedMutexGuard<()>, ProtocolError> {
+        let lock = self
+            .stored_operation_lock(StoredCacheKey::ExplicitSession(key.clone()))
+            .await;
+        lock.try_lock_owned().map_err(|_| {
+            ProtocolError::new(
+                http::StatusCode::CONFLICT,
+                "session_busy",
+                "Another operation is already using this session",
+            )
+        })
+    }
+
     async fn lock_stored_operation(&self, key: StoredCacheKey) -> OwnedMutexGuard<()> {
-        let lock = {
+        self.stored_operation_lock(key).await.lock_owned().await
+    }
+
+    async fn stored_operation_lock(&self, key: StoredCacheKey) -> Arc<Mutex<()>> {
+        {
             let mut locks = self.operation_locks.lock().await;
             locks.retain(|_, lock| lock.strong_count() > 0);
             if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
@@ -263,8 +311,7 @@ impl ConversationCache {
                 locks.insert(key, Arc::downgrade(&lock));
                 lock
             }
-        };
-        lock.lock_owned().await
+        }
     }
 
     pub async fn set(&self, key: CacheKey, conv: CachedConversation) {
@@ -282,6 +329,117 @@ impl ConversationCache {
             map.insert(key, conv);
         }
         self.persist().await;
+    }
+
+    pub async fn stage_explicit_turn(
+        &self,
+        key: &ExplicitSessionKey,
+        pending: PendingExplicitTurn,
+    ) -> Result<(), ProtocolError> {
+        let updated = {
+            let mut map = self.inner.lock().await;
+            let conversation = map
+                .get_mut(&StoredCacheKey::ExplicitSession(key.clone()))
+                .ok_or_else(|| explicit_missing("Session disappeared before completion"))?;
+            let explicit = conversation
+                .explicit
+                .as_mut()
+                .ok_or_else(|| explicit_missing("Session metadata is unavailable"))?;
+            explicit.state = ExplicitSessionState::InFlight;
+            explicit.pending = Some(pending);
+            conversation.last_used = Utc::now();
+            true
+        };
+        if updated {
+            self.persist().await;
+        }
+        Ok(())
+    }
+
+    pub async fn commit_explicit_turn(
+        &self,
+        key: &ExplicitSessionKey,
+        assistant_digest_after: Option<String>,
+    ) -> Result<(), ProtocolError> {
+        {
+            let mut map = self.inner.lock().await;
+            let conversation = map
+                .get_mut(&StoredCacheKey::ExplicitSession(key.clone()))
+                .ok_or_else(|| explicit_missing("Session disappeared before commit"))?;
+            let explicit = conversation
+                .explicit
+                .as_mut()
+                .ok_or_else(|| explicit_missing("Session metadata is unavailable"))?;
+            let pending = explicit
+                .pending
+                .take()
+                .ok_or_else(|| explicit_missing("Session has no pending turn"))?;
+            conversation.turns.truncate(pending.replace_from_turn);
+            conversation.turns.push(CachedTurn {
+                user_hashes: Vec::new(),
+                assistant_uuid: pending.assistant_uuid_after.clone(),
+            });
+            explicit.turns.truncate(pending.replace_from_turn);
+            explicit.turns.push(ExplicitTurn {
+                parent_uuid_before: pending.parent_uuid_before,
+                user_digests: pending.user_digests,
+                assistant_uuid_after: pending.assistant_uuid_after,
+                parent_timeline: pending.parent_timeline,
+                request_timeline: pending.request_timeline,
+                assistant_digest_after,
+            });
+            explicit.state = ExplicitSessionState::Committed;
+            conversation.last_used = Utc::now();
+        }
+        self.persist().await;
+        Ok(())
+    }
+
+    pub async fn mark_explicit_uncertain(&self, key: &ExplicitSessionKey) {
+        let updated = {
+            let mut map = self.inner.lock().await;
+            map.get_mut(&StoredCacheKey::ExplicitSession(key.clone()))
+                .and_then(|conversation| conversation.explicit.as_mut())
+                .map(|explicit| {
+                    explicit.state = ExplicitSessionState::Uncertain;
+                })
+                .is_some()
+        };
+        if updated {
+            self.persist().await;
+        }
+    }
+
+    pub async fn tombstone_explicit(&self, key: &ExplicitSessionKey) {
+        let updated = {
+            let mut map = self.inner.lock().await;
+            if let Some(conversation) = map.get_mut(&StoredCacheKey::ExplicitSession(key.clone()))
+                && let Some(explicit) = conversation.explicit.as_mut()
+            {
+                explicit.state = ExplicitSessionState::Tombstoned;
+                explicit.pending = None;
+                conversation.last_used = Utc::now();
+                true
+            } else {
+                false
+            }
+        };
+        if updated {
+            self.persist().await;
+        }
+    }
+
+    pub async fn reset_explicit(&self, key: &ExplicitSessionKey) -> bool {
+        let removed = self
+            .inner
+            .lock()
+            .await
+            .remove(&StoredCacheKey::ExplicitSession(key.clone()))
+            .is_some();
+        if removed {
+            self.persist().await;
+        }
+        removed
     }
 
     /// Append a new turn to an existing cached conversation
@@ -384,7 +542,7 @@ impl ConversationCache {
         let removed = {
             let mut map = self.inner.lock().await;
             let old_len = map.len();
-            map.retain(|_, v| v.valid && !v.is_expired());
+            map.retain(|_, conversation| conversation.should_retain());
             map.len() != old_len
         };
         if removed {
@@ -479,7 +637,7 @@ impl ConversationCache {
         let mut map = HashMap::new();
         for entry in persisted.conversations {
             let conversation = CachedConversation::from(entry.conversation);
-            if conversation.valid && !conversation.is_expired() {
+            if conversation.should_retain() {
                 map.insert(entry.key, conversation);
             }
         }

@@ -203,6 +203,7 @@ mod tests {
             last_used: Utc::now(),
             valid: true,
             last_stream_healthy: Arc::new(AtomicBool::new(true)),
+            explicit: None,
         }
     }
 

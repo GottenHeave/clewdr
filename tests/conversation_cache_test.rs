@@ -26,6 +26,7 @@ fn make_cached(conv_uuid: &str, turns: Vec<CachedTurn>, system_hash: u64) -> Cac
         last_used: chrono::Utc::now(),
         valid: true,
         last_stream_healthy: Arc::new(AtomicBool::new(true)),
+        explicit: None,
     }
 }
 
@@ -409,6 +410,7 @@ async fn test_stream_health_flag() {
         last_used: chrono::Utc::now(),
         valid: true,
         last_stream_healthy: flag.clone(),
+        explicit: None,
     };
     cache.set(key.clone(), conv).await;
 
@@ -448,6 +450,7 @@ async fn test_stream_health_update_on_append() {
         last_used: chrono::Utc::now(),
         valid: true,
         last_stream_healthy: flag,
+        explicit: None,
     };
     cache.set(key.clone(), conv).await;
 

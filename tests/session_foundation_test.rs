@@ -21,6 +21,7 @@ fn cached_conversation(id: &str) -> CachedConversation {
         last_used: chrono::Utc::now(),
         valid: true,
         last_stream_healthy: Arc::new(AtomicBool::new(true)),
+        explicit: None,
     }
 }
 

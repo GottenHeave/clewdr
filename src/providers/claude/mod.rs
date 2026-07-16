@@ -11,6 +11,7 @@ use crate::{
     claude_web_state::conversation_cache::ConversationCache,
     error::ClewdrError,
     middleware::claude::{ClaudeApiFormat, ClaudeContext},
+    protocol::AuthPrincipal,
     services::cookie_actor::CookieActorHandle,
     types::claude::CreateMessageParams,
     utils::{enabled, print_out_json},
@@ -27,6 +28,7 @@ pub struct ClaudeInvocation {
     pub params: CreateMessageParams,
     pub context: ClaudeContext,
     pub operation: ClaudeOperation,
+    pub principal: Option<AuthPrincipal>,
 }
 
 impl ClaudeInvocation {
@@ -35,6 +37,7 @@ impl ClaudeInvocation {
             params,
             context,
             operation: ClaudeOperation::Messages,
+            principal: None,
         }
     }
 
@@ -43,6 +46,20 @@ impl ClaudeInvocation {
             params,
             context,
             operation: ClaudeOperation::CountTokens,
+            principal: None,
+        }
+    }
+
+    pub fn authenticated_messages(
+        params: CreateMessageParams,
+        context: ClaudeContext,
+        principal: AuthPrincipal,
+    ) -> Self {
+        Self {
+            params,
+            context,
+            operation: ClaudeOperation::Messages,
+            principal: Some(principal),
         }
     }
 }
@@ -118,7 +135,9 @@ impl LLMProvider for ClaudeWebProvider {
             params,
             context,
             operation,
+            principal,
         } = request;
+        state.principal = principal;
         if !matches!(operation, ClaudeOperation::Messages) {
             return Err(ClewdrError::BadRequest {
                 msg: "Unsupported operation for Claude Web",
@@ -175,6 +194,7 @@ impl LLMProvider for ClaudeCodeProvider {
             params,
             context,
             operation,
+            principal: _,
         } = request;
         match operation {
             ClaudeOperation::Messages => {
