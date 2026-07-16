@@ -11,11 +11,14 @@ use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 use crate::{
     api::*,
     claude_web_state::conversation_cache::ConversationCache,
-    config::{CLEWDR_CONFIG, CONVERSATION_CACHE_PATH},
+    config::{
+        CLEWDR_CONFIG, CONVERSATION_CACHE_PATH, PROTOCOL_SESSION_CACHE_PATH, STAGED_FILES_PATH,
+    },
     middleware::{
         RequireAdminAuth, RequireBearerAuth, RequireFlexibleAuth,
         claude::{add_usage_info, apply_stop_sequences, check_overloaded, to_oai},
     },
+    protocol::{files::StagedFileStore, sessions::ProtocolSessionStore},
     providers::claude::ClaudeProviders,
     services::cookie_actor::CookieActorHandle,
 };
@@ -25,6 +28,7 @@ pub struct RouterBuilder {
     claude_providers: ClaudeProviders,
     cookie_actor_handle: CookieActorHandle,
     inner: Router,
+    protocol_api_state: ProtocolApiState,
 }
 
 impl RouterBuilder {
@@ -55,12 +59,43 @@ impl RouterBuilder {
             }
         });
 
-        let claude_providers =
-            crate::providers::claude::build_providers(cookie_handle.clone(), conv_cache);
+        let (files, sessions) = if CLEWDR_CONFIG.load().no_fs {
+            (None, ProtocolSessionStore::memory())
+        } else {
+            (
+                Some(
+                    StagedFileStore::persistent(STAGED_FILES_PATH.as_path())
+                        .await
+                        .expect("Failed to initialize staged file storage"),
+                ),
+                ProtocolSessionStore::persistent(PROTOCOL_SESSION_CACHE_PATH.as_path())
+                    .await
+                    .expect("Failed to initialize protocol session storage"),
+            )
+        };
+        let claude_providers = crate::providers::claude::build_providers(
+            cookie_handle.clone(),
+            conv_cache,
+            files.clone(),
+            sessions.clone(),
+        );
+        let cleanup_files = files.clone();
+        let cleanup_sessions = sessions.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                if let Some(files) = &cleanup_files {
+                    let _ = files.cleanup().await;
+                }
+                let _ = cleanup_sessions.cleanup_tombstones().await;
+            }
+        });
         RouterBuilder {
             claude_providers,
             cookie_actor_handle: cookie_handle,
             inner: Router::new(),
+            protocol_api_state: ProtocolApiState { files, sessions },
         }
     }
 
@@ -69,12 +104,27 @@ impl RouterBuilder {
     pub fn with_default_setup(self) -> Self {
         self.route_claude_code_endpoints()
             .route_claude_web_endpoints()
+            .route_protocol_endpoints()
             .route_admin_endpoints()
             .route_claude_web_oai_endpoints()
             .route_claude_code_oai_endpoints()
             .setup_static_serving()
             .with_tower_trace()
             .with_cors()
+    }
+
+    fn route_protocol_endpoints(mut self) -> Self {
+        let upload = Router::new()
+            .route("/v1/files", post(api_stage_file))
+            .layer(DefaultBodyLimit::max(
+                crate::protocol::files::DEFAULT_MAX_FILE_BYTES as usize + 1024 * 1024,
+            ));
+        let router = upload
+            .route("/v1/sessions/reset", post(api_reset_session))
+            .layer(from_extractor::<RequireFlexibleAuth>())
+            .with_state(self.protocol_api_state.clone());
+        self.inner = self.inner.merge(router);
+        self
     }
 
     /// Sets up routes for v1 endpoints

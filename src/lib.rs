@@ -11,6 +11,7 @@ pub mod claude_web_state;
 pub mod config;
 pub mod error;
 pub mod middleware;
+pub mod protocol;
 pub mod providers;
 pub mod router;
 pub mod services;

@@ -4,10 +4,12 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use futures::{StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use serde_json::Value;
+use snafu::GenerateImplicitData;
 use tracing::{debug, warn};
 use url::Url;
 use wreq::multipart::{Form, Part};
 
+use crate::protocol::sessions::SessionOperation;
 use crate::{
     claude_web_state::ClaudeWebState,
     config::CLEWDR_CONFIG,
@@ -134,6 +136,94 @@ impl ClaudeWebState {
             .buffered(5)
             .try_collect()
             .await
+    }
+
+    pub async fn upload_protocol_files(
+        &self,
+        files: Vec<ImageSource>,
+        org_uuid: &str,
+        conversation_uuid: &str,
+        operation: &SessionOperation,
+    ) -> Result<Vec<String>, crate::error::ClewdrError> {
+        let staged_store = self.staged_files.as_ref().ok_or_else(|| {
+            crate::protocol::ProtocolError::new(
+                http::StatusCode::NOT_IMPLEMENTED,
+                "staged_files_unavailable",
+                "Staged file references require filesystem persistence",
+            )
+        })?;
+        let session_store = self
+            .protocol_sessions
+            .as_ref()
+            .expect("protocol session store is configured");
+        let principal = self.principal.as_ref().expect("authenticated principal");
+        let endpoint = conversation_upload_endpoint(&self.endpoint, org_uuid, conversation_uuid)
+            .map_err(|source| crate::error::ClewdrError::Whatever {
+                message: "Failed to build conversation upload URL".to_string(),
+                source: Some(Box::new(source)),
+            })?;
+        let mut uploaded = Vec::with_capacity(files.len());
+        for file in files {
+            let ImageSource::File { file_id } = file else {
+                uploaded.extend(
+                    self.upload_files(vec![file], org_uuid, conversation_uuid)
+                        .await?,
+                );
+                continue;
+            };
+            if !file_id.starts_with("file_clewdr_v1_") {
+                uploaded.push(file_id);
+                continue;
+            }
+            if let Some(existing) = session_store.file_mapping(operation, &file_id).await {
+                uploaded.push(existing);
+                continue;
+            }
+            let staged = staged_store.resolve(principal, &file_id).await?;
+            let part = Part::file(&staged.path)
+                .await
+                .map_err(|source| crate::error::ClewdrError::IoError {
+                    loc: snafu::Location::generate(),
+                    source,
+                })?
+                .file_name(staged.filename.clone())
+                .mime_str(&staged.mime_type)
+                .map_err(|error| crate::error::ClewdrError::Whatever {
+                    message: "Invalid staged file media type".to_string(),
+                    source: Some(Box::new(error)),
+                })?;
+            let response = self
+                .build_request(http::Method::POST, endpoint.clone())
+                .multipart(Form::new().part("file", part))
+                .send()
+                .await
+                .map_err(|source| crate::error::ClewdrError::WreqError {
+                    msg: "Failed to upload staged file",
+                    source,
+                })?
+                .check_claude()
+                .await?;
+            #[derive(serde::Deserialize)]
+            struct UploadResponse {
+                file_uuid: String,
+            }
+            let response = response.json::<UploadResponse>().await.map_err(|source| {
+                crate::error::ClewdrError::WreqError {
+                    msg: "Failed to parse staged file upload response",
+                    source,
+                }
+            })?;
+            if let Some(session) = session_store.get(operation).await {
+                staged_store
+                    .add_reference(&file_id, &session.session_ref())
+                    .await?;
+            }
+            session_store
+                .put_file_mapping(operation, &file_id, &response.file_uuid)
+                .await?;
+            uploaded.push(response.file_uuid);
+        }
+        Ok(uploaded)
     }
 }
 
@@ -406,11 +496,44 @@ pub(super) fn extract_base64_file(source: &Value) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{Json, Router, extract::Multipart, routing::post};
+    use bytes::Bytes;
+    use futures::stream;
     use serde_json::json;
     use url::Url;
 
     use super::*;
-    use crate::types::claude::{ContentBlock, CreateMessageParams, Message, MessageContent, Role};
+    use crate::{
+        claude_web_state::conversation_cache::ConversationCache,
+        protocol::{
+            AuthPrincipal,
+            files::StagedFileStore,
+            sessions::{PendingTurn, ProtocolSessionStore},
+        },
+        services::cookie_actor::CookieActorHandle,
+        types::claude::{ContentBlock, CreateMessageParams, Message, MessageContent, Role},
+    };
+
+    async fn mock_upload(
+        axum::extract::State(count): axum::extract::State<Arc<AtomicUsize>>,
+        mut multipart: Multipart,
+    ) -> Json<serde_json::Value> {
+        let field = multipart.next_field().await.unwrap().unwrap();
+        assert_eq!(field.name(), Some("file"));
+        assert_eq!(field.file_name(), Some("report.txt"));
+        assert_eq!(field.content_type(), Some("text/plain"));
+        assert_eq!(
+            field.bytes().await.unwrap(),
+            Bytes::from_static(b"contents")
+        );
+        let index = count.fetch_add(1, Ordering::SeqCst) + 1;
+        Json(json!({ "file_uuid": format!("claude-file-{index}") }))
+    }
 
     #[tokio::test]
     async fn merge_messages_preserves_text_document_title_as_attachment_file_name() {
@@ -500,6 +623,136 @@ mod tests {
             "https://claude.ai/api/organizations/organization-id/conversations/\
 conversation-id/wiggle/upload-file"
         );
+    }
+
+    #[tokio::test]
+    async fn staged_file_mapping_is_reused_within_one_session_and_isolated_across_sessions() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/organizations/{org}/conversations/{conversation}/wiggle/upload-file",
+                post(mock_upload),
+            )
+            .with_state(count.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let files = StagedFileStore::persistent(temp.path().join("files"))
+            .await
+            .unwrap();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let staged = files
+            .stage_stream(
+                &principal,
+                "report.txt",
+                "text/plain",
+                stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"contents"))]),
+            )
+            .await
+            .unwrap();
+        let sessions = ProtocolSessionStore::memory();
+        let session_digest = "ab".repeat(32);
+        let operation = sessions
+            .try_begin(&principal, &session_digest)
+            .await
+            .unwrap();
+        sessions
+            .create_provisional(
+                &operation,
+                &principal,
+                &session_digest,
+                "cookie".into(),
+                "org".into(),
+                "conversation".into(),
+                "model".into(),
+                "system".into(),
+                PendingTurn {
+                    parent_uuid_before: None,
+                    user_digests: vec!["user".into()],
+                    assistant_uuid_after: "assistant".into(),
+                    replace_from_turn: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let handle = CookieActorHandle::start().await.unwrap();
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
+        state.endpoint = Url::parse(&format!("http://{address}/")).unwrap();
+        state.principal = Some(principal);
+        state.staged_files = Some(files);
+        state.protocol_sessions = Some(sessions);
+        let first = state
+            .upload_protocol_files(
+                vec![ImageSource::File {
+                    file_id: staged.id.clone(),
+                }],
+                "org",
+                "conversation",
+                &operation,
+            )
+            .await
+            .unwrap();
+        let second = state
+            .upload_protocol_files(
+                vec![ImageSource::File {
+                    file_id: staged.id.clone(),
+                }],
+                "org",
+                "conversation",
+                &operation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, vec!["claude-file-1"]);
+        assert_eq!(second, first);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        let second_session_digest = "cd".repeat(32);
+        let second_operation = state
+            .protocol_sessions
+            .as_ref()
+            .unwrap()
+            .try_begin(state.principal.as_ref().unwrap(), &second_session_digest)
+            .await
+            .unwrap();
+        state
+            .protocol_sessions
+            .as_ref()
+            .unwrap()
+            .create_provisional(
+                &second_operation,
+                state.principal.as_ref().unwrap(),
+                &second_session_digest,
+                "cookie".into(),
+                "org".into(),
+                "other-conversation".into(),
+                "model".into(),
+                "system".into(),
+                PendingTurn {
+                    parent_uuid_before: None,
+                    user_digests: vec!["user".into()],
+                    assistant_uuid_after: "assistant".into(),
+                    replace_from_turn: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let third = state
+            .upload_protocol_files(
+                vec![ImageSource::File { file_id: staged.id }],
+                "org",
+                "other-conversation",
+                &second_operation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(third, vec!["claude-file-2"]);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 }
 

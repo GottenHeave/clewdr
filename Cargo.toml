@@ -15,7 +15,7 @@ path = "src/lib.rs"
 arc-swap = "1"
 async-stream = "0.3"
 async-trait = "0.1"
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "multipart"] }
 axum-auth = "0.8"
 base64 = "0.22"
 bytes = "1"
@@ -30,6 +30,7 @@ eventsource-stream = "0.2"
 figment = { version = "0.10", features = ["env", "toml"] }
 futures = "0.3"
 hex = "0.4"
+hmac = "0.13"
 http = "1"
 include_dir = { version = "0.7", optional = true }
 itertools = "0.14"
@@ -39,6 +40,7 @@ oauth2 = { version = "5", default-features = false }
 passwords = "3"
 ractor = "0.15"
 regex = "1"
+rand = "0.9"
 self-replace = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -50,7 +52,7 @@ strum = { version = "0.28", features = ["derive"] }
 tempfile = { version = "3", optional = true }
 thiserror = "2"
 tiktoken-rs = "0.9"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal"] }
 toml = "1"
 tower = "0.5"
 tower-http = { version = "0.6", features = [

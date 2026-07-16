@@ -15,6 +15,7 @@ use crate::{
     claude_code_state::ClaudeCodeState,
     claude_web_state::ClaudeWebState,
     error::{CheckClaudeErr, ClewdrError},
+    protocol::sessions::StreamSessionGuard,
     types::claude::{
         ContentBlock, CountMessageTokensResponse, CreateMessageParams, CreateMessageResponse,
         Message, Role,
@@ -32,19 +33,30 @@ use crate::{
 /// Combined completion text from all events
 pub async fn merge_sse(
     stream: EventStream<impl Stream<Item = Result<Bytes, wreq::Error>>>,
-) -> Result<String, ClewdrError> {
+) -> Result<(String, bool), ClewdrError> {
     #[derive(Deserialize)]
     struct Data {
         completion: String,
     }
-    Ok(stream
-        .try_filter_map(async |event| {
-            Ok(serde_json::from_str::<Data>(&event.data)
-                .map(|data| data.completion)
-                .ok())
-        })
-        .try_collect()
-        .await?)
+    let events = stream.try_collect::<Vec<_>>().await?;
+    let saw_message_stop = events.iter().any(|event| {
+        event.event == "message_stop"
+            || serde_json::from_str::<serde_json::Value>(&event.data)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .is_some_and(|event_type| event_type == "message_stop")
+    });
+    let text = events
+        .iter()
+        .filter_map(|event| serde_json::from_str::<Data>(&event.data).ok())
+        .map(|data| data.completion)
+        .collect();
+    Ok((text, saw_message_stop))
 }
 
 impl<S> From<S> for Message
@@ -81,6 +93,7 @@ impl ClaudeWebState {
     ) -> Result<axum::response::Response, ClewdrError> {
         // Take the stream health flag so it can be moved into the stream wrapper
         let stream_health_flag = self.stream_health_flag.take();
+        let protocol_lifecycle = self.protocol_lifecycle.take();
 
         if self.stream {
             // Stream through while accumulating completion text; persist usage at end
@@ -105,17 +118,38 @@ impl ClaudeWebState {
                 .eventsource()
                 .map_err(axum::Error::new);
             let stream = try_stream! {
+                let mut protocol_guard = protocol_lifecycle.map(StreamSessionGuard::new);
+                let mut saw_message_stop = false;
                 let mut acc = String::new();
                 #[derive(serde::Deserialize)]
                 struct Data { completion: String }
                 futures::pin_mut!(stream);
                 while let Some(event) = stream.try_next().await? {
+                    let is_message_stop = event.event == "message_stop" || serde_json::from_str::<serde_json::Value>(&event.data)
+                        .ok()
+                        .and_then(|value| value.get("type").and_then(serde_json::Value::as_str).map(str::to_owned))
+                        .is_some_and(|event_type| event_type == "message_stop");
+                    if is_message_stop {
+                        saw_message_stop = true;
+                        if let Some(guard) = protocol_guard.as_mut() {
+                            guard.commit().await.map_err(axum::Error::new)?;
+                        }
+                    }
                     if let Ok(d) = serde_json::from_str::<Data>(&event.data) {
                         acc.push_str(&d.completion);
                     }
                     let e = SseEvent::default().event(event.event).id(event.id);
                     let e = if let Some(retry) = event.retry { e.retry(retry) } else { e };
                     yield e.data(event.data);
+                }
+                if let Some(guard) = protocol_guard.as_mut() {
+                    if !saw_message_stop {
+                        guard.uncertain().await;
+                        Err(axum::Error::new(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "Claude Web stream ended without message_stop",
+                        )))?;
+                    }
                 }
                 // Stream completed successfully — mark as healthy
                 if let Some(flag) = stream_health_flag.as_ref() {
@@ -186,7 +220,28 @@ impl ClaudeWebState {
 
         let stream = wreq_res.bytes_stream();
         let stream = stream.eventsource();
-        let text = merge_sse(stream).await?;
+        let (text, saw_message_stop) = match merge_sse(stream).await {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(lifecycle) = protocol_lifecycle {
+                    lifecycle.uncertain().await;
+                }
+                return Err(error);
+            }
+        };
+        if let Some(lifecycle) = protocol_lifecycle {
+            if saw_message_stop {
+                lifecycle.commit().await?;
+            } else {
+                lifecycle.uncertain().await;
+                return Err(crate::protocol::ProtocolError::new(
+                    http::StatusCode::BAD_GATEWAY,
+                    "conversation_state_uncertain",
+                    "Claude Web response ended without message_stop",
+                )
+                .into());
+            }
+        }
 
         // Non-streaming: full response received successfully — mark as healthy
         if let Some(flag) = stream_health_flag.as_ref() {
@@ -309,4 +364,156 @@ async fn count_code_output_tokens_for_text(
     };
     // do not set count_tokens_allowed flag here to avoid races; handled by try_code_count_tokens
     bearer_count_tokens(&code, &access, &body).await
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use axum::{
+        Router, body, body::Body, http::header::CONTENT_TYPE, response::Response, routing::get,
+    };
+
+    use crate::{
+        claude_web_state::{ClaudeWebState, conversation_cache::ConversationCache},
+        protocol::{
+            AuthPrincipal,
+            sessions::{PendingTurn, ProtocolSessionStore, SessionLifecycle},
+        },
+        services::cookie_actor::CookieActorHandle,
+    };
+
+    async fn healthy_stream() -> Response {
+        Response::builder()
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(
+                "data: {\"type\":\"message_start\"}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+            ))
+            .unwrap()
+    }
+
+    async fn incomplete_stream() -> Response {
+        Response::builder()
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from("data: {\"type\":\"message_start\"}\n\n"))
+            .unwrap()
+    }
+
+    async fn setup_lifecycle(
+        session_digest: &str,
+    ) -> (
+        AuthPrincipal,
+        std::sync::Arc<ProtocolSessionStore>,
+        SessionLifecycle,
+    ) {
+        let principal = AuthPrincipal::for_authenticated_user();
+        let store = ProtocolSessionStore::memory();
+        let operation = store.try_begin(&principal, session_digest).await.unwrap();
+        store
+            .create_provisional(
+                &operation,
+                &principal,
+                session_digest,
+                "cookie".into(),
+                "org".into(),
+                "conversation".into(),
+                "model".into(),
+                "system".into(),
+                PendingTurn {
+                    parent_uuid_before: None,
+                    user_digests: vec!["user".into()],
+                    assistant_uuid_after: "assistant".into(),
+                    replace_from_turn: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let lifecycle = SessionLifecycle::new(store.clone(), operation);
+        (principal, store, lifecycle)
+    }
+
+    async fn upstream_response(path: &'static str) -> wreq::Response {
+        let app = Router::new()
+            .route("/healthy", get(healthy_stream))
+            .route("/incomplete", get(incomplete_stream));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        wreq::Client::new()
+            .get(format!("http://{address}/{path}"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn message_stop_commits_protocol_turn_after_body_consumption() {
+        let session_digest = "ab".repeat(32);
+        let (principal, store, lifecycle) = setup_lifecycle(&session_digest).await;
+        let handle = CookieActorHandle::start().await.unwrap();
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
+        state.stream = true;
+        state.protocol_lifecycle = Some(lifecycle);
+        let response = state
+            .transform_response(upstream_response("healthy").await)
+            .await
+            .unwrap();
+        body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let operation = store.try_begin(&principal, &session_digest).await.unwrap();
+        let session = store.get(&operation).await.unwrap();
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].assistant_uuid_after, "assistant");
+    }
+
+    #[tokio::test]
+    async fn eof_without_message_stop_marks_protocol_session_uncertain() {
+        let session_digest = "cd".repeat(32);
+        let (principal, store, lifecycle) = setup_lifecycle(&session_digest).await;
+        let handle = CookieActorHandle::start().await.unwrap();
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
+        state.stream = true;
+        state.protocol_lifecycle = Some(lifecycle);
+        let response = state
+            .transform_response(upstream_response("incomplete").await)
+            .await
+            .unwrap();
+        assert!(
+            body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .is_err()
+        );
+
+        let operation = store.try_begin(&principal, &session_digest).await.unwrap();
+        let error = store
+            .plan(&operation, &["user".into()], "model", "system")
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "conversation_state_uncertain");
+    }
+
+    #[tokio::test]
+    async fn unpolled_downstream_body_marks_protocol_session_uncertain() {
+        let session_digest = "de".repeat(32);
+        let (principal, store, lifecycle) = setup_lifecycle(&session_digest).await;
+        let handle = CookieActorHandle::start().await.unwrap();
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
+        state.stream = true;
+        state.protocol_lifecycle = Some(lifecycle);
+        let response = state
+            .transform_response(upstream_response("healthy").await)
+            .await
+            .unwrap();
+        drop(response);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let operation = store.try_begin(&principal, &session_digest).await.unwrap();
+        let error = store
+            .plan(&operation, &["user".into()], "model", "system")
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "conversation_state_uncertain");
+    }
 }

@@ -5,6 +5,7 @@ use colored::Colorize;
 use moka::sync::Cache;
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use snafu::{GenerateImplicitData, Location};
 use tracing::{error, info, warn};
 
@@ -34,7 +35,11 @@ enum CookieActorMessage {
     /// Check for timed out Cookies
     CheckReset,
     /// Request to get a Cookie
-    Request(Option<u64>, RpcReplyPort<Result<CookieStatus, ClewdrError>>),
+    Request(
+        Option<String>,
+        Option<String>,
+        RpcReplyPort<Result<CookieStatus, ClewdrError>>,
+    ),
     /// Get all Cookie status information
     GetStatus(RpcReplyPort<CookieStatusInfo>),
     /// Delete a Cookie
@@ -47,7 +52,7 @@ struct CookieActorState {
     valid: VecDeque<CookieStatus>,
     exhausted: HashSet<CookieStatus>,
     invalid: HashSet<UselessCookie>,
-    moka: Cache<u64, CookieStatus>,
+    moka: Cache<String, CookieStatus>,
 }
 
 /// Cookie actor that handles cookie distribution, collection, and status tracking using Ractor
@@ -176,15 +181,30 @@ impl CookieActor {
     fn dispatch(
         &self,
         state: &mut CookieActorState,
-        hash: Option<u64>,
+        hash: Option<String>,
+        required_cookie_id: Option<String>,
     ) -> Result<CookieStatus, ClewdrError> {
         Self::reset(state);
-        if let Some(hash) = hash
-            && let Some(cookie) = state.moka.get(&hash)
+        if let Some(required_cookie_id) = required_cookie_id {
+            let cookie = state
+                .valid
+                .iter()
+                .find(|cookie| {
+                    hex::encode(Sha256::digest(cookie.cookie.to_string())) == required_cookie_id
+                })
+                .cloned()
+                .ok_or(ClewdrError::NoCookieAvailable)?;
+            if let Some(hash) = hash {
+                state.moka.insert(hash, cookie.clone());
+            }
+            return Ok(cookie);
+        }
+        if let Some(ref hash) = hash
+            && let Some(cookie) = state.moka.get(hash)
             && let Some(cookie) = state.valid.iter().find(|&c| c == &cookie)
         {
             // renew moka cache
-            state.moka.insert(hash, cookie.clone());
+            state.moka.insert(hash.clone(), cookie.clone());
             return Ok(cookie.clone());
         }
         let cookie = state
@@ -369,8 +389,8 @@ impl Actor for CookieActor {
                 }
                 Self::reset(state);
             }
-            CookieActorMessage::Request(cache_hash, reply_port) => {
-                let result = self.dispatch(state, cache_hash);
+            CookieActorMessage::Request(cache_hash, required_cookie_id, reply_port) => {
+                let result = self.dispatch(state, cache_hash, required_cookie_id);
                 reply_port.send(result)?;
             }
             CookieActorMessage::GetStatus(reply_port) => {
@@ -435,11 +455,36 @@ impl CookieActorHandle {
 
     /// Request a cookie from the cookie actor
     pub async fn request(&self, cache_hash: Option<u64>) -> Result<CookieStatus, ClewdrError> {
-        ractor::call!(self.actor_ref, CookieActorMessage::Request, cache_hash).map_err(|e| {
-            ClewdrError::RactorError {
-                loc: Location::generate(),
-                msg: format!("Failed to communicate with CookieActor for request operation: {e}"),
-            }
+        let cache_key = cache_hash.map(|hash| format!("legacy:{hash:016x}"));
+        self.request_sticky(cache_key, None).await
+    }
+
+    pub async fn request_session(
+        &self,
+        session_digest: &str,
+        required_cookie_id: Option<&str>,
+    ) -> Result<CookieStatus, ClewdrError> {
+        self.request_sticky(
+            Some(format!("session:v1:{session_digest}")),
+            required_cookie_id.map(str::to_owned),
+        )
+        .await
+    }
+
+    async fn request_sticky(
+        &self,
+        cache_key: Option<String>,
+        required_cookie_id: Option<String>,
+    ) -> Result<CookieStatus, ClewdrError> {
+        ractor::call!(
+            self.actor_ref,
+            CookieActorMessage::Request,
+            cache_key,
+            required_cookie_id
+        )
+        .map_err(|e| ClewdrError::RactorError {
+            loc: Location::generate(),
+            msg: format!("Failed to communicate with CookieActor for request operation: {e}"),
         })?
     }
 
