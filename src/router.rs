@@ -79,9 +79,9 @@ impl RouterBuilder {
             .expect("Failed to clean protocol session tombstones");
         if let Some(files) = &files {
             files
-                .reconcile_references(&sessions.staged_file_references().await)
+                .remove_orphaned_references(&sessions.existing_session_refs().await)
                 .await
-                .expect("Failed to reconcile staged file references");
+                .expect("Failed to remove orphaned staged file references");
             files.cleanup().await.expect("Failed to clean staged files");
         }
         let claude_providers = crate::providers::claude::build_providers(
@@ -98,8 +98,8 @@ impl RouterBuilder {
                 interval.tick().await;
                 let _ = cleanup_sessions.cleanup_tombstones().await;
                 if let Some(files) = &cleanup_files {
-                    let references = cleanup_sessions.staged_file_references().await;
-                    let _ = files.reconcile_references(&references).await;
+                    let session_refs = cleanup_sessions.existing_session_refs().await;
+                    let _ = files.remove_orphaned_references(&session_refs).await;
                     let _ = files.cleanup().await;
                 }
             }

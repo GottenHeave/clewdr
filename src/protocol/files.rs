@@ -435,13 +435,14 @@ impl StagedFileStore {
         self.persist_locked(&index).await
     }
 
-    pub async fn reconcile_references(
+    pub async fn remove_orphaned_references(
         &self,
-        references: &HashMap<String, BTreeSet<String>>,
+        existing_session_refs: &BTreeSet<String>,
     ) -> Result<(), ProtocolError> {
         let mut index = self.index.lock().await;
-        for (id, file) in &mut index.files {
-            file.references = references.get(id).cloned().unwrap_or_default();
+        for file in index.files.values_mut() {
+            file.references
+                .retain(|session_ref| existing_session_refs.contains(session_ref));
         }
         self.persist_locked(&index).await
     }

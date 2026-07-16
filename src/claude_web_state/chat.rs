@@ -22,8 +22,8 @@ use crate::{
     protocol::{
         ProtocolError, parse_session_id,
         sessions::{
-            PendingTurn, ReusePlan, SessionLifecycle, digest_assistant_messages, digest_model,
-            digest_system, digest_user_messages,
+            PendingTurn, ReusePlan, SessionLifecycle, digest_message_timeline, digest_model,
+            digest_system, digest_user_messages, selected_parent_message_timeline,
         },
     },
     types::claude::{ContentBlock, CreateMessageParams, ImageSource, Message, MessageContent},
@@ -194,19 +194,29 @@ impl ClaudeWebState {
             .iter()
             .map(|(_, digest)| digest.clone())
             .collect::<Vec<_>>();
-        let assistant_digests = digest_assistant_messages(&p.messages);
+        let message_timeline = digest_message_timeline(&p.messages);
         let model_digest = digest_model(&p.model);
         let system_digest = digest_system(&p.system);
         let plan = sessions
             .plan(
                 &operation,
                 &user_digests,
-                &assistant_digests,
+                &message_timeline,
                 &model_digest,
                 &system_digest,
             )
             .await?;
         let existing = sessions.get(&operation).await;
+        let parent_message_timeline = match &plan {
+            ReusePlan::Create => Vec::new(),
+            _ => selected_parent_message_timeline(
+                &existing
+                    .as_ref()
+                    .expect("reuse plan requires an existing session")
+                    .turns,
+                &plan,
+            )?,
+        };
 
         let cookie_result = self
             .request_session_cookie(
@@ -282,7 +292,8 @@ impl ClaudeWebState {
             user_digests: user_digests[suffix_start..].to_vec(),
             assistant_uuid_after: assistant_uuid.clone(),
             replace_from_turn,
-            assistant_digests_before: assistant_digests,
+            parent_message_timeline: Some(parent_message_timeline),
+            request_message_timeline: Some(message_timeline),
         };
 
         let body = if is_new {
@@ -1034,7 +1045,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::types::claude::{OutputConfig, OutputEffort, Role, Thinking, ThinkingMode};
+    use crate::{
+        claude_web_state::conversation_cache::ConversationCache,
+        protocol::{AuthPrincipal, sessions::ProtocolSessionStore},
+        services::cookie_actor::CookieActorHandle,
+        types::claude::{OutputConfig, OutputEffort, Role, Thinking, ThinkingMode},
+    };
 
     #[test]
     fn model_selector_state_body_uses_effort_and_mode_shape() {
@@ -1108,5 +1124,73 @@ mod tests {
                 "enabled_imagine": true
             })
         );
+    }
+
+    #[tokio::test]
+    async fn regenerate_with_assistant_prefill_fails_before_upstream_request() {
+        let params = CreateMessageParams {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![
+                Message::new_text(Role::User, "u1"),
+                Message::new_text(Role::Assistant, "prefill"),
+            ],
+            ..Default::default()
+        };
+        let principal = AuthPrincipal::for_authenticated_user();
+        let session_digest = "fa".repeat(32);
+        let sessions = ProtocolSessionStore::memory();
+        let operation = sessions
+            .try_begin(&principal, &session_digest)
+            .await
+            .unwrap();
+        let user_digests = digest_user_messages(&params.messages)
+            .into_iter()
+            .map(|(_, digest)| digest)
+            .collect::<Vec<_>>();
+        sessions
+            .create_provisional(
+                &operation,
+                &principal,
+                &session_digest,
+                "cookie".into(),
+                "org".into(),
+                "conv".into(),
+                digest_model(&params.model),
+                digest_system(&params.system),
+                PendingTurn {
+                    parent_uuid_before: None,
+                    user_digests,
+                    assistant_uuid_after: "assistant".into(),
+                    replace_from_turn: 0,
+                    parent_message_timeline: Some(vec![]),
+                    request_message_timeline: Some(digest_message_timeline(&params.messages)),
+                },
+            )
+            .await
+            .unwrap();
+        sessions
+            .commit(
+                &operation,
+                Some(crate::protocol::sessions::digest_assistant_output(
+                    "generated",
+                )),
+            )
+            .await
+            .unwrap();
+        drop(operation);
+
+        let handle = CookieActorHandle::start().await.unwrap();
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
+        state.principal = Some(principal);
+        state.protocol_sessions = Some(sessions);
+        let error = state
+            .try_protocol_chat(params, session_digest)
+            .await
+            .unwrap_err();
+        let ClewdrError::Protocol { source } = error else {
+            panic!("expected protocol validation error");
+        };
+        assert_eq!(source.status, http::StatusCode::CONFLICT);
+        assert_eq!(source.code, "conversation_reuse_failed");
     }
 }

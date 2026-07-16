@@ -424,7 +424,8 @@ mod protocol_tests {
                     user_digests: vec!["user".into()],
                     assistant_uuid_after: "assistant".into(),
                     replace_from_turn: 0,
-                    assistant_digests_before: vec![],
+                    parent_message_timeline: Some(vec![]),
+                    request_message_timeline: Some(vec![]),
                 },
             )
             .await

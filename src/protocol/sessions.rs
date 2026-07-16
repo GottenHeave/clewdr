@@ -42,7 +42,9 @@ pub struct SessionTurn {
     pub user_digests: Vec<String>,
     pub assistant_uuid_after: String,
     #[serde(default)]
-    pub assistant_digests_before: Vec<String>,
+    pub parent_message_timeline: Option<Vec<String>>,
+    #[serde(default)]
+    pub request_message_timeline: Option<Vec<String>>,
     #[serde(default)]
     pub assistant_digest_after: Option<String>,
 }
@@ -54,7 +56,9 @@ pub struct PendingTurn {
     pub assistant_uuid_after: String,
     pub replace_from_turn: usize,
     #[serde(default)]
-    pub assistant_digests_before: Vec<String>,
+    pub parent_message_timeline: Option<Vec<String>>,
+    #[serde(default)]
+    pub request_message_timeline: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -309,7 +313,7 @@ impl ProtocolSessionStore {
         &self,
         operation: &SessionOperation,
         user_digests: &[String],
-        assistant_digests: &[String],
+        message_timeline: &[String],
         model_digest: &str,
         system_digest: &str,
     ) -> Result<ReusePlan, ProtocolError> {
@@ -338,7 +342,7 @@ impl ProtocolSessionStore {
             return Err(reuse_failed("Model or system prompt changed"));
         }
         let plan = plan_committed_turns(&session.turns, user_digests)?;
-        validate_assistant_context(&session.turns, assistant_digests, &plan)?;
+        validate_message_timeline(&session.turns, user_digests, message_timeline, &plan)?;
         Ok(plan)
     }
 
@@ -448,7 +452,8 @@ impl ProtocolSessionStore {
             parent_uuid_before: pending.parent_uuid_before,
             user_digests: pending.user_digests,
             assistant_uuid_after: pending.assistant_uuid_after,
-            assistant_digests_before: pending.assistant_digests_before,
+            parent_message_timeline: pending.parent_message_timeline,
+            request_message_timeline: pending.request_message_timeline,
             assistant_digest_after,
         });
         session.state = SessionState::Committed;
@@ -572,19 +577,13 @@ impl ProtocolSessionStore {
         self.persist_locked(&index).await
     }
 
-    pub async fn staged_file_references(&self) -> HashMap<String, BTreeSet<String>> {
+    pub async fn existing_session_refs(&self) -> BTreeSet<String> {
         let index = self.index.lock().await;
-        let mut references = HashMap::<String, BTreeSet<String>>::new();
-        for session in index.sessions.values() {
-            let session_ref = session.session_ref();
-            for file_id in session.file_mappings.keys() {
-                references
-                    .entry(file_id.clone())
-                    .or_default()
-                    .insert(session_ref.clone());
-            }
-        }
-        references
+        index
+            .sessions
+            .values()
+            .map(ProtocolSession::session_ref)
+            .collect()
     }
 
     async fn persist_locked(&self, index: &SessionIndex) -> Result<(), ProtocolError> {
@@ -639,73 +638,80 @@ pub fn digest_user_messages(messages: &[Message]) -> Vec<(usize, String)> {
         .iter()
         .enumerate()
         .filter(|(_, message)| message.role == Role::User)
-        .filter_map(|(index, message)| {
-            let content = match &message.content {
-                MessageContent::Text { content } => serde_json::json!([{
-                    "type": "text",
-                    "text": content,
-                }]),
-                MessageContent::Blocks { content } => {
-                    let relevant = content
-                        .iter()
-                        .filter_map(|block| match block {
-                            ContentBlock::Text { text, .. } => {
-                                Some(serde_json::json!({ "type": "text", "text": text }))
-                            }
-                            ContentBlock::Image { source, .. } => Some(serde_json::json!({
-                                "type": "image",
-                                "source": source,
-                            })),
-                            ContentBlock::Document {
-                                source,
-                                context,
-                                title,
-                                ..
-                            } => Some(serde_json::json!({
-                                "type": "document",
-                                "source": source,
-                                "context": context,
-                                "title": title,
-                            })),
-                            ContentBlock::ContainerUpload { file_id, .. } => {
-                                Some(serde_json::json!({
-                                    "type": "container_upload",
-                                    "file_id": file_id,
-                                }))
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>();
-                    if relevant.is_empty() {
-                        return None;
-                    }
-                    serde_json::Value::Array(relevant)
-                }
-            };
-            Some((index, digest_json(&content)))
+        .filter_map(|(index, message)| digest_user_message(message).map(|digest| (index, digest)))
+        .collect()
+}
+
+pub fn digest_message_timeline(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter_map(|message| match message.role {
+            Role::User => digest_user_message(message).map(|digest| format!("user:{digest}")),
+            Role::Assistant => {
+                digest_assistant_message(message).map(|digest| format!("assistant:{digest}"))
+            }
+            Role::System => None,
         })
         .collect()
 }
 
-pub fn digest_assistant_messages(messages: &[Message]) -> Vec<String> {
-    messages
-        .iter()
-        .filter(|message| message.role == Role::Assistant)
-        .filter_map(|message| {
-            let text = match &message.content {
-                MessageContent::Text { content } => content.clone(),
-                MessageContent::Blocks { content } => content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text { text, .. } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            };
-            (!text.is_empty()).then(|| digest_assistant_output(&text))
-        })
-        .collect()
+fn digest_user_message(message: &Message) -> Option<String> {
+    let content = match &message.content {
+        MessageContent::Text { content } => serde_json::json!([{
+            "type": "text",
+            "text": content,
+        }]),
+        MessageContent::Blocks { content } => {
+            let relevant = content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text, .. } => {
+                        Some(serde_json::json!({ "type": "text", "text": text }))
+                    }
+                    ContentBlock::Image { source, .. } => Some(serde_json::json!({
+                        "type": "image",
+                        "source": source,
+                    })),
+                    ContentBlock::Document {
+                        source,
+                        context,
+                        title,
+                        ..
+                    } => Some(serde_json::json!({
+                        "type": "document",
+                        "source": source,
+                        "context": context,
+                        "title": title,
+                    })),
+                    ContentBlock::ContainerUpload { file_id, .. } => Some(serde_json::json!({
+                        "type": "container_upload",
+                        "file_id": file_id,
+                    })),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if relevant.is_empty() {
+                return None;
+            }
+            serde_json::Value::Array(relevant)
+        }
+    };
+    Some(digest_json(&content))
+}
+
+fn digest_assistant_message(message: &Message) -> Option<String> {
+    let text = match &message.content {
+        MessageContent::Text { content } => content.trim().to_string(),
+        MessageContent::Blocks { content } => content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.trim()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    (!text.is_empty()).then(|| digest_assistant_output(&text))
 }
 
 pub fn digest_assistant_output(text: &str) -> String {
@@ -777,18 +783,51 @@ fn plan_committed_turns(
     ))
 }
 
-fn validate_assistant_context(
+fn validate_message_timeline(
     turns: &[SessionTurn],
-    requested: &[String],
+    user_digests: &[String],
+    requested_timeline: &[String],
     plan: &ReusePlan,
 ) -> Result<(), ProtocolError> {
-    let expected = match plan {
-        ReusePlan::Create => return Ok(()),
+    if matches!(plan, ReusePlan::Create) {
+        return Ok(());
+    }
+    let mut expected = selected_parent_message_timeline(turns, plan)?;
+    let suffix_start = match plan {
+        ReusePlan::Append { suffix_start, .. }
+        | ReusePlan::Fork { suffix_start, .. }
+        | ReusePlan::Regenerate { suffix_start, .. } => *suffix_start,
+        ReusePlan::Create => unreachable!(),
+    };
+    expected.extend(
+        user_digests[suffix_start..]
+            .iter()
+            .map(|digest| format!("user:{digest}")),
+    );
+    if requested_timeline != expected {
+        return Err(reuse_failed(
+            "Message order or assistant content cannot be forwarded faithfully from the selected conversation parent",
+        ));
+    }
+    Ok(())
+}
+
+pub fn selected_parent_message_timeline(
+    turns: &[SessionTurn],
+    plan: &ReusePlan,
+) -> Result<Vec<String>, ProtocolError> {
+    let timeline = match plan {
+        ReusePlan::Create => return Ok(Vec::new()),
         ReusePlan::Append { .. } => {
             let latest = turns.last().expect("append requires a committed turn");
-            let mut expected = latest.assistant_digests_before.clone();
-            expected.extend(latest.assistant_digest_after.iter().cloned());
-            expected
+            let mut timeline = latest
+                .request_message_timeline
+                .clone()
+                .ok_or_else(legacy_session_requires_reset)?;
+            if let Some(digest) = &latest.assistant_digest_after {
+                timeline.push(format!("assistant:{digest}"));
+            }
+            return Ok(timeline);
         }
         ReusePlan::Fork {
             replace_from_turn, ..
@@ -798,15 +837,18 @@ fn validate_assistant_context(
         } => turns
             .get(*replace_from_turn)
             .expect("reuse plan references a committed turn")
-            .assistant_digests_before
+            .parent_message_timeline
             .clone(),
     };
-    if requested != expected {
-        return Err(reuse_failed(
-            "Assistant history or prefill does not match the selected conversation parent",
-        ));
-    }
-    Ok(())
+    timeline.ok_or_else(legacy_session_requires_reset)
+}
+
+fn legacy_session_requires_reset() -> ProtocolError {
+    ProtocolError::new(
+        StatusCode::GONE,
+        "conversation_expired",
+        "The session predates message timeline validation and must be reset",
+    )
 }
 
 fn enforce_capacity(
@@ -897,7 +939,8 @@ mod tests {
             parent_uuid_before: parent.map(str::to_owned),
             user_digests: users.iter().map(|value| (*value).to_owned()).collect(),
             assistant_uuid_after: assistant.to_owned(),
-            assistant_digests_before: vec![],
+            parent_message_timeline: Some(vec![]),
+            request_message_timeline: Some(vec![]),
             assistant_digest_after: None,
         }
     }
@@ -938,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_turn_without_assistant_digests_loads_from_v1_metadata() {
+    fn pending_turn_without_timelines_loads_from_legacy_metadata() {
         let pending: PendingTurn = serde_json::from_value(serde_json::json!({
             "parent_uuid_before": null,
             "user_digests": ["u1"],
@@ -947,7 +990,8 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(pending.assistant_digests_before.is_empty());
+        assert!(pending.parent_message_timeline.is_none());
+        assert!(pending.request_message_timeline.is_none());
     }
 
     #[test]
@@ -989,7 +1033,8 @@ mod tests {
                     user_digests: vec!["u1".into()],
                     assistant_uuid_after: "a1".into(),
                     replace_from_turn: 0,
-                    assistant_digests_before: vec![],
+                    parent_message_timeline: Some(vec![]),
+                    request_message_timeline: Some(vec!["user:u1".into()]),
                 },
             )
             .await
@@ -1106,7 +1151,8 @@ mod tests {
                     user_digests: vec!["u".into()],
                     assistant_uuid_after: "a".into(),
                     replace_from_turn: 0,
-                    assistant_digests_before: vec![],
+                    parent_message_timeline: Some(vec![]),
+                    request_message_timeline: Some(vec!["user:u".into()]),
                 },
             )
             .await
@@ -1168,7 +1214,8 @@ mod tests {
                     user_digests: vec!["u1".into()],
                     assistant_uuid_after: "a1".into(),
                     replace_from_turn: 0,
-                    assistant_digests_before: vec![],
+                    parent_message_timeline: Some(vec![]),
+                    request_message_timeline: Some(vec!["user:u1".into()]),
                 },
             )
             .await
@@ -1182,7 +1229,8 @@ mod tests {
                     user_digests: vec!["u2".into()],
                     assistant_uuid_after: "a2".into(),
                     replace_from_turn: 1,
-                    assistant_digests_before: vec![],
+                    parent_message_timeline: Some(vec!["user:u1".into()]),
+                    request_message_timeline: Some(vec!["user:u1".into(), "user:u2".into()]),
                 },
             )
             .await
@@ -1196,7 +1244,7 @@ mod tests {
                 .plan(
                     &operation,
                     &["u1".into(), "u2".into()],
-                    &[],
+                    &["user:u1".into(), "user:u2".into()],
                     "model",
                     "system",
                 )
@@ -1232,7 +1280,11 @@ mod tests {
                     user_digests: vec!["u1".into()],
                     assistant_uuid_after: "a1".into(),
                     replace_from_turn: 0,
-                    assistant_digests_before: vec![prefill.clone()],
+                    parent_message_timeline: Some(vec![]),
+                    request_message_timeline: Some(vec![
+                        "user:u1".into(),
+                        format!("assistant:{prefill}"),
+                    ]),
                 },
             )
             .await
@@ -1247,7 +1299,12 @@ mod tests {
                 .plan(
                     &operation,
                     &["u1".into(), "u2".into()],
-                    &[prefill.clone(), generated.clone()],
+                    &[
+                        "user:u1".into(),
+                        format!("assistant:{prefill}"),
+                        format!("assistant:{generated}"),
+                        "user:u2".into(),
+                    ],
                     "model",
                     "system",
                 )
@@ -1260,7 +1317,26 @@ mod tests {
                 .plan(
                     &operation,
                     &["u1".into(), "u2".into()],
-                    &[prefill.clone(), digest_assistant_output("changed answer")],
+                    &[
+                        "user:u1".into(),
+                        format!("assistant:{prefill}"),
+                        format!("assistant:{}", digest_assistant_output("changed answer")),
+                        "user:u2".into(),
+                    ],
+                    "model",
+                    "system",
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "conversation_reuse_failed"
+        );
+        assert_eq!(
+            store
+                .plan(
+                    &operation,
+                    &["u1".into()],
+                    &["user:u1".into(), format!("assistant:{prefill}")],
                     "model",
                     "system",
                 )
@@ -1274,7 +1350,7 @@ mod tests {
                 .plan(
                     &operation,
                     &["u1".into()],
-                    std::slice::from_ref(&prefill),
+                    &["user:u1".into()],
                     "model",
                     "system",
                 )
@@ -1287,7 +1363,10 @@ mod tests {
                 .plan(
                     &operation,
                     &["u1".into()],
-                    &[digest_assistant_output("changed prefill")],
+                    &[
+                        "user:u1".into(),
+                        format!("assistant:{}", digest_assistant_output("changed prefill")),
+                    ],
                     "model",
                     "system",
                 )
@@ -1296,6 +1375,68 @@ mod tests {
                 .code,
             "conversation_reuse_failed"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_committed_session_requires_reset_before_reuse() {
+        let store = ProtocolSessionStore::memory();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let digest = "fe".repeat(32);
+        let operation = store.try_begin(&principal, &digest).await.unwrap();
+        store
+            .create_provisional(
+                &operation,
+                &principal,
+                &digest,
+                "cookie".into(),
+                "org".into(),
+                "conv".into(),
+                "model".into(),
+                "system".into(),
+                PendingTurn {
+                    parent_uuid_before: None,
+                    user_digests: vec!["u1".into()],
+                    assistant_uuid_after: "a1".into(),
+                    replace_from_turn: 0,
+                    parent_message_timeline: Some(vec![]),
+                    request_message_timeline: Some(vec!["user:u1".into()]),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .commit(&operation, Some(digest_assistant_output("a1")))
+            .await
+            .unwrap();
+        {
+            let mut index = store.index.lock().await;
+            let turn = index
+                .sessions
+                .get_mut(&operation.key)
+                .unwrap()
+                .turns
+                .last_mut()
+                .unwrap();
+            turn.parent_message_timeline = None;
+            turn.request_message_timeline = None;
+        }
+
+        let error = store
+            .plan(
+                &operation,
+                &["u1".into(), "u2".into()],
+                &[
+                    "user:u1".into(),
+                    format!("assistant:{}", digest_assistant_output("a1")),
+                    "user:u2".into(),
+                ],
+                "model",
+                "system",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::GONE);
+        assert_eq!(error.code, "conversation_expired");
     }
 
     #[test]
@@ -1310,8 +1451,29 @@ mod tests {
         )];
 
         assert_ne!(
-            digest_assistant_messages(&messages),
-            digest_assistant_messages(&regrouped)
+            digest_message_timeline(&messages),
+            digest_message_timeline(&regrouped)
+        );
+    }
+
+    #[test]
+    fn message_timeline_preserves_cross_role_order() {
+        let ordered = [
+            Message::new_text(Role::User, "u1"),
+            Message::new_text(Role::Assistant, "a1"),
+            Message::new_text(Role::User, "u2"),
+            Message::new_text(Role::Assistant, "a2"),
+        ];
+        let reordered = [
+            Message::new_text(Role::User, "u1"),
+            Message::new_text(Role::User, "u2"),
+            Message::new_text(Role::Assistant, "a1"),
+            Message::new_text(Role::Assistant, "a2"),
+        ];
+
+        assert_ne!(
+            digest_message_timeline(&ordered),
+            digest_message_timeline(&reordered)
         );
     }
 
@@ -1336,7 +1498,8 @@ mod tests {
                     user_digests: vec!["u".into()],
                     assistant_uuid_after: "a".into(),
                     replace_from_turn: 0,
-                    assistant_digests_before: vec![],
+                    parent_message_timeline: Some(vec![]),
+                    request_message_timeline: Some(vec!["user:u".into()]),
                 },
             )
             .await
@@ -1364,7 +1527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tombstone_ttl_cleanup_reconciles_file_refs_for_quota_recovery() {
+    async fn tombstone_ttl_cleanup_removes_file_refs_for_quota_recovery() {
         let temp = tempfile::tempdir().unwrap();
         let files = StagedFileStore::persistent_with_limits(temp.path().join("files"), 4, 4)
             .await
@@ -1397,7 +1560,8 @@ mod tests {
                     user_digests: vec!["u".into()],
                     assistant_uuid_after: "a".into(),
                     replace_from_turn: 0,
-                    assistant_digests_before: vec![],
+                    parent_message_timeline: Some(vec![]),
+                    request_message_timeline: Some(vec!["user:u".into()]),
                 },
             )
             .await
@@ -1418,7 +1582,7 @@ mod tests {
 
         sessions.cleanup_tombstones().await.unwrap();
         files
-            .reconcile_references(&sessions.staged_file_references().await)
+            .remove_orphaned_references(&sessions.existing_session_refs().await)
             .await
             .unwrap();
         let second = files
@@ -1435,5 +1599,140 @@ mod tests {
             files.resolve(&principal, &first.id).await.unwrap_err().code,
             "file_not_found"
         );
+    }
+
+    #[tokio::test]
+    async fn cleanup_does_not_remove_reference_added_during_upload_mapping() {
+        let temp = tempfile::tempdir().unwrap();
+        let files = StagedFileStore::persistent_with_limits(temp.path().join("files"), 4, 4)
+            .await
+            .unwrap();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let file = files
+            .stage_stream(
+                &principal,
+                "first.bin",
+                "application/octet-stream",
+                stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"1234"))]),
+            )
+            .await
+            .unwrap();
+        let sessions = ProtocolSessionStore::memory();
+        let digest = "ef".repeat(32);
+        let operation = sessions.try_begin(&principal, &digest).await.unwrap();
+        sessions
+            .create_provisional(
+                &operation,
+                &principal,
+                &digest,
+                "cookie".into(),
+                "org".into(),
+                "conv".into(),
+                "model".into(),
+                "system".into(),
+                PendingTurn {
+                    parent_uuid_before: None,
+                    user_digests: vec!["u".into()],
+                    assistant_uuid_after: "a".into(),
+                    replace_from_turn: 0,
+                    parent_message_timeline: Some(vec![]),
+                    request_message_timeline: Some(vec!["user:u".into()]),
+                },
+            )
+            .await
+            .unwrap();
+
+        let cleanup_snapshot = sessions.existing_session_refs().await;
+        let session_ref = sessions.get(&operation).await.unwrap().session_ref();
+        files.add_reference(&file.id, &session_ref).await.unwrap();
+        sessions
+            .put_file_mapping(&operation, &file.id, "claude-file")
+            .await
+            .unwrap();
+        files
+            .remove_orphaned_references(&cleanup_snapshot)
+            .await
+            .unwrap();
+
+        let error = files
+            .stage_stream(
+                &principal,
+                "second.bin",
+                "application/octet-stream",
+                stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"5678"))]),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "staged_storage_full");
+    }
+
+    #[tokio::test]
+    async fn stale_cleanup_snapshot_does_not_restore_reference_removed_by_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let files = StagedFileStore::persistent_with_limits(temp.path().join("files"), 4, 4)
+            .await
+            .unwrap();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let first = files
+            .stage_stream(
+                &principal,
+                "first.bin",
+                "application/octet-stream",
+                stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"1234"))]),
+            )
+            .await
+            .unwrap();
+        let sessions = ProtocolSessionStore::memory();
+        let digest = "ee".repeat(32);
+        let operation = sessions.try_begin(&principal, &digest).await.unwrap();
+        sessions
+            .create_provisional(
+                &operation,
+                &principal,
+                &digest,
+                "cookie".into(),
+                "org".into(),
+                "conv".into(),
+                "model".into(),
+                "system".into(),
+                PendingTurn {
+                    parent_uuid_before: None,
+                    user_digests: vec!["u".into()],
+                    assistant_uuid_after: "a".into(),
+                    replace_from_turn: 0,
+                    parent_message_timeline: Some(vec![]),
+                    request_message_timeline: Some(vec!["user:u".into()]),
+                },
+            )
+            .await
+            .unwrap();
+        sessions
+            .put_file_mapping(&operation, &first.id, "claude-file")
+            .await
+            .unwrap();
+        let session_ref = sessions.get(&operation).await.unwrap().session_ref();
+        files.add_reference(&first.id, &session_ref).await.unwrap();
+
+        let stale_cleanup_snapshot = sessions.existing_session_refs().await;
+        let removed = sessions.reset(&operation, &principal).await.unwrap();
+        files
+            .remove_session_references(&removed.session_ref())
+            .await
+            .unwrap();
+        files
+            .remove_orphaned_references(&stale_cleanup_snapshot)
+            .await
+            .unwrap();
+
+        let second = files
+            .stage_stream(
+                &principal,
+                "second.bin",
+                "application/octet-stream",
+                stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"5678"))]),
+            )
+            .await
+            .unwrap();
+        assert_ne!(first.id, second.id);
     }
 }
