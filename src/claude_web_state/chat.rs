@@ -359,7 +359,7 @@ impl ClaudeWebState {
                 .iter()
                 .map(|(message_index, _)| &p.messages[*message_index])
                 .collect::<Vec<_>>();
-            let bundled = self.bundle_user_messages(&user_messages)?;
+            let bundled = self.bundle_explicit_user_messages(&user_messages)?;
             let files = match self
                 .upload_protocol_files(
                     bundled.images.clone(),
@@ -939,6 +939,22 @@ impl ClaudeWebState {
         &self,
         user_msgs: &[&Message],
     ) -> Result<BundledMessages, ProtocolError> {
+        self.bundle_normalized_user_messages(user_msgs, "\n\n", true)
+    }
+
+    fn bundle_explicit_user_messages(
+        &self,
+        user_msgs: &[&Message],
+    ) -> Result<BundledMessages, ProtocolError> {
+        self.bundle_normalized_user_messages(user_msgs, "\n", false)
+    }
+
+    fn bundle_normalized_user_messages(
+        &self,
+        user_msgs: &[&Message],
+        message_separator: &str,
+        attach_long_text: bool,
+    ) -> Result<BundledMessages, ProtocolError> {
         let mut texts: Vec<String> = vec![];
         let mut attachments: Vec<Attachment> = vec![];
         let mut images: Vec<ImageSource> = vec![];
@@ -958,13 +974,13 @@ impl ClaudeWebState {
             images.extend(normalized.images);
         }
 
-        let combined = texts.join("\n\n");
+        let combined = texts.join(message_separator);
 
         // Threshold: if combined text is under ~4000 chars, use prompt directly
         // Otherwise put it in an attachment
         const PROMPT_THRESHOLD: usize = 4000;
 
-        if combined.len() <= PROMPT_THRESHOLD {
+        if !attach_long_text || combined.len() <= PROMPT_THRESHOLD {
             let mut prompt = combined;
             if prompt.is_empty() && (!attachments.is_empty() || !images.is_empty()) {
                 prompt = "Please answer using the attached content.".to_string();
@@ -1215,6 +1231,59 @@ mod tests {
         let bundled = state.bundle_user_messages(&[&message]).unwrap();
 
         assert_eq!(bundled.prompt, "a\n\nb");
+    }
+
+    #[tokio::test]
+    async fn explicit_create_and_regenerate_build_equivalent_user_content() {
+        let handle = CookieActorHandle::start().await.unwrap();
+        let state = ClaudeWebState::new(handle, ConversationCache::new());
+        let messages = vec![
+            Message::new_blocks(
+                Role::User,
+                vec![
+                    ContentBlock::text("u1"),
+                    serde_json::from_value(json!({
+                        "type": "document",
+                        "source": { "type": "text", "data": "notes" },
+                        "title": "notes.txt"
+                    }))
+                    .unwrap(),
+                ],
+            ),
+            Message::new_blocks(
+                Role::User,
+                vec![
+                    ContentBlock::text("u2".repeat(2100)),
+                    ContentBlock::Image {
+                        source: ImageSource::Base64 {
+                            media_type: "image/png".into(),
+                            data: "aW1hZ2U=".into(),
+                            file_name: Some("image.png".into()),
+                        },
+                        cache_control: None,
+                    },
+                ],
+            ),
+        ];
+        let create = state
+            .transform_request(CreateMessageParams {
+                model: "claude-sonnet-4-6".into(),
+                messages: messages.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        let message_refs = messages.iter().collect::<Vec<_>>();
+        let regenerate = state.bundle_explicit_user_messages(&message_refs).unwrap();
+
+        assert_eq!(create.prompt, regenerate.prompt);
+        assert_eq!(
+            serde_json::to_value(&create.attachments).unwrap(),
+            serde_json::to_value(&regenerate.attachments).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&create.images).unwrap(),
+            serde_json::to_value(&regenerate.images).unwrap()
+        );
     }
 
     #[tokio::test]
