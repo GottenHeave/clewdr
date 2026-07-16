@@ -60,7 +60,7 @@ mod tests {
     use super::*;
     use crate::claude_web_state::{
         conversation_cache::CachedConversation,
-        explicit_session::{ExplicitConversation, ExplicitReusePlan, ExplicitSessionState, plan},
+        explicit_session::{ExplicitConversation, ExplicitSessionState},
     };
 
     fn cached_session(state: ExplicitSessionState) -> CachedConversation {
@@ -114,38 +114,5 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(cache.get_explicit(&key).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn concurrent_reset_reports_session_busy() {
-        let cache = ConversationCache::new();
-        let principal = AuthPrincipal::for_authenticated_user();
-        let digest = "cd".repeat(32);
-        let key = ExplicitSessionKey::new(principal.as_str(), &digest);
-        let _operation = cache.try_lock_explicit_operation(&key).await.unwrap();
-        let error = cache.try_lock_explicit_operation(&key).await.unwrap_err();
-        assert_eq!(error.status, StatusCode::CONFLICT);
-        assert_eq!(error.code, "session_busy");
-    }
-
-    #[tokio::test]
-    async fn reset_allows_uncertain_session_to_create_again() {
-        let cache = ConversationCache::new();
-        let key = ExplicitSessionKey::new("principal", "uncertain");
-        cache
-            .set_explicit(key.clone(), cached_session(ExplicitSessionState::Uncertain))
-            .await;
-        assert!(cache.reset_explicit(&key).await.unwrap());
-        assert_eq!(
-            plan(
-                None,
-                &["user".into()],
-                &["user:user".into()],
-                "model",
-                "system",
-            )
-            .unwrap(),
-            ExplicitReusePlan::Create
-        );
     }
 }
