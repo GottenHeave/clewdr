@@ -646,9 +646,9 @@ pub fn digest_message_timeline(messages: &[Message]) -> Vec<String> {
     messages
         .iter()
         .filter_map(|message| match message.role {
-            Role::User => digest_user_message(message).map(|digest| format!("user:{digest}")),
+            Role::User => digest_message_content(message).map(|digest| format!("user:{digest}")),
             Role::Assistant => {
-                digest_assistant_message(message).map(|digest| format!("assistant:{digest}"))
+                digest_message_content(message).map(|digest| format!("assistant:{digest}"))
             }
             Role::System => None,
         })
@@ -656,21 +656,39 @@ pub fn digest_message_timeline(messages: &[Message]) -> Vec<String> {
 }
 
 fn digest_user_message(message: &Message) -> Option<String> {
-    let content = match &message.content {
-        MessageContent::Text { content } => serde_json::json!([{
-            "type": "text",
-            "text": content,
-        }]),
+    digest_message_content(message)
+}
+
+fn digest_message_content(message: &Message) -> Option<String> {
+    let content = canonical_message_content(&message.content)?;
+    Some(digest_json(&content))
+}
+
+fn canonical_message_content(content: &MessageContent) -> Option<serde_json::Value> {
+    let content = match content {
+        MessageContent::Text { content } => {
+            let text = content.trim();
+            if text.is_empty() {
+                return None;
+            }
+            vec![serde_json::json!({
+                "type": "text",
+                "text": text,
+            })]
+        }
         MessageContent::Blocks { content } => {
             let relevant = content
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::Text { text, .. } => {
-                        Some(serde_json::json!({ "type": "text", "text": text }))
-                    }
+                    ContentBlock::Text { text, .. } => (!text.trim().is_empty())
+                        .then(|| serde_json::json!({ "type": "text", "text": text.trim() })),
                     ContentBlock::Image { source, .. } => Some(serde_json::json!({
                         "type": "image",
                         "source": source,
+                    })),
+                    ContentBlock::ImageUrl { image_url } => Some(serde_json::json!({
+                        "type": "image_url",
+                        "url": image_url.url.trim(),
                     })),
                     ContentBlock::Document {
                         source,
@@ -693,32 +711,18 @@ fn digest_user_message(message: &Message) -> Option<String> {
             if relevant.is_empty() {
                 return None;
             }
-            serde_json::Value::Array(relevant)
+            relevant
         }
     };
-    Some(digest_json(&content))
-}
-
-fn digest_assistant_message(message: &Message) -> Option<String> {
-    let text = match &message.content {
-        MessageContent::Text { content } => content.trim().to_string(),
-        MessageContent::Blocks { content } => content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text { text, .. } => Some(text.trim()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    };
-    (!text.is_empty()).then(|| digest_assistant_output(&text))
+    Some(serde_json::Value::Array(content))
 }
 
 pub fn digest_assistant_output(text: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"clewdr-assistant-text-v1\0");
-    digest.update(text.as_bytes());
-    hex::encode(digest.finalize())
+    let content = canonical_message_content(&MessageContent::Text {
+        content: text.to_owned(),
+    })
+    .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+    digest_json(&content)
 }
 
 pub fn session_ref(principal: &str, session_digest: &str) -> String {
@@ -1454,6 +1458,108 @@ mod tests {
             digest_message_timeline(&messages),
             digest_message_timeline(&regrouped)
         );
+    }
+
+    #[test]
+    fn assistant_attachment_identity_changes_message_timeline() {
+        let message_with = |data: &str| {
+            Message::new_blocks(
+                Role::Assistant,
+                vec![
+                    ContentBlock::text("same text"),
+                    ContentBlock::Image {
+                        source: crate::types::claude::ImageSource::Base64 {
+                            media_type: "image/png".into(),
+                            data: data.into(),
+                            file_name: Some("image.png".into()),
+                        },
+                        cache_control: None,
+                    },
+                ],
+            )
+        };
+
+        assert_ne!(
+            digest_message_timeline(&[message_with("attachment-a")]),
+            digest_message_timeline(&[message_with("attachment-b")])
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_assistant_attachment_cannot_reuse_committed_parent() {
+        let message_with = |data: &str| {
+            Message::new_blocks(
+                Role::Assistant,
+                vec![
+                    ContentBlock::text("same text"),
+                    ContentBlock::Image {
+                        source: crate::types::claude::ImageSource::Base64 {
+                            media_type: "image/png".into(),
+                            data: data.into(),
+                            file_name: Some("image.png".into()),
+                        },
+                        cache_control: None,
+                    },
+                ],
+            )
+        };
+        let initial_messages = vec![
+            Message::new_text(Role::User, "u1"),
+            message_with("attachment-a"),
+        ];
+        let user_digest = digest_user_messages(&initial_messages)[0].1.clone();
+        let generated_digest = digest_assistant_output("generated");
+        let store = ProtocolSessionStore::memory();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let session_digest = "ed".repeat(32);
+        let operation = store.try_begin(&principal, &session_digest).await.unwrap();
+        store
+            .create_provisional(
+                &operation,
+                &principal,
+                &session_digest,
+                "cookie".into(),
+                "org".into(),
+                "conv".into(),
+                "model".into(),
+                "system".into(),
+                PendingTurn {
+                    parent_uuid_before: None,
+                    user_digests: vec![user_digest.clone()],
+                    assistant_uuid_after: "assistant".into(),
+                    replace_from_turn: 0,
+                    parent_message_timeline: Some(vec![]),
+                    request_message_timeline: Some(digest_message_timeline(&initial_messages)),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .commit(&operation, Some(generated_digest))
+            .await
+            .unwrap();
+
+        let changed_messages = vec![
+            Message::new_text(Role::User, "u1"),
+            message_with("attachment-b"),
+            Message::new_text(Role::Assistant, "generated"),
+            Message::new_text(Role::User, "u2"),
+        ];
+        let changed_user_digests = digest_user_messages(&changed_messages)
+            .into_iter()
+            .map(|(_, digest)| digest)
+            .collect::<Vec<_>>();
+        let error = store
+            .plan(
+                &operation,
+                &changed_user_digests,
+                &digest_message_timeline(&changed_messages),
+                "model",
+                "system",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "conversation_reuse_failed");
     }
 
     #[test]

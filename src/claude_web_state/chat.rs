@@ -26,7 +26,9 @@ use crate::{
             digest_system, digest_user_messages, selected_parent_message_timeline,
         },
     },
-    types::claude::{ContentBlock, CreateMessageParams, ImageSource, Message, MessageContent},
+    types::claude::{
+        ContentBlock, CreateMessageParams, ImageSource, Message, MessageContent, Role,
+    },
     types::claude_web::request::{Attachment, CreateConversationParams, TurnMessageUuids},
     utils::{TIME_ZONE, print_out_json},
 };
@@ -175,6 +177,17 @@ impl ClaudeWebState {
         p: CreateMessageParams,
         session_digest: String,
     ) -> Result<axum::response::Response, ClewdrError> {
+        if p.messages
+            .iter()
+            .any(|message| message.role == Role::System)
+        {
+            return Err(ProtocolError::new(
+                http::StatusCode::BAD_REQUEST,
+                "conversation_reuse_failed",
+                "Explicit sessions require system instructions in the top-level system field",
+            )
+            .into());
+        }
         let principal = self.principal.clone().ok_or(ClewdrError::InvalidAuth)?;
         let sessions = self
             .protocol_sessions
@@ -1191,6 +1204,79 @@ mod tests {
             panic!("expected protocol validation error");
         };
         assert_eq!(source.status, http::StatusCode::CONFLICT);
+        assert_eq!(source.code, "conversation_reuse_failed");
+    }
+
+    #[tokio::test]
+    async fn message_system_role_is_rejected_before_parent_reuse() {
+        let principal = AuthPrincipal::for_authenticated_user();
+        let session_digest = "fb".repeat(32);
+        let sessions = ProtocolSessionStore::memory();
+        let operation = sessions
+            .try_begin(&principal, &session_digest)
+            .await
+            .unwrap();
+        sessions
+            .create_provisional(
+                &operation,
+                &principal,
+                &session_digest,
+                "cookie".into(),
+                "org".into(),
+                "conv".into(),
+                digest_model("claude-sonnet-4-6"),
+                digest_system(&None),
+                PendingTurn {
+                    parent_uuid_before: None,
+                    user_digests: vec![
+                        digest_user_messages(&[Message::new_text(Role::User, "u1")])[0]
+                            .1
+                            .clone(),
+                    ],
+                    assistant_uuid_after: "assistant".into(),
+                    replace_from_turn: 0,
+                    parent_message_timeline: Some(vec![]),
+                    request_message_timeline: Some(digest_message_timeline(&[Message::new_text(
+                        Role::User,
+                        "u1",
+                    )])),
+                },
+            )
+            .await
+            .unwrap();
+        sessions
+            .commit(
+                &operation,
+                Some(crate::protocol::sessions::digest_assistant_output(
+                    "generated",
+                )),
+            )
+            .await
+            .unwrap();
+        drop(operation);
+        let params = CreateMessageParams {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![
+                Message::new_text(Role::System, "changed system instruction"),
+                Message::new_text(Role::User, "u1"),
+                Message::new_text(Role::Assistant, "generated"),
+                Message::new_text(Role::User, "u2"),
+            ],
+            ..Default::default()
+        };
+        let handle = CookieActorHandle::start().await.unwrap();
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
+        state.principal = Some(principal);
+        state.protocol_sessions = Some(sessions);
+
+        let error = state
+            .try_protocol_chat(params, session_digest)
+            .await
+            .unwrap_err();
+        let ClewdrError::Protocol { source } = error else {
+            panic!("expected protocol validation error");
+        };
+        assert_eq!(source.status, http::StatusCode::BAD_REQUEST);
         assert_eq!(source.code, "conversation_reuse_failed");
     }
 }
