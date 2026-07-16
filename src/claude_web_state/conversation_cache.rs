@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::{TimestampSecondsWithFrac, serde_as};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::warn;
+
+use crate::utils::write_json_atomically;
 
 const CACHE_FILE_VERSION: u32 = 1;
 
@@ -68,15 +70,37 @@ impl CachedConversation {
     }
 }
 
-/// Cache key: identifies a unique "conversation slot"
-/// First version: one conversation per (cookie, key_index) pair
-/// This means each downstream API key gets one cached conversation per cookie
+/// Identifies either an implicit request family or an explicit client session.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacheKey {
-    /// Index of the downstream API key in config (from self.key)
-    pub key_index: usize,
-    /// Request-family fingerprint used to isolate auxiliary requests.
-    pub request_fingerprint: u64,
+#[serde(untagged)]
+pub enum CacheKey {
+    Legacy {
+        key_index: usize,
+        request_fingerprint: u64,
+    },
+    ExplicitSession {
+        session_principal: String,
+        session_digest: String,
+    },
+}
+
+impl CacheKey {
+    pub fn legacy(key_index: usize, request_fingerprint: u64) -> Self {
+        Self::Legacy {
+            key_index,
+            request_fingerprint,
+        }
+    }
+
+    pub fn explicit_session(
+        session_principal: impl Into<String>,
+        session_digest: impl Into<String>,
+    ) -> Self {
+        Self::ExplicitSession {
+            session_principal: session_principal.into(),
+            session_digest: session_digest.into(),
+        }
+    }
 }
 
 #[serde_as]
@@ -164,6 +188,7 @@ impl PersistedConversationCache {
 #[derive(Clone)]
 pub struct ConversationCache {
     inner: Arc<Mutex<HashMap<CacheKey, CachedConversation>>>,
+    operation_locks: Arc<Mutex<HashMap<CacheKey, Weak<Mutex<()>>>>>,
     persist_path: Option<Arc<PathBuf>>,
     persist_lock: Arc<Mutex<()>>,
 }
@@ -172,6 +197,7 @@ impl ConversationCache {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            operation_locks: Arc::new(Mutex::new(HashMap::new())),
             persist_path: None,
             persist_lock: Arc::new(Mutex::new(())),
         }
@@ -200,6 +226,7 @@ impl ConversationCache {
         };
         Self {
             inner: Arc::new(Mutex::new(inner)),
+            operation_locks: Arc::new(Mutex::new(HashMap::new())),
             persist_path: Some(Arc::new(persist_path)),
             persist_lock: Arc::new(Mutex::new(())),
         }
@@ -208,6 +235,21 @@ impl ConversationCache {
     pub async fn get(&self, key: &CacheKey) -> Option<CachedConversation> {
         let map = self.inner.lock().await;
         map.get(key).filter(|c| c.valid && !c.is_expired()).cloned()
+    }
+
+    pub async fn lock_operation(&self, key: &CacheKey) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.operation_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(key.clone(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
     }
 
     pub async fn set(&self, key: CacheKey, conv: CachedConversation) {
@@ -337,7 +379,7 @@ impl ConversationCache {
             let map = self.inner.lock().await;
             PersistedConversationCache::from_map(&map)
         };
-        if let Err(err) = Self::write_to_path(path, &snapshot).await {
+        if let Err(err) = write_json_atomically(path, &snapshot).await {
             warn!(
                 "[CACHE] failed to persist conversation cache to {}: {}",
                 path.display(),
@@ -374,33 +416,5 @@ impl ConversationCache {
             }
         }
         Ok(map)
-    }
-
-    async fn write_to_path(
-        path: &Path,
-        snapshot: &PersistedConversationCache,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(parent) = path.parent()
-            && !parent.exists()
-        {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let tmp_path = path.with_extension("json.tmp");
-        let data = serde_json::to_vec_pretty(snapshot)?;
-        tokio::fs::write(&tmp_path, data).await?;
-        match tokio::fs::rename(&tmp_path, path).await {
-            Ok(()) => Ok(()),
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                let _ = tokio::fs::remove_file(path).await;
-                tokio::fs::rename(&tmp_path, path).await?;
-                Ok(())
-            }
-            Err(err) => Err(Box::new(err)),
-        }
     }
 }

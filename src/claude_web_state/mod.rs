@@ -306,20 +306,17 @@ impl ClaudeWebState {
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&digest[..8]);
 
-        CacheKey {
-            key_index: self.key.map(|(_, idx)| idx).unwrap_or(0),
-            request_fingerprint: u64::from_le_bytes(bytes),
-        }
+        CacheKey::legacy(
+            self.key.map(|(_, idx)| idx).unwrap_or(0),
+            u64::from_le_bytes(bytes),
+        )
     }
 
     fn cache_key(&self) -> CacheKey {
         self.last_params
             .as_ref()
             .map(|params| self.cache_key_for(params))
-            .unwrap_or(CacheKey {
-                key_index: self.key.map(|(_, idx)| idx).unwrap_or(0),
-                request_fingerprint: 0,
-            })
+            .unwrap_or_else(|| CacheKey::legacy(self.key.map(|(_, idx)| idx).unwrap_or(0), 0))
     }
 
     fn cookie_id(&self) -> String {

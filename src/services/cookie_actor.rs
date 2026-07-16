@@ -5,6 +5,7 @@ use colored::Colorize;
 use moka::sync::Cache;
 use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use snafu::{GenerateImplicitData, Location};
 use tracing::{error, info, warn};
 
@@ -16,6 +17,23 @@ use crate::{
 const INTERVAL: u64 = 300;
 const SESSION_WINDOW_SECS: i64 = 5 * 60 * 60; // 5h
 const WEEKLY_WINDOW_SECS: i64 = 7 * 24 * 60 * 60; // 7d
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct CookieAffinityKey(String);
+
+impl CookieAffinityKey {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn session(session_digest: &str) -> Self {
+        Self::new(format!("session:v1:{session_digest}"))
+    }
+
+    fn legacy(hash: u64) -> Self {
+        Self::new(format!("legacy:{hash:016x}"))
+    }
+}
 
 #[derive(Debug, Serialize, Clone)]
 pub struct CookieStatusInfo {
@@ -34,7 +52,11 @@ enum CookieActorMessage {
     /// Check for timed out Cookies
     CheckReset,
     /// Request to get a Cookie
-    Request(Option<u64>, RpcReplyPort<Result<CookieStatus, ClewdrError>>),
+    Request(
+        Option<CookieAffinityKey>,
+        Option<String>,
+        RpcReplyPort<Result<CookieStatus, ClewdrError>>,
+    ),
     /// Get all Cookie status information
     GetStatus(RpcReplyPort<CookieStatusInfo>),
     /// Delete a Cookie
@@ -47,7 +69,7 @@ struct CookieActorState {
     valid: VecDeque<CookieStatus>,
     exhausted: HashSet<CookieStatus>,
     invalid: HashSet<UselessCookie>,
-    moka: Cache<u64, CookieStatus>,
+    moka: Cache<CookieAffinityKey, CookieStatus>,
 }
 
 /// Cookie actor that handles cookie distribution, collection, and status tracking using Ractor
@@ -176,15 +198,28 @@ impl CookieActor {
     fn dispatch(
         &self,
         state: &mut CookieActorState,
-        hash: Option<u64>,
+        affinity: Option<CookieAffinityKey>,
+        required_cookie_id: Option<String>,
     ) -> Result<CookieStatus, ClewdrError> {
         Self::reset(state);
-        if let Some(hash) = hash
-            && let Some(cookie) = state.moka.get(&hash)
+        if let Some(required_cookie_id) = required_cookie_id {
+            let cookie = state
+                .valid
+                .iter()
+                .find(|cookie| cookie_id(cookie) == required_cookie_id)
+                .cloned()
+                .ok_or(ClewdrError::NoCookieAvailable)?;
+            if let Some(affinity) = affinity {
+                state.moka.insert(affinity, cookie.clone());
+            }
+            return Ok(cookie);
+        }
+        if let Some(ref affinity) = affinity
+            && let Some(cookie) = state.moka.get(affinity)
             && let Some(cookie) = state.valid.iter().find(|&c| c == &cookie)
         {
             // renew moka cache
-            state.moka.insert(hash, cookie.clone());
+            state.moka.insert(affinity.clone(), cookie.clone());
             return Ok(cookie.clone());
         }
         let cookie = state
@@ -192,8 +227,8 @@ impl CookieActor {
             .pop_front()
             .ok_or(ClewdrError::NoCookieAvailable)?;
         state.valid.push_back(cookie.clone());
-        if let Some(hash) = hash {
-            state.moka.insert(hash, cookie.clone());
+        if let Some(affinity) = affinity {
+            state.moka.insert(affinity, cookie.clone());
         }
         Ok(cookie)
     }
@@ -369,8 +404,8 @@ impl Actor for CookieActor {
                 }
                 Self::reset(state);
             }
-            CookieActorMessage::Request(cache_hash, reply_port) => {
-                let result = self.dispatch(state, cache_hash);
+            CookieActorMessage::Request(affinity, required_cookie_id, reply_port) => {
+                let result = self.dispatch(state, affinity, required_cookie_id);
                 reply_port.send(result)?;
             }
             CookieActorMessage::GetStatus(reply_port) => {
@@ -435,11 +470,36 @@ impl CookieActorHandle {
 
     /// Request a cookie from the cookie actor
     pub async fn request(&self, cache_hash: Option<u64>) -> Result<CookieStatus, ClewdrError> {
-        ractor::call!(self.actor_ref, CookieActorMessage::Request, cache_hash).map_err(|e| {
-            ClewdrError::RactorError {
-                loc: Location::generate(),
-                msg: format!("Failed to communicate with CookieActor for request operation: {e}"),
-            }
+        self.request_with_affinity(cache_hash.map(CookieAffinityKey::legacy), None)
+            .await
+    }
+
+    pub async fn request_session(
+        &self,
+        session_digest: &str,
+        required_cookie_id: Option<&str>,
+    ) -> Result<CookieStatus, ClewdrError> {
+        self.request_with_affinity(
+            Some(CookieAffinityKey::session(session_digest)),
+            required_cookie_id,
+        )
+        .await
+    }
+
+    pub async fn request_with_affinity(
+        &self,
+        affinity: Option<CookieAffinityKey>,
+        required_cookie_id: Option<&str>,
+    ) -> Result<CookieStatus, ClewdrError> {
+        ractor::call!(
+            self.actor_ref,
+            CookieActorMessage::Request,
+            affinity,
+            required_cookie_id.map(str::to_owned)
+        )
+        .map_err(|e| ClewdrError::RactorError {
+            loc: Location::generate(),
+            msg: format!("Failed to communicate with CookieActor for request operation: {e}"),
         })?
     }
 
@@ -487,5 +547,42 @@ impl CookieActorHandle {
                 msg: format!("Failed to communicate with CookieActor for delete operation: {e}"),
             }
         })?
+    }
+}
+
+fn cookie_id(cookie: &CookieStatus) -> String {
+    hex::encode(Sha256::digest(cookie.cookie.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cookie(fill: char) -> CookieStatus {
+        CookieStatus::new(&format!("{}-bbbbbbAA", fill.to_string().repeat(86)), None).unwrap()
+    }
+
+    fn state(cookies: impl IntoIterator<Item = CookieStatus>) -> CookieActorState {
+        CookieActorState {
+            valid: cookies.into_iter().collect(),
+            exhausted: HashSet::new(),
+            invalid: HashSet::new(),
+            moka: Cache::builder().max_capacity(10).build(),
+        }
+    }
+
+    #[test]
+    fn required_cookie_id_overrides_an_existing_affinity() {
+        let first = cookie('a');
+        let second = cookie('c');
+        let affinity = CookieAffinityKey::session("digest");
+        let mut state = state([first.clone(), second.clone()]);
+        state.moka.insert(affinity.clone(), first);
+
+        let selected = CookieActor
+            .dispatch(&mut state, Some(affinity), Some(cookie_id(&second)))
+            .unwrap();
+
+        assert_eq!(selected, second);
     }
 }

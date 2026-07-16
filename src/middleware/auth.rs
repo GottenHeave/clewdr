@@ -2,7 +2,7 @@ use axum::extract::FromRequestParts;
 use axum_auth::AuthBearer;
 use tracing::warn;
 
-use crate::{config::CLEWDR_CONFIG, error::ClewdrError};
+use crate::{config::CLEWDR_CONFIG, error::ClewdrError, protocol::AuthPrincipal};
 
 /// Middleware guard that ensures requests have valid admin authentication
 ///
@@ -71,9 +71,12 @@ where
             .await
             .map_err(|_| ClewdrError::InvalidAuth)?;
         if !CLEWDR_CONFIG.load().user_auth(&key) {
-            warn!("Invalid Bearer key: {}", key);
+            warn!("Invalid Bearer key");
             return Err(ClewdrError::InvalidAuth);
         }
+        parts
+            .extensions
+            .insert(AuthPrincipal::for_authenticated_user());
         Ok(Self)
     }
 }
@@ -97,6 +100,9 @@ where
         if let Some(key) = parts.headers.get("x-api-key").and_then(|v| v.to_str().ok())
             && CLEWDR_CONFIG.load().user_auth(key)
         {
+            parts
+                .extensions
+                .insert(AuthPrincipal::for_authenticated_user());
             return Ok(Self);
         }
 
@@ -104,6 +110,9 @@ where
         if let Ok(AuthBearer(key)) = AuthBearer::from_request_parts(parts, &()).await
             && CLEWDR_CONFIG.load().user_auth(&key)
         {
+            parts
+                .extensions
+                .insert(AuthPrincipal::for_authenticated_user());
             return Ok(Self);
         }
 

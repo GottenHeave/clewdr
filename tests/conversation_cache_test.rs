@@ -33,10 +33,7 @@ fn make_cached(conv_uuid: &str, turns: Vec<CachedTurn>, system_hash: u64) -> Cac
 #[tokio::test]
 async fn test_sequential_requests_use_cache() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = CacheKey::legacy(0, 0);
     let sys_hash = hash_system(&None);
 
     // Request 1: full messages [u1, u2, u3]
@@ -119,10 +116,7 @@ async fn test_sequential_requests_use_cache() {
 #[tokio::test]
 async fn test_edit_scenario_fork() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = CacheKey::legacy(0, 0);
     let sys_hash = hash_system(&None);
 
     // Initial: [u1, u2, u3]
@@ -160,10 +154,7 @@ async fn test_edit_scenario_fork() {
 #[tokio::test]
 async fn test_edit_scenario_fork_multi_turn() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = CacheKey::legacy(0, 0);
     let sys_hash = hash_system(&None);
 
     // Turn 0: [u1, u2, u3], Turn 1: [u4]
@@ -222,10 +213,7 @@ async fn test_edit_scenario_fork_multi_turn() {
 #[tokio::test]
 async fn test_system_prompt_change_full_rebuild() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = CacheKey::legacy(0, 0);
     let sys_hash1 = hash_system(&Some(serde_json::json!("system v1")));
     let sys_hash2 = hash_system(&Some(serde_json::json!("system v2")));
 
@@ -251,10 +239,7 @@ async fn test_system_prompt_change_full_rebuild() {
 #[tokio::test]
 async fn test_model_switch_invalidation() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = CacheKey::legacy(0, 0);
     let sys_hash = hash_system(&None);
 
     let conv = make_cached(
@@ -280,10 +265,7 @@ async fn test_model_switch_invalidation() {
 #[tokio::test]
 async fn test_incremental_failure_fallback() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = CacheKey::legacy(0, 0);
     let sys_hash = hash_system(&None);
 
     // Set up cache
@@ -331,10 +313,7 @@ async fn test_incremental_failure_fallback() {
 #[tokio::test]
 async fn test_cookie_rotation_invalidation() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = CacheKey::legacy(0, 0);
     let sys_hash = hash_system(&None);
 
     let conv = make_cached(
@@ -357,10 +336,7 @@ async fn test_cookie_rotation_invalidation() {
 #[tokio::test]
 async fn test_cache_cleanup() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = CacheKey::legacy(0, 0);
     let sys_hash = hash_system(&None);
 
     // Create a conversation that's already expired (created 26 days ago)
@@ -387,10 +363,7 @@ async fn test_cache_cleanup() {
 #[tokio::test]
 async fn test_stream_health_flag() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = CacheKey::legacy(0, 0);
     let sys_hash = hash_system(&None);
 
     let flag = Arc::new(AtomicBool::new(false));
@@ -426,10 +399,7 @@ async fn test_stream_health_flag() {
 #[tokio::test]
 async fn test_stream_health_update_on_append() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = CacheKey::legacy(0, 0);
     let sys_hash = hash_system(&None);
 
     let flag = Arc::new(AtomicBool::new(true)); // initially healthy (stream completed)
@@ -467,14 +437,8 @@ async fn test_stream_health_update_on_append() {
 #[tokio::test]
 async fn test_cache_key_isolation() {
     let cache = ConversationCache::new();
-    let key0 = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
-    let key1 = CacheKey {
-        key_index: 1,
-        request_fingerprint: 0,
-    };
+    let key0 = CacheKey::legacy(0, 0);
+    let key1 = CacheKey::legacy(1, 0);
     let sys_hash = hash_system(&None);
 
     let conv0 = make_cached(
@@ -512,14 +476,8 @@ async fn test_cache_key_isolation() {
 #[tokio::test]
 async fn test_cache_key_request_fingerprint_isolation() {
     let cache = ConversationCache::new();
-    let chat_key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 1,
-    };
-    let diagnostic_key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 2,
-    };
+    let chat_key = CacheKey::legacy(0, 1);
+    let diagnostic_key = CacheKey::legacy(0, 2);
     let sys_hash = hash_system(&None);
 
     let chat_conv = make_cached("chat_conv", vec![], sys_hash);
@@ -540,10 +498,7 @@ async fn test_cache_key_request_fingerprint_isolation() {
 async fn test_persistent_cache_reloads_valid_entries() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("conversation_cache.json");
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = CacheKey::legacy(0, 0);
     let sys_hash = hash_system(&None);
     let cookie_id = "hashed-cookie-id";
 
@@ -578,18 +533,9 @@ async fn test_persistent_cache_skips_expired_and_invalid_entries() {
     let path = dir.path().join("conversation_cache.json");
     let sys_hash = hash_system(&None);
 
-    let expired_key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
-    let invalid_key = CacheKey {
-        key_index: 1,
-        request_fingerprint: 0,
-    };
-    let valid_key = CacheKey {
-        key_index: 2,
-        request_fingerprint: 0,
-    };
+    let expired_key = CacheKey::legacy(0, 0);
+    let invalid_key = CacheKey::legacy(1, 0);
+    let valid_key = CacheKey::legacy(2, 0);
     let cache = ConversationCache::persistent(&path).await;
 
     let mut expired = make_cached("conv_expired", vec![], sys_hash);
@@ -621,10 +567,7 @@ async fn test_persistent_cache_skips_expired_and_invalid_entries() {
 async fn test_persistent_cache_restores_stream_health() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("conversation_cache.json");
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = CacheKey::legacy(0, 0);
     let sys_hash = hash_system(&None);
 
     let cache = ConversationCache::persistent(&path).await;
