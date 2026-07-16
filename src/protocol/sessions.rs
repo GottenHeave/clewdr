@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-use crate::types::claude::{ContentBlock, Message, MessageContent, Role};
+use crate::types::claude::{ContentBlock, ImageSource, Message, MessageContent, Role};
 
 use super::{AuthPrincipal, ProtocolError};
 
@@ -338,6 +338,7 @@ impl ProtocolSessionStore {
             }
             SessionState::Committed => {}
         }
+        ensure_validated_timelines(&session.turns)?;
         if session.model_digest != model_digest || session.system_digest != system_digest {
             return Err(reuse_failed("Model or system prompt changed"));
         }
@@ -680,16 +681,21 @@ fn canonical_message_content(content: &MessageContent) -> Option<serde_json::Val
             let relevant = content
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::Text { text, .. } => (!text.trim().is_empty())
-                        .then(|| serde_json::json!({ "type": "text", "text": text.trim() })),
+                    ContentBlock::Text { text, .. } => {
+                        Some(serde_json::json!({ "type": "text", "text": text.trim() }))
+                    }
                     ContentBlock::Image { source, .. } => Some(serde_json::json!({
                         "type": "image",
                         "source": source,
                     })),
-                    ContentBlock::ImageUrl { image_url } => Some(serde_json::json!({
-                        "type": "image_url",
-                        "url": image_url.url.trim(),
-                    })),
+                    ContentBlock::ImageUrl { image_url } => {
+                        ImageSource::from_data_url(&image_url.url).map(|_| {
+                            serde_json::json!({
+                                "type": "image_url",
+                                "url": image_url.url,
+                            })
+                        })
+                    }
                     ContentBlock::Document {
                         source,
                         context,
@@ -812,6 +818,15 @@ fn validate_message_timeline(
         return Err(reuse_failed(
             "Message order or assistant content cannot be forwarded faithfully from the selected conversation parent",
         ));
+    }
+    Ok(())
+}
+
+fn ensure_validated_timelines(turns: &[SessionTurn]) -> Result<(), ProtocolError> {
+    if turns.iter().any(|turn| {
+        turn.parent_message_timeline.is_none() || turn.request_message_timeline.is_none()
+    }) {
+        return Err(legacy_session_requires_reset());
     }
     Ok(())
 }
@@ -1428,14 +1443,10 @@ mod tests {
         let error = store
             .plan(
                 &operation,
-                &["u1".into(), "u2".into()],
-                &[
-                    "user:u1".into(),
-                    format!("assistant:{}", digest_assistant_output("a1")),
-                    "user:u2".into(),
-                ],
-                "model",
-                "system",
+                &["digest-from-new-normalization".into()],
+                &["user:digest-from-new-normalization".into()],
+                "changed-model",
+                "changed-system",
             )
             .await
             .unwrap_err();
@@ -1482,6 +1493,45 @@ mod tests {
         assert_ne!(
             digest_message_timeline(&[message_with("attachment-a")]),
             digest_message_timeline(&[message_with("attachment-b")])
+        );
+    }
+
+    #[test]
+    fn image_url_digest_preserves_raw_url_identity() {
+        let message_with = |url: &str| {
+            Message::new_blocks(
+                Role::Assistant,
+                vec![ContentBlock::ImageUrl {
+                    image_url: crate::types::claude::ImageUrl { url: url.into() },
+                }],
+            )
+        };
+        let url = "data:image/png;base64,aW1hZ2U=";
+
+        assert_ne!(
+            digest_message_timeline(&[message_with(url)]),
+            digest_message_timeline(&[message_with(&format!(" {url}"))])
+        );
+    }
+
+    #[test]
+    fn empty_text_blocks_remain_message_timeline_boundaries() {
+        let with_empty = Message::new_blocks(
+            Role::Assistant,
+            vec![
+                ContentBlock::text("a"),
+                ContentBlock::text(""),
+                ContentBlock::text("b"),
+            ],
+        );
+        let without_empty = Message::new_blocks(
+            Role::Assistant,
+            vec![ContentBlock::text("a"), ContentBlock::text("b")],
+        );
+
+        assert_ne!(
+            digest_message_timeline(&[with_empty]),
+            digest_message_timeline(&[without_empty])
         );
     }
 

@@ -950,6 +950,11 @@ impl ClaudeWebState {
                             ContentBlock::Image { source, .. } => {
                                 images.push(source.clone());
                             }
+                            ContentBlock::ImageUrl { image_url } => {
+                                if let Some(source) = ImageSource::from_data_url(&image_url.url) {
+                                    images.push(source);
+                                }
+                            }
                             ContentBlock::Document { source, title, .. } => {
                                 let file_name =
                                     extract_document_file_name(source, title.as_deref());
@@ -1135,6 +1140,32 @@ mod tests {
                 "tool_search_mode": "auto",
                 "is_temporary": true,
                 "enabled_imagine": true
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn image_url_user_suffix_enters_incremental_uploads() {
+        let handle = CookieActorHandle::start().await.unwrap();
+        let state = ClaudeWebState::new(handle, ConversationCache::new());
+        let message = Message::new_blocks(
+            Role::User,
+            vec![ContentBlock::ImageUrl {
+                image_url: crate::types::claude::ImageUrl {
+                    url: "data:image/png;base64,aW1hZ2U=".into(),
+                },
+            }],
+        );
+
+        let bundled = state.bundle_user_messages(&[&message]);
+
+        assert_eq!(bundled.images.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&bundled.images[0]).unwrap(),
+            json!({
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "aW1hZ2U="
             })
         );
     }
