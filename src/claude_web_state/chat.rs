@@ -8,19 +8,23 @@ use snafu::ResultExt;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 use wreq::{Method, Response, header::ACCEPT};
 
-use super::{
-    ClaudeWebState, PendingCacheWrite,
-    transform::{
-        extract_base64_file, extract_document_file_name, extract_document_text, extract_file_id,
-    },
-};
+use super::{ClaudeWebState, PendingCacheWrite};
 use crate::{
     claude_web_state::conversation_cache::{CachedConversation, CachedTurn},
     claude_web_state::diff::{self, DiffResult, extract_user_hashes, hash_system},
     config::CLEWDR_CONFIG,
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
-    types::claude::{ContentBlock, CreateMessageParams, ImageSource, Message, MessageContent},
-    types::claude_web::request::{Attachment, CreateConversationParams, TurnMessageUuids},
+    protocol::{
+        ProtocolError, parse_session_id,
+        sessions::{
+            PendingTurn, ReusePlan, SessionLifecycle, digest_message_timeline, digest_model,
+            digest_system, digest_user_messages, selected_parent_message_timeline,
+        },
+    },
+    types::claude::{CreateMessageParams, ImageSource, Message, Role},
+    types::claude_web::request::{
+        Attachment, CreateConversationParams, TurnMessageUuids, normalize_explicit_message,
+    },
     utils::{TIME_ZONE, print_out_json},
 };
 
@@ -94,6 +98,14 @@ impl ClaudeWebState {
         &mut self,
         p: CreateMessageParams,
     ) -> Result<axum::response::Response, ClewdrError> {
+        let session_id = p
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.fields.get("user_id"))
+            .map(String::as_str);
+        if let Some(session_digest) = parse_session_id(session_id)? {
+            return self.try_protocol_chat(p, session_digest).await;
+        }
         for i in 0..CLEWDR_CONFIG.load().max_retries + 1 {
             if i > 0 {
                 info!("[RETRY] attempt: {}", i.to_string().green());
@@ -153,6 +165,285 @@ impl ClaudeWebState {
         }
         error!("Max retries exceeded");
         Err(ClewdrError::TooManyRetries)
+    }
+
+    async fn try_protocol_chat(
+        &mut self,
+        p: CreateMessageParams,
+        session_digest: String,
+    ) -> Result<axum::response::Response, ClewdrError> {
+        if p.messages
+            .iter()
+            .any(|message| message.role == Role::System)
+        {
+            return Err(ProtocolError::new(
+                http::StatusCode::BAD_REQUEST,
+                "conversation_reuse_failed",
+                "Explicit sessions require system instructions in the top-level system field",
+            )
+            .into());
+        }
+        for message in &p.messages {
+            normalize_explicit_message(message).map_err(|error| {
+                ProtocolError::new(
+                    http::StatusCode::BAD_REQUEST,
+                    "conversation_reuse_failed",
+                    error.to_string(),
+                )
+            })?;
+        }
+        let principal = self.principal.clone().ok_or(ClewdrError::InvalidAuth)?;
+        let sessions = self
+            .protocol_sessions
+            .clone()
+            .expect("protocol session store is configured");
+        let operation = sessions.try_begin(&principal, &session_digest).await?;
+        let user_entries = digest_user_messages(&p.messages);
+        if user_entries.is_empty() {
+            return Err(ProtocolError::new(
+                http::StatusCode::BAD_REQUEST,
+                "conversation_reuse_failed",
+                "A protocol request must contain user content",
+            )
+            .into());
+        }
+        let user_digests = user_entries
+            .iter()
+            .map(|(_, digest)| digest.clone())
+            .collect::<Vec<_>>();
+        let message_timeline = digest_message_timeline(&p.messages);
+        let model_digest = digest_model(&p.model);
+        let system_digest = digest_system(&p.system);
+        let plan = sessions
+            .plan(
+                &operation,
+                &user_digests,
+                &message_timeline,
+                &model_digest,
+                &system_digest,
+            )
+            .await?;
+        let existing = sessions.get(&operation).await;
+        let parent_message_timeline = match &plan {
+            ReusePlan::Create => Vec::new(),
+            _ => selected_parent_message_timeline(
+                &existing
+                    .as_ref()
+                    .expect("reuse plan requires an existing session")
+                    .turns,
+                &plan,
+            )?,
+        };
+
+        let cookie_result = self
+            .request_session_cookie(
+                &session_digest,
+                existing.as_ref().map(|session| session.cookie_id.as_str()),
+            )
+            .await;
+        let _cookie = match cookie_result {
+            Err(ClewdrError::NoCookieAvailable) if existing.is_some() => {
+                sessions.tombstone(&operation).await?;
+                return Err(ProtocolError::new(
+                    http::StatusCode::GONE,
+                    "conversation_expired",
+                    "The session Cookie is no longer available",
+                )
+                .into());
+            }
+            result => result?,
+        };
+        self.bootstrap().await?;
+        let organization_uuid = self.org_uuid.clone().ok_or(ClewdrError::UnexpectedNone {
+            msg: "Organization UUID is not set",
+        })?;
+        if let Some(existing) = &existing
+            && (existing.cookie_id != self.cookie_id()
+                || existing.organization_uuid != organization_uuid)
+        {
+            sessions.tombstone(&operation).await?;
+            return Err(ProtocolError::new(
+                http::StatusCode::GONE,
+                "conversation_expired",
+                "The persisted Cookie or organization is no longer available",
+            )
+            .into());
+        }
+
+        let human_uuid = uuid::Uuid::new_v4().to_string();
+        let assistant_uuid = uuid::Uuid::new_v4().to_string();
+        let (conversation_uuid, parent_uuid, suffix_start, replace_from_turn, is_new) = match plan {
+            ReusePlan::Create => (uuid::Uuid::new_v4().to_string(), None, 0, 0, true),
+            ReusePlan::Append {
+                parent_uuid,
+                suffix_start,
+            } => (
+                existing.as_ref().unwrap().conversation_uuid.clone(),
+                Some(parent_uuid),
+                suffix_start,
+                existing.as_ref().unwrap().turns.len(),
+                false,
+            ),
+            ReusePlan::Fork {
+                parent_uuid,
+                suffix_start,
+                replace_from_turn,
+            }
+            | ReusePlan::Regenerate {
+                parent_uuid,
+                suffix_start,
+                replace_from_turn,
+            } => (
+                existing.as_ref().unwrap().conversation_uuid.clone(),
+                parent_uuid,
+                suffix_start,
+                replace_from_turn,
+                false,
+            ),
+        };
+        self.conv_uuid = Some(conversation_uuid.clone());
+        self.last_params = Some(p.clone());
+        self.sync_model_selector_state(&p).await?;
+        let pending = PendingTurn {
+            parent_uuid_before: parent_uuid.clone(),
+            user_digests: user_digests[suffix_start..].to_vec(),
+            assistant_uuid_after: assistant_uuid.clone(),
+            replace_from_turn,
+            parent_message_timeline: Some(parent_message_timeline),
+            request_message_timeline: Some(message_timeline),
+        };
+
+        let body = if is_new {
+            sessions
+                .create_provisional(
+                    &operation,
+                    &principal,
+                    &session_digest,
+                    self.cookie_id(),
+                    organization_uuid.clone(),
+                    conversation_uuid.clone(),
+                    model_digest,
+                    system_digest,
+                    pending,
+                )
+                .await?;
+            let mut body = self
+                .transform_request(p.clone())
+                .ok_or(ClewdrError::BadRequest {
+                    msg: "Request body is empty",
+                })?;
+            body.create_conversation_params = Some(create_conversation_params(
+                &p,
+                !CLEWDR_CONFIG.load().preserve_chats,
+                self.is_pro(),
+            ));
+            body.turn_message_uuids = Some(TurnMessageUuids {
+                human_message_uuid: human_uuid,
+                assistant_message_uuid: assistant_uuid,
+            });
+            let images = body.images.drain(..).collect::<Vec<_>>();
+            body.files = match self
+                .upload_protocol_files(images, &organization_uuid, &conversation_uuid, &operation)
+                .await
+            {
+                Ok(files) => files,
+                Err(error) => {
+                    sessions.mark_uncertain(&operation).await?;
+                    return Err(error);
+                }
+            };
+            serde_json::to_value(body)?
+        } else {
+            sessions.start_existing(&operation, pending).await?;
+            let user_messages = user_entries[suffix_start..]
+                .iter()
+                .map(|(message_index, _)| &p.messages[*message_index])
+                .collect::<Vec<_>>();
+            let bundled = self.bundle_explicit_user_messages(&user_messages)?;
+            let files = match self
+                .upload_protocol_files(
+                    bundled.images.clone(),
+                    &organization_uuid,
+                    &conversation_uuid,
+                    &operation,
+                )
+                .await
+            {
+                Ok(files) => files,
+                Err(error) => {
+                    sessions
+                        .restore_committed_before_completion(&operation)
+                        .await?;
+                    return Err(error);
+                }
+            };
+            let mut body = json!({
+                "prompt": bundled.prompt,
+                "timezone": TIME_ZONE.to_string(),
+                "turn_message_uuids": {
+                    "human_message_uuid": human_uuid,
+                    "assistant_message_uuid": assistant_uuid,
+                },
+                "attachments": bundled.attachments,
+                "files": files,
+                "rendering_mode": if p.stream.unwrap_or_default() { "messages" } else { "raw" },
+            });
+            if let Some(parent_uuid) = parent_uuid {
+                body["parent_message_uuid"] = json!(parent_uuid);
+            }
+            if self.is_pro() {
+                body["model"] = json!(p.model);
+            }
+            if let Some(effort) = p.web_thinking_effort() {
+                body["effort"] = json!(effort);
+            }
+            if let Some(mode) = p.web_thinking_mode() {
+                body["thinking_mode"] = json!(mode);
+            }
+            body
+        };
+        print_out_json(&body, "claude_web_protocol_req.json");
+        let endpoint = self
+            .endpoint
+            .join(&format!(
+                "api/organizations/{organization_uuid}/chat_conversations/{conversation_uuid}/completion"
+            ))
+            .expect("URL path components are generated UUIDs");
+        let response = self
+            .build_request(Method::POST, endpoint)
+            .json(&body)
+            .header(ACCEPT, "text/event-stream")
+            .send()
+            .await
+            .context(WreqSnafu {
+                msg: "Failed to send protocol chat request",
+            });
+        let response = match response {
+            Ok(response) => match response.check_claude().await {
+                Ok(response) => response,
+                Err(ClewdrError::ClaudeHttpError { code, .. })
+                    if code == http::StatusCode::NOT_FOUND || code == http::StatusCode::GONE =>
+                {
+                    sessions.tombstone(&operation).await?;
+                    return Err(ProtocolError::new(
+                        http::StatusCode::GONE,
+                        "conversation_expired",
+                        "The upstream conversation no longer exists",
+                    )
+                    .into());
+                }
+                Err(error) => {
+                    sessions.mark_uncertain(&operation).await?;
+                    return Err(error);
+                }
+            },
+            Err(error) => {
+                sessions.mark_uncertain(&operation).await?;
+                return Err(error);
+            }
+        };
+        self.protocol_lifecycle = Some(SessionLifecycle::new(sessions, operation));
+        self.transform_response(response).await
     }
 
     /// Main entry point — tries cache reuse, falls back to full paste
@@ -411,7 +702,7 @@ impl ClaudeWebState {
             .collect();
 
         // Bundle user messages into prompt + optional attachment
-        let bundled = self.bundle_user_messages(&new_user_msgs);
+        let bundled = self.bundle_user_messages(&new_user_msgs)?;
 
         // Generate turn UUIDs
         let human_uuid = uuid::Uuid::new_v4().to_string();
@@ -492,7 +783,7 @@ impl ClaudeWebState {
             .collect();
 
         // Bundle all remaining user messages
-        let bundled = self.bundle_user_messages(&remaining_user_msgs);
+        let bundled = self.bundle_user_messages(&remaining_user_msgs)?;
 
         let human_uuid = uuid::Uuid::new_v4().to_string();
         let assistant_uuid = uuid::Uuid::new_v4().to_string();
@@ -644,85 +935,72 @@ impl ClaudeWebState {
     }
 
     /// Merge user messages into prompt or attachment based on length
-    fn bundle_user_messages(&self, user_msgs: &[&Message]) -> BundledMessages {
+    fn bundle_user_messages(
+        &self,
+        user_msgs: &[&Message],
+    ) -> Result<BundledMessages, ProtocolError> {
+        self.bundle_normalized_user_messages(user_msgs, "\n\n", true)
+    }
+
+    fn bundle_explicit_user_messages(
+        &self,
+        user_msgs: &[&Message],
+    ) -> Result<BundledMessages, ProtocolError> {
+        self.bundle_normalized_user_messages(user_msgs, "\n", false)
+    }
+
+    fn bundle_normalized_user_messages(
+        &self,
+        user_msgs: &[&Message],
+        message_separator: &str,
+        attach_long_text: bool,
+    ) -> Result<BundledMessages, ProtocolError> {
         let mut texts: Vec<String> = vec![];
         let mut attachments: Vec<Attachment> = vec![];
         let mut images: Vec<ImageSource> = vec![];
 
         for msg in user_msgs {
-            match &msg.content {
-                MessageContent::Text { content } => {
-                    texts.push(content.trim().to_string());
-                }
-                MessageContent::Blocks { content } => {
-                    for block in content {
-                        match block {
-                            ContentBlock::Text { text, .. } => {
-                                texts.push(text.trim().to_string());
-                            }
-                            ContentBlock::Image { source, .. } => {
-                                images.push(source.clone());
-                            }
-                            ContentBlock::Document { source, title, .. } => {
-                                let file_name =
-                                    extract_document_file_name(source, title.as_deref());
-                                if let Some(text) = extract_document_text(source) {
-                                    attachments.push(match file_name {
-                                        Some(file_name) => {
-                                            Attachment::new_with_file_name(text, file_name)
-                                        }
-                                        None => Attachment::new(text),
-                                    });
-                                } else if let Some(file_id) = extract_file_id(source) {
-                                    images.push(ImageSource::File { file_id });
-                                } else if let Some((media_type, data)) = extract_base64_file(source)
-                                {
-                                    images.push(ImageSource::Base64 {
-                                        media_type,
-                                        data,
-                                        file_name,
-                                    });
-                                }
-                            }
-                            ContentBlock::ContainerUpload { file_id, .. } => {
-                                images.push(ImageSource::File {
-                                    file_id: file_id.clone(),
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+            let normalized = normalize_explicit_message(msg).map_err(|error| {
+                ProtocolError::new(
+                    http::StatusCode::BAD_REQUEST,
+                    "conversation_reuse_failed",
+                    error.to_string(),
+                )
+            })?;
+            if !normalized.text_blocks.is_empty() {
+                texts.push(normalized.text_blocks.join("\n"));
             }
+            attachments.extend(normalized.attachments);
+            images.extend(normalized.images);
         }
 
-        let combined = texts.join("\n\n");
+        let combined = texts.join(message_separator);
 
         // Threshold: if combined text is under ~4000 chars, use prompt directly
         // Otherwise put it in an attachment
         const PROMPT_THRESHOLD: usize = 4000;
 
-        if combined.len() <= PROMPT_THRESHOLD {
+        if !attach_long_text || combined.len() <= PROMPT_THRESHOLD {
             let mut prompt = combined;
             if prompt.is_empty() && (!attachments.is_empty() || !images.is_empty()) {
                 prompt = "Please answer using the attached content.".to_string();
             }
-            BundledMessages {
+            Ok(BundledMessages {
                 prompt,
                 attachments,
                 images,
-            }
+            })
         } else {
             attachments.push(Attachment::new(combined));
             let mut p_str = CLEWDR_CONFIG.load().custom_prompt.clone();
             if p_str.is_empty() {
                 p_str = "Please answer using the attached content.".to_string();
             }
-            BundledMessages {
+            Ok(BundledMessages {
                 prompt: p_str,
                 attachments,
                 images,
-            }
+            })
         }
     }
 
@@ -771,7 +1049,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::types::claude::{OutputConfig, OutputEffort, Role, Thinking, ThinkingMode};
+    use crate::{
+        claude_web_state::conversation_cache::ConversationCache,
+        protocol::{AuthPrincipal, sessions::ProtocolSessionStore},
+        services::cookie_actor::CookieActorHandle,
+        types::claude::{ContentBlock, OutputConfig, OutputEffort, Role, Thinking, ThinkingMode},
+    };
 
     #[test]
     fn model_selector_state_body_uses_effort_and_mode_shape() {
@@ -845,5 +1128,302 @@ mod tests {
                 "enabled_imagine": true
             })
         );
+    }
+
+    #[tokio::test]
+    async fn image_url_user_suffix_enters_incremental_uploads() {
+        let handle = CookieActorHandle::start().await.unwrap();
+        let state = ClaudeWebState::new(handle, ConversationCache::new());
+        let message = Message::new_blocks(
+            Role::User,
+            vec![ContentBlock::ImageUrl {
+                image_url: crate::types::claude::ImageUrl {
+                    url: "data:image/png;base64,aW1hZ2U=".into(),
+                },
+            }],
+        );
+
+        let bundled = state.bundle_user_messages(&[&message]).unwrap();
+
+        assert_eq!(bundled.images.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&bundled.images[0]).unwrap(),
+            json!({
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "aW1hZ2U="
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn unforwardable_explicit_content_fails_before_cookie_or_upstream() {
+        let invalid_messages = [
+            Message::new_text(Role::User, "   "),
+            Message::new_blocks(
+                Role::User,
+                vec![
+                    serde_json::from_value(json!({
+                        "type": "document",
+                        "source": { "type": "url", "url": "https://example.com/document" }
+                    }))
+                    .unwrap(),
+                ],
+            ),
+            Message::new_blocks(
+                Role::User,
+                vec![
+                    serde_json::from_value(json!({
+                        "type": "document",
+                        "source": { "type": "text", "data": "   " }
+                    }))
+                    .unwrap(),
+                ],
+            ),
+            Message::new_blocks(
+                Role::User,
+                vec![ContentBlock::Image {
+                    source: ImageSource::Url {
+                        url: "https://example.com/image.png".into(),
+                    },
+                    cache_control: None,
+                }],
+            ),
+        ];
+        let handle = CookieActorHandle::start().await.unwrap();
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
+        state.principal = Some(AuthPrincipal::for_authenticated_user());
+        state.protocol_sessions = Some(ProtocolSessionStore::memory());
+
+        for message in invalid_messages {
+            let error = state
+                .try_protocol_chat(
+                    CreateMessageParams {
+                        model: "claude-sonnet-4-6".into(),
+                        messages: vec![message],
+                        ..Default::default()
+                    },
+                    "fc".repeat(32),
+                )
+                .await
+                .unwrap_err();
+            let ClewdrError::Protocol { source } = error else {
+                panic!("expected protocol validation error");
+            };
+            assert_eq!(source.status, http::StatusCode::BAD_REQUEST);
+            assert_eq!(source.code, "conversation_reuse_failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_text_blocks_preserve_full_merge_boundaries() {
+        let handle = CookieActorHandle::start().await.unwrap();
+        let state = ClaudeWebState::new(handle, ConversationCache::new());
+        let message = Message::new_blocks(
+            Role::User,
+            vec![
+                ContentBlock::text("a"),
+                ContentBlock::text(""),
+                ContentBlock::text("b"),
+            ],
+        );
+
+        let bundled = state.bundle_user_messages(&[&message]).unwrap();
+
+        assert_eq!(bundled.prompt, "a\n\nb");
+    }
+
+    #[tokio::test]
+    async fn explicit_create_and_regenerate_build_equivalent_user_content() {
+        let handle = CookieActorHandle::start().await.unwrap();
+        let state = ClaudeWebState::new(handle, ConversationCache::new());
+        let messages = vec![
+            Message::new_blocks(
+                Role::User,
+                vec![
+                    ContentBlock::text("u1"),
+                    serde_json::from_value(json!({
+                        "type": "document",
+                        "source": { "type": "text", "data": "notes" },
+                        "title": "notes.txt"
+                    }))
+                    .unwrap(),
+                ],
+            ),
+            Message::new_blocks(
+                Role::User,
+                vec![
+                    ContentBlock::text("u2".repeat(2100)),
+                    ContentBlock::Image {
+                        source: ImageSource::Base64 {
+                            media_type: "image/png".into(),
+                            data: "aW1hZ2U=".into(),
+                            file_name: Some("image.png".into()),
+                        },
+                        cache_control: None,
+                    },
+                ],
+            ),
+        ];
+        let create = state
+            .transform_request(CreateMessageParams {
+                model: "claude-sonnet-4-6".into(),
+                messages: messages.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        let message_refs = messages.iter().collect::<Vec<_>>();
+        let regenerate = state.bundle_explicit_user_messages(&message_refs).unwrap();
+
+        assert_eq!(create.prompt, regenerate.prompt);
+        assert_eq!(
+            serde_json::to_value(&create.attachments).unwrap(),
+            serde_json::to_value(&regenerate.attachments).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&create.images).unwrap(),
+            serde_json::to_value(&regenerate.images).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn regenerate_with_assistant_prefill_fails_before_upstream_request() {
+        let params = CreateMessageParams {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![
+                Message::new_text(Role::User, "u1"),
+                Message::new_text(Role::Assistant, "prefill"),
+            ],
+            ..Default::default()
+        };
+        let principal = AuthPrincipal::for_authenticated_user();
+        let session_digest = "fa".repeat(32);
+        let sessions = ProtocolSessionStore::memory();
+        let operation = sessions
+            .try_begin(&principal, &session_digest)
+            .await
+            .unwrap();
+        let user_digests = digest_user_messages(&params.messages)
+            .into_iter()
+            .map(|(_, digest)| digest)
+            .collect::<Vec<_>>();
+        sessions
+            .create_provisional(
+                &operation,
+                &principal,
+                &session_digest,
+                "cookie".into(),
+                "org".into(),
+                "conv".into(),
+                digest_model(&params.model),
+                digest_system(&params.system),
+                PendingTurn {
+                    parent_uuid_before: None,
+                    user_digests,
+                    assistant_uuid_after: "assistant".into(),
+                    replace_from_turn: 0,
+                    parent_message_timeline: Some(vec![]),
+                    request_message_timeline: Some(digest_message_timeline(&params.messages)),
+                },
+            )
+            .await
+            .unwrap();
+        sessions
+            .commit(
+                &operation,
+                Some(crate::protocol::sessions::digest_assistant_output(
+                    "generated",
+                )),
+            )
+            .await
+            .unwrap();
+        drop(operation);
+
+        let handle = CookieActorHandle::start().await.unwrap();
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
+        state.principal = Some(principal);
+        state.protocol_sessions = Some(sessions);
+        let error = state
+            .try_protocol_chat(params, session_digest)
+            .await
+            .unwrap_err();
+        let ClewdrError::Protocol { source } = error else {
+            panic!("expected protocol validation error");
+        };
+        assert_eq!(source.status, http::StatusCode::CONFLICT);
+        assert_eq!(source.code, "conversation_reuse_failed");
+    }
+
+    #[tokio::test]
+    async fn message_system_role_is_rejected_before_parent_reuse() {
+        let principal = AuthPrincipal::for_authenticated_user();
+        let session_digest = "fb".repeat(32);
+        let sessions = ProtocolSessionStore::memory();
+        let operation = sessions
+            .try_begin(&principal, &session_digest)
+            .await
+            .unwrap();
+        sessions
+            .create_provisional(
+                &operation,
+                &principal,
+                &session_digest,
+                "cookie".into(),
+                "org".into(),
+                "conv".into(),
+                digest_model("claude-sonnet-4-6"),
+                digest_system(&None),
+                PendingTurn {
+                    parent_uuid_before: None,
+                    user_digests: vec![
+                        digest_user_messages(&[Message::new_text(Role::User, "u1")])[0]
+                            .1
+                            .clone(),
+                    ],
+                    assistant_uuid_after: "assistant".into(),
+                    replace_from_turn: 0,
+                    parent_message_timeline: Some(vec![]),
+                    request_message_timeline: Some(digest_message_timeline(&[Message::new_text(
+                        Role::User,
+                        "u1",
+                    )])),
+                },
+            )
+            .await
+            .unwrap();
+        sessions
+            .commit(
+                &operation,
+                Some(crate::protocol::sessions::digest_assistant_output(
+                    "generated",
+                )),
+            )
+            .await
+            .unwrap();
+        drop(operation);
+        let params = CreateMessageParams {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![
+                Message::new_text(Role::System, "changed system instruction"),
+                Message::new_text(Role::User, "u1"),
+                Message::new_text(Role::Assistant, "generated"),
+                Message::new_text(Role::User, "u2"),
+            ],
+            ..Default::default()
+        };
+        let handle = CookieActorHandle::start().await.unwrap();
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
+        state.principal = Some(principal);
+        state.protocol_sessions = Some(sessions);
+
+        let error = state
+            .try_protocol_chat(params, session_digest)
+            .await
+            .unwrap_err();
+        let ClewdrError::Protocol { source } = error else {
+            panic!("expected protocol validation error");
+        };
+        assert_eq!(source.status, http::StatusCode::BAD_REQUEST);
+        assert_eq!(source.code, "conversation_reuse_failed");
     }
 }

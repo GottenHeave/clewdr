@@ -158,6 +158,10 @@ pub enum ClewdrError {
     TimestampError { timestamp: i64 },
     #[snafu(display("Key/Password Invalid"))]
     InvalidAuth,
+    #[snafu(transparent)]
+    Protocol {
+        source: crate::protocol::ProtocolError,
+    },
     #[snafu(whatever, display("{}: {}", message, source.as_ref().map_or_else(|| "Unknown error".into(), |e| e.to_string())))]
     Whatever {
         message: String,
@@ -190,6 +194,7 @@ impl IntoResponse for ClewdrError {
             ClewdrError::ClaudeHttpError { code, inner } => {
                 return (code, Json(ClaudeError { error: inner })).into_response();
             }
+            ClewdrError::Protocol { source } => return source.into_response(),
             ClewdrError::TestMessage => {
                 return (
                     StatusCode::OK,

@@ -18,6 +18,11 @@ use crate::{
     config::{CLAUDE_ENDPOINT, CLEWDR_CONFIG, CookieStatus, Reason},
     error::{ClewdrError, WreqSnafu},
     middleware::claude::ClaudeApiFormat,
+    protocol::{
+        AuthPrincipal,
+        files::StagedFileStore,
+        sessions::{ProtocolSessionStore, SessionLifecycle},
+    },
     services::cookie_actor::CookieActorHandle,
     types::claude::{CreateMessageParams, Usage},
     utils::build_http_client,
@@ -77,6 +82,10 @@ pub struct ClaudeWebState {
     /// Set to true when the SSE stream completes with a proper stop signal.
     /// Checked on next cache reuse attempt.
     pub stream_health_flag: Option<Arc<AtomicBool>>,
+    pub principal: Option<AuthPrincipal>,
+    pub staged_files: Option<Arc<StagedFileStore>>,
+    pub protocol_sessions: Option<Arc<ProtocolSessionStore>>,
+    pub protocol_lifecycle: Option<SessionLifecycle>,
 }
 
 impl ClaudeWebState {
@@ -100,6 +109,10 @@ impl ClaudeWebState {
             conv_cache,
             pending_cache_write: None,
             stream_health_flag: None,
+            principal: None,
+            staged_files: None,
+            protocol_sessions: None,
+            protocol_lifecycle: None,
         }
     }
 
@@ -161,6 +174,22 @@ impl ClaudeWebState {
     /// Updates the internal state with the new cookie and proxy configuration
     pub async fn request_cookie(&mut self) -> Result<CookieStatus, ClewdrError> {
         let res = self.cookie_actor_handle.request(None).await?;
+        self.apply_cookie(res)
+    }
+
+    pub async fn request_session_cookie(
+        &mut self,
+        session_digest: &str,
+        required_cookie_id: Option<&str>,
+    ) -> Result<CookieStatus, ClewdrError> {
+        let res = self
+            .cookie_actor_handle
+            .request_session(session_digest, required_cookie_id)
+            .await?;
+        self.apply_cookie(res)
+    }
+
+    fn apply_cookie(&mut self, res: CookieStatus) -> Result<CookieStatus, ClewdrError> {
         self.cookie = Some(res.to_owned());
         // Always pull latest proxy/endpoint before building the client
         self.proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();

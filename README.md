@@ -22,11 +22,20 @@ It keeps resource usage low, serves OpenAI-style endpoints, and ships with a Lep
 | Service | Endpoint |
 |---------|----------|
 | Claude.ai | `http://127.0.0.1:8484/v1/messages` |
+| Claude.ai staged files | `http://127.0.0.1:8484/v1/files` |
+| Claude.ai session reset | `http://127.0.0.1:8484/v1/sessions/reset` |
 | Claude.ai OpenAI compatible | `http://127.0.0.1:8484/v1/chat/completions` |
 | Claude Code | `http://127.0.0.1:8484/code/v1/messages` |
 | Claude Code OpenAI compatible | `http://127.0.0.1:8484/code/v1/chat/completions` |
 
-Streaming responses work on every endpoint.
+Streaming responses work on the Messages and chat completion endpoints.
+
+Clients can stage one multipart `file` through `/v1/files` and reference the
+returned `file_clewdr_v1_...` ID from Messages. Versioned Cherry sessions use
+`metadata.user_id` values beginning with `cherry_topic_v1_`; ClewdR then reuses
+the bound Cookie, Claude Web conversation, parent message, and conversation-
+scoped upstream file IDs. A `409` requires explicit user recovery. A `410` may
+be recovered by calling `/v1/sessions/reset` once before retrying.
 
 ## Quick Start
 
