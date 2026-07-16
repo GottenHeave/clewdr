@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-use crate::types::claude::{ContentBlock, ImageSource, Message, MessageContent, Role};
+use crate::types::claude::{Message, Role};
+use crate::types::claude_web::request::normalize_explicit_message;
 
 use super::{AuthPrincipal, ProtocolError};
 
@@ -661,74 +662,17 @@ fn digest_user_message(message: &Message) -> Option<String> {
 }
 
 fn digest_message_content(message: &Message) -> Option<String> {
-    let content = canonical_message_content(&message.content)?;
-    Some(digest_json(&content))
-}
-
-fn canonical_message_content(content: &MessageContent) -> Option<serde_json::Value> {
-    let content = match content {
-        MessageContent::Text { content } => {
-            let text = content.trim();
-            if text.is_empty() {
-                return None;
-            }
-            vec![serde_json::json!({
-                "type": "text",
-                "text": text,
-            })]
-        }
-        MessageContent::Blocks { content } => {
-            let relevant = content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text, .. } => {
-                        Some(serde_json::json!({ "type": "text", "text": text.trim() }))
-                    }
-                    ContentBlock::Image { source, .. } => Some(serde_json::json!({
-                        "type": "image",
-                        "source": source,
-                    })),
-                    ContentBlock::ImageUrl { image_url } => {
-                        ImageSource::from_data_url(&image_url.url).map(|_| {
-                            serde_json::json!({
-                                "type": "image_url",
-                                "url": image_url.url,
-                            })
-                        })
-                    }
-                    ContentBlock::Document {
-                        source,
-                        context,
-                        title,
-                        ..
-                    } => Some(serde_json::json!({
-                        "type": "document",
-                        "source": source,
-                        "context": context,
-                        "title": title,
-                    })),
-                    ContentBlock::ContainerUpload { file_id, .. } => Some(serde_json::json!({
-                        "type": "container_upload",
-                        "file_id": file_id,
-                    })),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            if relevant.is_empty() {
-                return None;
-            }
-            relevant
-        }
-    };
-    Some(serde_json::Value::Array(content))
+    normalize_explicit_message(message)
+        .ok()
+        .map(|normalized| digest_json(&normalized.identity))
 }
 
 pub fn digest_assistant_output(text: &str) -> String {
-    let content = canonical_message_content(&MessageContent::Text {
-        content: text.to_owned(),
-    })
-    .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
-    digest_json(&content)
+    let message = Message::new_text(Role::Assistant, text);
+    let identity = normalize_explicit_message(&message)
+        .map(|normalized| normalized.identity)
+        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+    digest_json(&identity)
 }
 
 pub fn session_ref(principal: &str, session_digest: &str) -> String {
@@ -952,6 +896,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::files::StagedFileStore;
+    use crate::types::claude::ContentBlock;
 
     fn turn(parent: Option<&str>, users: &[&str], assistant: &str) -> SessionTurn {
         SessionTurn {

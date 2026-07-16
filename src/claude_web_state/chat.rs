@@ -8,12 +8,7 @@ use snafu::ResultExt;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 use wreq::{Method, Response, header::ACCEPT};
 
-use super::{
-    ClaudeWebState, PendingCacheWrite,
-    transform::{
-        extract_base64_file, extract_document_file_name, extract_document_text, extract_file_id,
-    },
-};
+use super::{ClaudeWebState, PendingCacheWrite};
 use crate::{
     claude_web_state::conversation_cache::{CachedConversation, CachedTurn},
     claude_web_state::diff::{self, DiffResult, extract_user_hashes, hash_system},
@@ -26,10 +21,10 @@ use crate::{
             digest_system, digest_user_messages, selected_parent_message_timeline,
         },
     },
-    types::claude::{
-        ContentBlock, CreateMessageParams, ImageSource, Message, MessageContent, Role,
+    types::claude::{CreateMessageParams, ImageSource, Message, Role},
+    types::claude_web::request::{
+        Attachment, CreateConversationParams, TurnMessageUuids, normalize_explicit_message,
     },
-    types::claude_web::request::{Attachment, CreateConversationParams, TurnMessageUuids},
     utils::{TIME_ZONE, print_out_json},
 };
 
@@ -187,6 +182,15 @@ impl ClaudeWebState {
                 "Explicit sessions require system instructions in the top-level system field",
             )
             .into());
+        }
+        for message in &p.messages {
+            normalize_explicit_message(message).map_err(|error| {
+                ProtocolError::new(
+                    http::StatusCode::BAD_REQUEST,
+                    "conversation_reuse_failed",
+                    error.to_string(),
+                )
+            })?;
         }
         let principal = self.principal.clone().ok_or(ClewdrError::InvalidAuth)?;
         let sessions = self
@@ -355,7 +359,7 @@ impl ClaudeWebState {
                 .iter()
                 .map(|(message_index, _)| &p.messages[*message_index])
                 .collect::<Vec<_>>();
-            let bundled = self.bundle_user_messages(&user_messages);
+            let bundled = self.bundle_user_messages(&user_messages)?;
             let files = match self
                 .upload_protocol_files(
                     bundled.images.clone(),
@@ -698,7 +702,7 @@ impl ClaudeWebState {
             .collect();
 
         // Bundle user messages into prompt + optional attachment
-        let bundled = self.bundle_user_messages(&new_user_msgs);
+        let bundled = self.bundle_user_messages(&new_user_msgs)?;
 
         // Generate turn UUIDs
         let human_uuid = uuid::Uuid::new_v4().to_string();
@@ -779,7 +783,7 @@ impl ClaudeWebState {
             .collect();
 
         // Bundle all remaining user messages
-        let bundled = self.bundle_user_messages(&remaining_user_msgs);
+        let bundled = self.bundle_user_messages(&remaining_user_msgs)?;
 
         let human_uuid = uuid::Uuid::new_v4().to_string();
         let assistant_uuid = uuid::Uuid::new_v4().to_string();
@@ -931,61 +935,27 @@ impl ClaudeWebState {
     }
 
     /// Merge user messages into prompt or attachment based on length
-    fn bundle_user_messages(&self, user_msgs: &[&Message]) -> BundledMessages {
+    fn bundle_user_messages(
+        &self,
+        user_msgs: &[&Message],
+    ) -> Result<BundledMessages, ProtocolError> {
         let mut texts: Vec<String> = vec![];
         let mut attachments: Vec<Attachment> = vec![];
         let mut images: Vec<ImageSource> = vec![];
 
         for msg in user_msgs {
-            match &msg.content {
-                MessageContent::Text { content } => {
-                    texts.push(content.trim().to_string());
-                }
-                MessageContent::Blocks { content } => {
-                    for block in content {
-                        match block {
-                            ContentBlock::Text { text, .. } => {
-                                texts.push(text.trim().to_string());
-                            }
-                            ContentBlock::Image { source, .. } => {
-                                images.push(source.clone());
-                            }
-                            ContentBlock::ImageUrl { image_url } => {
-                                if let Some(source) = ImageSource::from_data_url(&image_url.url) {
-                                    images.push(source);
-                                }
-                            }
-                            ContentBlock::Document { source, title, .. } => {
-                                let file_name =
-                                    extract_document_file_name(source, title.as_deref());
-                                if let Some(text) = extract_document_text(source) {
-                                    attachments.push(match file_name {
-                                        Some(file_name) => {
-                                            Attachment::new_with_file_name(text, file_name)
-                                        }
-                                        None => Attachment::new(text),
-                                    });
-                                } else if let Some(file_id) = extract_file_id(source) {
-                                    images.push(ImageSource::File { file_id });
-                                } else if let Some((media_type, data)) = extract_base64_file(source)
-                                {
-                                    images.push(ImageSource::Base64 {
-                                        media_type,
-                                        data,
-                                        file_name,
-                                    });
-                                }
-                            }
-                            ContentBlock::ContainerUpload { file_id, .. } => {
-                                images.push(ImageSource::File {
-                                    file_id: file_id.clone(),
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+            let normalized = normalize_explicit_message(msg).map_err(|error| {
+                ProtocolError::new(
+                    http::StatusCode::BAD_REQUEST,
+                    "conversation_reuse_failed",
+                    error.to_string(),
+                )
+            })?;
+            if !normalized.text_blocks.is_empty() {
+                texts.push(normalized.text_blocks.join("\n"));
             }
+            attachments.extend(normalized.attachments);
+            images.extend(normalized.images);
         }
 
         let combined = texts.join("\n\n");
@@ -999,22 +969,22 @@ impl ClaudeWebState {
             if prompt.is_empty() && (!attachments.is_empty() || !images.is_empty()) {
                 prompt = "Please answer using the attached content.".to_string();
             }
-            BundledMessages {
+            Ok(BundledMessages {
                 prompt,
                 attachments,
                 images,
-            }
+            })
         } else {
             attachments.push(Attachment::new(combined));
             let mut p_str = CLEWDR_CONFIG.load().custom_prompt.clone();
             if p_str.is_empty() {
                 p_str = "Please answer using the attached content.".to_string();
             }
-            BundledMessages {
+            Ok(BundledMessages {
                 prompt: p_str,
                 attachments,
                 images,
-            }
+            })
         }
     }
 
@@ -1067,7 +1037,7 @@ mod tests {
         claude_web_state::conversation_cache::ConversationCache,
         protocol::{AuthPrincipal, sessions::ProtocolSessionStore},
         services::cookie_actor::CookieActorHandle,
-        types::claude::{OutputConfig, OutputEffort, Role, Thinking, ThinkingMode},
+        types::claude::{ContentBlock, OutputConfig, OutputEffort, Role, Thinking, ThinkingMode},
     };
 
     #[test]
@@ -1157,7 +1127,7 @@ mod tests {
             }],
         );
 
-        let bundled = state.bundle_user_messages(&[&message]);
+        let bundled = state.bundle_user_messages(&[&message]).unwrap();
 
         assert_eq!(bundled.images.len(), 1);
         assert_eq!(
@@ -1168,6 +1138,83 @@ mod tests {
                 "data": "aW1hZ2U="
             })
         );
+    }
+
+    #[tokio::test]
+    async fn unforwardable_explicit_content_fails_before_cookie_or_upstream() {
+        let invalid_messages = [
+            Message::new_text(Role::User, "   "),
+            Message::new_blocks(
+                Role::User,
+                vec![
+                    serde_json::from_value(json!({
+                        "type": "document",
+                        "source": { "type": "url", "url": "https://example.com/document" }
+                    }))
+                    .unwrap(),
+                ],
+            ),
+            Message::new_blocks(
+                Role::User,
+                vec![
+                    serde_json::from_value(json!({
+                        "type": "document",
+                        "source": { "type": "text", "data": "   " }
+                    }))
+                    .unwrap(),
+                ],
+            ),
+            Message::new_blocks(
+                Role::User,
+                vec![ContentBlock::Image {
+                    source: ImageSource::Url {
+                        url: "https://example.com/image.png".into(),
+                    },
+                    cache_control: None,
+                }],
+            ),
+        ];
+        let handle = CookieActorHandle::start().await.unwrap();
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
+        state.principal = Some(AuthPrincipal::for_authenticated_user());
+        state.protocol_sessions = Some(ProtocolSessionStore::memory());
+
+        for message in invalid_messages {
+            let error = state
+                .try_protocol_chat(
+                    CreateMessageParams {
+                        model: "claude-sonnet-4-6".into(),
+                        messages: vec![message],
+                        ..Default::default()
+                    },
+                    "fc".repeat(32),
+                )
+                .await
+                .unwrap_err();
+            let ClewdrError::Protocol { source } = error else {
+                panic!("expected protocol validation error");
+            };
+            assert_eq!(source.status, http::StatusCode::BAD_REQUEST);
+            assert_eq!(source.code, "conversation_reuse_failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_text_blocks_preserve_full_merge_boundaries() {
+        let handle = CookieActorHandle::start().await.unwrap();
+        let state = ClaudeWebState::new(handle, ConversationCache::new());
+        let message = Message::new_blocks(
+            Role::User,
+            vec![
+                ContentBlock::text("a"),
+                ContentBlock::text(""),
+                ContentBlock::text("b"),
+            ],
+        );
+
+        let bundled = state.bundle_user_messages(&[&message]).unwrap();
+
+        assert_eq!(bundled.prompt, "a\n\nb");
     }
 
     #[tokio::test]
