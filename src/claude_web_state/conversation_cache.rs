@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -261,6 +263,8 @@ pub struct ConversationCache {
     persist_path: Option<Arc<PathBuf>>,
     persist_lock: Arc<Mutex<()>>,
     explicit_mutation_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    persistence_attempts: Arc<AtomicUsize>,
 }
 
 impl ConversationCache {
@@ -271,6 +275,8 @@ impl ConversationCache {
             persist_path: None,
             persist_lock: Arc::new(Mutex::new(())),
             explicit_mutation_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            persistence_attempts: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -301,6 +307,8 @@ impl ConversationCache {
             persist_path: Some(Arc::new(persist_path)),
             persist_lock: Arc::new(Mutex::new(())),
             explicit_mutation_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            persistence_attempts: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -377,6 +385,7 @@ impl ConversationCache {
         conv: CachedConversation,
     ) -> Result<(), ProtocolError> {
         let _mutation = self.explicit_mutation_lock.lock().await;
+        let _persist = self.persist_lock.lock().await;
         let stored_key = StoredCacheKey::ExplicitSession(key.clone());
         let previous = {
             let mut map = self.inner.lock().await;
@@ -385,7 +394,8 @@ impl ConversationCache {
             }
             map.insert(stored_key.clone(), conv)
         };
-        self.persist_explicit_change(stored_key, previous).await
+        self.persist_explicit_change_locked(stored_key, previous)
+            .await
     }
 
     async fn set_stored(&self, key: StoredCacheKey, conv: CachedConversation) {
@@ -402,6 +412,7 @@ impl ConversationCache {
         pending: PendingExplicitTurn,
     ) -> Result<(), ProtocolError> {
         let _mutation = self.explicit_mutation_lock.lock().await;
+        let _persist = self.persist_lock.lock().await;
         let stored_key = StoredCacheKey::ExplicitSession(key.clone());
         let previous = {
             let mut map = self.inner.lock().await;
@@ -418,7 +429,7 @@ impl ConversationCache {
             conversation.last_used = Utc::now();
             previous
         };
-        self.persist_explicit_change(stored_key, Some(previous))
+        self.persist_explicit_change_locked(stored_key, Some(previous))
             .await
     }
 
@@ -428,6 +439,7 @@ impl ConversationCache {
         assistant_digest_after: Option<String>,
     ) -> Result<(), ProtocolError> {
         let _mutation = self.explicit_mutation_lock.lock().await;
+        let _persist = self.persist_lock.lock().await;
         let stored_key = StoredCacheKey::ExplicitSession(key.clone());
         let previous = {
             let mut map = self.inner.lock().await;
@@ -461,7 +473,7 @@ impl ConversationCache {
             conversation.last_used = Utc::now();
             previous
         };
-        self.persist_explicit_change(stored_key, Some(previous))
+        self.persist_explicit_change_locked(stored_key, Some(previous))
             .await
     }
 
@@ -470,6 +482,7 @@ impl ConversationCache {
         key: &ExplicitSessionKey,
     ) -> Result<(), ProtocolError> {
         let _mutation = self.explicit_mutation_lock.lock().await;
+        let _persist = self.persist_lock.lock().await;
         let stored_key = StoredCacheKey::ExplicitSession(key.clone());
         let previous = {
             let mut map = self.inner.lock().await;
@@ -484,12 +497,23 @@ impl ConversationCache {
             explicit.state = ExplicitSessionState::Uncertain;
             previous
         };
-        self.persist_explicit_change(stored_key, Some(previous))
+        self.persist_explicit_change_locked(stored_key, Some(previous))
             .await
+    }
+
+    pub async fn mark_explicit_uncertain_in_memory(&self, key: &ExplicitSessionKey) {
+        let mut map = self.inner.lock().await;
+        if let Some(explicit) = map
+            .get_mut(&StoredCacheKey::ExplicitSession(key.clone()))
+            .and_then(|conversation| conversation.explicit.as_mut())
+        {
+            explicit.state = ExplicitSessionState::Uncertain;
+        }
     }
 
     pub async fn tombstone_explicit(&self, key: &ExplicitSessionKey) -> Result<(), ProtocolError> {
         let _mutation = self.explicit_mutation_lock.lock().await;
+        let _persist = self.persist_lock.lock().await;
         let stored_key = StoredCacheKey::ExplicitSession(key.clone());
         let previous = {
             let mut map = self.inner.lock().await;
@@ -506,28 +530,29 @@ impl ConversationCache {
             conversation.last_used = Utc::now();
             previous
         };
-        self.persist_explicit_change(stored_key, Some(previous))
+        self.persist_explicit_change_locked(stored_key, Some(previous))
             .await
     }
 
     pub async fn reset_explicit(&self, key: &ExplicitSessionKey) -> Result<bool, ProtocolError> {
         let _mutation = self.explicit_mutation_lock.lock().await;
+        let _persist = self.persist_lock.lock().await;
         let stored_key = StoredCacheKey::ExplicitSession(key.clone());
         let removed = self.inner.lock().await.remove(&stored_key);
         let Some(removed) = removed else {
             return Ok(false);
         };
-        self.persist_explicit_change(stored_key, Some(removed))
+        self.persist_explicit_change_locked(stored_key, Some(removed))
             .await?;
         Ok(true)
     }
 
-    async fn persist_explicit_change(
+    async fn persist_explicit_change_locked(
         &self,
         key: StoredCacheKey,
         previous: Option<CachedConversation>,
     ) -> Result<(), ProtocolError> {
-        if let Err(error) = self.persist_result().await {
+        if let Err(error) = self.persist_snapshot().await {
             let mut map = self.inner.lock().await;
             match previous {
                 Some(previous) => {
@@ -715,6 +740,22 @@ impl ConversationCache {
             return Ok(());
         };
         let _guard = self.persist_lock.lock().await;
+        self.persist_snapshot_to(path).await
+    }
+
+    async fn persist_snapshot(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(path) = self.persist_path.as_deref() else {
+            return Ok(());
+        };
+        self.persist_snapshot_to(path).await
+    }
+
+    async fn persist_snapshot_to(
+        &self,
+        path: &Path,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        #[cfg(test)]
+        self.persistence_attempts.fetch_add(1, Ordering::Relaxed);
         let snapshot = {
             let map = self.inner.lock().await;
             PersistedConversationCache::from_map(&map)
@@ -948,5 +989,75 @@ mod explicit_tests {
         assert!(cache.reset_explicit(&key).await.unwrap());
         let cache = ConversationCache::persistent(&path).await;
         assert!(cache.get_explicit(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_drop_attempts_persistence_once_and_releases_operation() {
+        use crate::claude_web_state::explicit_session::ExplicitLifecycle;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"block").unwrap();
+        let cache = ConversationCache::persistent(blocker.join("cache.json")).await;
+        let key = ExplicitSessionKey::new("principal", "session");
+        cache
+            .set_explicit(key.clone(), conversation(ExplicitSessionState::InFlight))
+            .await;
+        let baseline = cache.persistence_attempts.load(Ordering::Relaxed);
+        let operation = cache.try_lock_explicit_operation(&key).await.unwrap();
+        drop(ExplicitLifecycle::new(
+            cache.clone(),
+            key.clone(),
+            operation,
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if cache.try_lock_explicit_operation(&key).await.is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("operation lock must be released after one failed persistence attempt");
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(
+            cache.persistence_attempts.load(Ordering::Relaxed),
+            baseline + 1
+        );
+        assert_eq!(
+            cache
+                .get_explicit(&key)
+                .await
+                .unwrap()
+                .explicit
+                .unwrap()
+                .state,
+            ExplicitSessionState::Uncertain
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_mutation_waits_for_persist_transaction_before_map_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        let cache = ConversationCache::persistent(&path).await;
+        let key = ExplicitSessionKey::new("principal", "session");
+        let persist_guard = cache.persist_lock.lock().await;
+        let update_cache = cache.clone();
+        let update_key = key.clone();
+        let update = tokio::spawn(async move {
+            update_cache
+                .set_explicit_checked(update_key, conversation(ExplicitSessionState::InFlight))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(cache.get_explicit(&key).await.is_none());
+        drop(persist_guard);
+        update.await.unwrap().unwrap();
+        cache.flush().await;
+        let reloaded = ConversationCache::persistent(&path).await;
+        assert!(reloaded.get_explicit(&key).await.is_some());
     }
 }

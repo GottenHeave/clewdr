@@ -38,6 +38,20 @@ struct BundledMessages {
     images: Vec<ImageSource>,
 }
 
+struct PreparedExplicitTurn {
+    conversation_uuid: String,
+    human_uuid: String,
+    assistant_uuid: String,
+}
+
+struct IncrementalTurn<'a> {
+    organization_uuid: &'a str,
+    conversation_uuid: &'a str,
+    parent_uuid: Option<&'a str>,
+    human_uuid: &'a str,
+    assistant_uuid: &'a str,
+}
+
 fn model_selector_state_body(p: &CreateMessageParams) -> serde_json::Value {
     let mut body = json!({ "model": p.model });
     if let (Some(effort), Some(mode)) = (p.web_thinking_effort(), p.web_thinking_mode()) {
@@ -274,8 +288,68 @@ impl ClaudeWebState {
             .map(|(_, hash)| *hash)
             .collect::<Vec<_>>();
 
+        let prepared = PreparedExplicitTurn {
+            conversation_uuid: existing
+                .as_ref()
+                .map(|conversation| conversation.conv_uuid.clone())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            human_uuid: uuid::Uuid::new_v4().to_string(),
+            assistant_uuid: uuid::Uuid::new_v4().to_string(),
+        };
+        let cache_write = match reuse {
+            ExplicitReusePlan::Create => PendingCacheWrite::Init {
+                key: self.cache_key_for(&p),
+                conv: Box::new(CachedConversation {
+                    conv_uuid: prepared.conversation_uuid.clone(),
+                    org_uuid: organization_uuid,
+                    cookie_id: self.cookie_id(),
+                    model: p.model.clone(),
+                    is_pro: self.is_pro(),
+                    system_hash: hash_system(&p.system),
+                    turns: vec![CachedTurn {
+                        user_hashes: suffix_hashes.clone(),
+                        assistant_uuid: prepared.assistant_uuid.clone(),
+                    }],
+                    created_at: chrono::Utc::now(),
+                    last_used: chrono::Utc::now(),
+                    valid: true,
+                    last_stream_healthy: Arc::new(AtomicBool::new(true)),
+                    explicit: None,
+                }),
+            },
+            ExplicitReusePlan::Append { .. } => PendingCacheWrite::AppendTurn {
+                key: self.cache_key_for(&p),
+                turn: CachedTurn {
+                    user_hashes: suffix_hashes.clone(),
+                    assistant_uuid: prepared.assistant_uuid.clone(),
+                },
+            },
+            ExplicitReusePlan::Fork { .. } | ExplicitReusePlan::Regenerate { .. } => {
+                PendingCacheWrite::ForkAndAppend {
+                    key: self.cache_key_for(&p),
+                    fork_turn_index: replace_from_turn,
+                    turn: CachedTurn {
+                        user_hashes: suffix_hashes.clone(),
+                        assistant_uuid: prepared.assistant_uuid.clone(),
+                    },
+                }
+            }
+        };
+        self.stage_explicit_write(
+            key.clone(),
+            cache_write,
+            model_digest,
+            system_digest,
+            parent_uuid.clone(),
+            user_digests[suffix_start..].to_vec(),
+            replace_from_turn,
+            selected_parent_timeline,
+            digested.timeline,
+        )
+        .await?;
+
         let send_result = self
-            .send_explicit_plan(
+            .send_explicit_plan_prepared(
                 &reuse,
                 existing.as_ref(),
                 parent_uuid.as_deref(),
@@ -283,30 +357,10 @@ impl ClaudeWebState {
                 &indices,
                 &suffix_hashes,
                 &p,
+                &prepared,
             )
             .await;
-
-        let Some(pending_write) = self.pending_cache_write.take() else {
-            return match send_result {
-                Err(error) => Err(error),
-                Ok(_) => Err(ClewdrError::Whatever {
-                    message: "Explicit session response has no pending cache write".to_string(),
-                    source: None,
-                }),
-            };
-        };
-        self.stage_explicit_write(
-            key.clone(),
-            pending_write,
-            model_digest,
-            system_digest,
-            parent_uuid,
-            user_digests[suffix_start..].to_vec(),
-            replace_from_turn,
-            selected_parent_timeline,
-            digested.timeline,
-        )
-        .await?;
+        self.pending_cache_write.take();
         let response = self.finish_explicit_send(&key, send_result).await?;
         self.explicit_lifecycle = Some(ExplicitLifecycle::new(
             self.conv_cache.clone(),
@@ -342,7 +396,7 @@ impl ClaudeWebState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn send_explicit_plan(
+    async fn send_explicit_plan_prepared(
         &mut self,
         reuse: &ExplicitReusePlan,
         existing: Option<&CachedConversation>,
@@ -351,9 +405,10 @@ impl ClaudeWebState {
         indices: &[usize],
         hashes: &[u64],
         p: &CreateMessageParams,
+        prepared: &PreparedExplicitTurn,
     ) -> Result<Response, ClewdrError> {
         match reuse {
-            ExplicitReusePlan::Create => self.send_full(p.clone(), true).await,
+            ExplicitReusePlan::Create => self.send_full(p.clone(), true, Some(prepared)).await,
             ExplicitReusePlan::Append { parent_uuid, .. } => {
                 self.send_incremental(
                     existing.expect("append requires cache"),
@@ -361,6 +416,7 @@ impl ClaudeWebState {
                     indices,
                     hashes,
                     p,
+                    Some(prepared),
                 )
                 .await
             }
@@ -372,10 +428,43 @@ impl ClaudeWebState {
                     indices,
                     hashes,
                     p,
+                    Some(prepared),
                 )
                 .await
             }
         }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    async fn send_explicit_plan(
+        &mut self,
+        reuse: &ExplicitReusePlan,
+        existing: Option<&CachedConversation>,
+        parent_uuid: Option<&str>,
+        replace_from_turn: usize,
+        indices: &[usize],
+        hashes: &[u64],
+        p: &CreateMessageParams,
+    ) -> Result<Response, ClewdrError> {
+        let prepared = PreparedExplicitTurn {
+            conversation_uuid: existing
+                .map(|conversation| conversation.conv_uuid.clone())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            human_uuid: uuid::Uuid::new_v4().to_string(),
+            assistant_uuid: uuid::Uuid::new_v4().to_string(),
+        };
+        self.send_explicit_plan_prepared(
+            reuse,
+            existing,
+            parent_uuid,
+            replace_from_turn,
+            indices,
+            hashes,
+            p,
+            &prepared,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -458,7 +547,7 @@ impl ClaudeWebState {
             // but this time we'll also write cache on success
         }
 
-        self.send_full(p, can_reuse).await
+        self.send_full(p, can_reuse, None).await
     }
 
     /// Attempt to reuse a cached conversation
@@ -521,6 +610,7 @@ impl ClaudeWebState {
                         &new_user_indices,
                         &new_user_hashes,
                         p,
+                        None,
                     )
                     .await;
                 Some(result)
@@ -544,6 +634,7 @@ impl ClaudeWebState {
                         &remaining_user_indices,
                         &remaining_user_hashes,
                         p,
+                        None,
                     )
                     .await;
                 Some(result)
@@ -561,6 +652,7 @@ impl ClaudeWebState {
         &mut self,
         p: CreateMessageParams,
         write_cache: bool,
+        prepared: Option<&PreparedExplicitTurn>,
     ) -> Result<Response, ClewdrError> {
         let org_uuid = self
             .org_uuid
@@ -573,7 +665,9 @@ impl ClaudeWebState {
 
         // Claude Web generates the UUID client-side and creates the conversation
         // as part of the first completion request.
-        let new_uuid = uuid::Uuid::new_v4().to_string();
+        let new_uuid = prepared
+            .map(|prepared| prepared.conversation_uuid.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let is_temporary = !CLEWDR_CONFIG.load().preserve_chats;
         self.conv_uuid = Some(new_uuid.clone());
         self.last_params = Some(p.clone());
@@ -589,8 +683,12 @@ impl ClaudeWebState {
             Some(create_conversation_params(&p, is_temporary, self.is_pro()));
 
         // Generate turn_message_uuids
-        let human_uuid = uuid::Uuid::new_v4().to_string();
-        let assistant_uuid = uuid::Uuid::new_v4().to_string();
+        let human_uuid = prepared
+            .map(|prepared| prepared.human_uuid.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let assistant_uuid = prepared
+            .map(|prepared| prepared.assistant_uuid.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         body.turn_message_uuids = Some(TurnMessageUuids {
             human_message_uuid: human_uuid.clone(),
             assistant_message_uuid: assistant_uuid.clone(),
@@ -663,6 +761,7 @@ impl ClaudeWebState {
         new_user_indices: &[usize],
         new_user_hashes: &[u64],
         p: &CreateMessageParams,
+        prepared: Option<&PreparedExplicitTurn>,
     ) -> Result<Response, ClewdrError> {
         self.conv_uuid = Some(cached.conv_uuid.clone());
         self.last_params = Some(p.clone());
@@ -683,20 +782,29 @@ impl ClaudeWebState {
             .collect();
 
         // Bundle user messages into prompt + optional attachment
-        let bundled = self.bundle_user_messages(&new_user_msgs)?;
+        let bundled = self.bundle_user_messages(
+            &new_user_msgs,
+            if prepared.is_some() { "\n" } else { "\n\n" },
+        )?;
 
         // Generate turn UUIDs
-        let human_uuid = uuid::Uuid::new_v4().to_string();
-        let assistant_uuid = uuid::Uuid::new_v4().to_string();
+        let human_uuid = prepared
+            .map(|prepared| prepared.human_uuid.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let assistant_uuid = prepared
+            .map(|prepared| prepared.assistant_uuid.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         let body = self
             .build_incremental_body(
                 &bundled,
-                &cached.org_uuid,
-                &cached.conv_uuid,
-                Some(parent_uuid),
-                &human_uuid,
-                &assistant_uuid,
+                IncrementalTurn {
+                    organization_uuid: &cached.org_uuid,
+                    conversation_uuid: &cached.conv_uuid,
+                    parent_uuid: Some(parent_uuid),
+                    human_uuid: &human_uuid,
+                    assistant_uuid: &assistant_uuid,
+                },
                 p,
             )
             .await?;
@@ -743,6 +851,7 @@ impl ClaudeWebState {
         remaining_user_indices: &[usize],
         remaining_user_hashes: &[u64],
         p: &CreateMessageParams,
+        prepared: Option<&PreparedExplicitTurn>,
     ) -> Result<Response, ClewdrError> {
         self.conv_uuid = Some(cached.conv_uuid.clone());
         self.last_params = Some(p.clone());
@@ -763,19 +872,28 @@ impl ClaudeWebState {
             .collect();
 
         // Bundle all remaining user messages
-        let bundled = self.bundle_user_messages(&remaining_user_msgs)?;
+        let bundled = self.bundle_user_messages(
+            &remaining_user_msgs,
+            if prepared.is_some() { "\n" } else { "\n\n" },
+        )?;
 
-        let human_uuid = uuid::Uuid::new_v4().to_string();
-        let assistant_uuid = uuid::Uuid::new_v4().to_string();
+        let human_uuid = prepared
+            .map(|prepared| prepared.human_uuid.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let assistant_uuid = prepared
+            .map(|prepared| prepared.assistant_uuid.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         let body = self
             .build_incremental_body(
                 &bundled,
-                &cached.org_uuid,
-                &cached.conv_uuid,
-                parent_uuid,
-                &human_uuid,
-                &assistant_uuid,
+                IncrementalTurn {
+                    organization_uuid: &cached.org_uuid,
+                    conversation_uuid: &cached.conv_uuid,
+                    parent_uuid,
+                    human_uuid: &human_uuid,
+                    assistant_uuid: &assistant_uuid,
+                },
                 p,
             )
             .await?;
@@ -870,28 +988,28 @@ impl ClaudeWebState {
     async fn build_incremental_body(
         &self,
         bundled: &BundledMessages,
-        org_uuid: &str,
-        conversation_uuid: &str,
-        parent_uuid: Option<&str>,
-        human_uuid: &str,
-        assistant_uuid: &str,
+        turn: IncrementalTurn<'_>,
         p: &CreateMessageParams,
     ) -> Result<serde_json::Value, ClewdrError> {
         let files = self
-            .upload_files(bundled.images.clone(), org_uuid, conversation_uuid)
+            .upload_files(
+                bundled.images.clone(),
+                turn.organization_uuid,
+                turn.conversation_uuid,
+            )
             .await?;
         let mut body = json!({
             "prompt": bundled.prompt,
             "timezone": TIME_ZONE.to_string(),
             "turn_message_uuids": {
-                "human_message_uuid": human_uuid,
-                "assistant_message_uuid": assistant_uuid,
+                "human_message_uuid": turn.human_uuid,
+                "assistant_message_uuid": turn.assistant_uuid,
             },
             "attachments": bundled.attachments,
             "files": files,
             "rendering_mode": if p.stream.unwrap_or_default() { "messages" } else { "raw" },
         });
-        if let Some(parent_uuid) = parent_uuid {
+        if let Some(parent_uuid) = turn.parent_uuid {
             body["parent_message_uuid"] = json!(parent_uuid);
         }
         // Model (only for pro)
@@ -919,6 +1037,7 @@ impl ClaudeWebState {
     fn bundle_user_messages(
         &self,
         user_msgs: &[&Message],
+        message_separator: &str,
     ) -> Result<BundledMessages, ProtocolError> {
         let mut texts: Vec<String> = vec![];
         let mut attachments: Vec<Attachment> = vec![];
@@ -933,7 +1052,7 @@ impl ClaudeWebState {
             images.extend(normalized.images);
         }
 
-        let combined = texts.join("\n\n");
+        let combined = texts.join(message_separator);
 
         // Threshold: if combined text is under ~4000 chars, use prompt directly
         // Otherwise put it in an attachment
@@ -1040,6 +1159,8 @@ mod tests {
         ContentBlock, ImageSource, Metadata, OutputConfig, OutputEffort, Role, Thinking,
         ThinkingMode,
     };
+
+    static CONFIG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[derive(Clone, Debug)]
     struct RecordedRequest {
@@ -1344,6 +1465,7 @@ mod tests {
 
     #[tokio::test]
     async fn try_chat_create_then_append_reuses_conversation() {
+        let _config_guard = CONFIG_TEST_LOCK.lock().await;
         let (endpoint, requests) = black_box_endpoint().await;
         let original = crate::config::CLEWDR_CONFIG.load().as_ref().clone();
         let _restore = ConfigRestore(original.clone());
@@ -1413,6 +1535,127 @@ mod tests {
             completions[1].body["parent_message_uuid"],
             first_assistant_uuid
         );
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_prevents_upload_and_completion_requests() {
+        let _config_guard = CONFIG_TEST_LOCK.lock().await;
+        let (endpoint, requests) = black_box_endpoint().await;
+        let original = crate::config::CLEWDR_CONFIG.load().as_ref().clone();
+        let _restore = ConfigRestore(original.clone());
+        crate::config::CLEWDR_CONFIG.rcu(|_| {
+            let mut config = original.clone();
+            config.rproxy = Some(endpoint.clone());
+            config.no_fs = true;
+            config.skip_non_pro = false;
+            config.skip_normal_pro = false;
+            config
+        });
+        let handle = crate::services::cookie_actor::CookieActorHandle::start()
+            .await
+            .unwrap();
+        let cookie =
+            crate::config::CookieStatus::new(&format!("{}-bbbbbbAA", "b".repeat(86)), None)
+                .unwrap();
+        handle.submit(cookie).await.unwrap();
+        tokio::task::yield_now().await;
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"block").unwrap();
+        let cache = ConversationCache::persistent(blocker.join("cache.json")).await;
+        let principal = crate::protocol::AuthPrincipal::for_authenticated_user();
+        let mut state = ClaudeWebState::new(handle, cache);
+        state.principal = Some(principal);
+        let error = state
+            .try_chat(CreateMessageParams {
+                model: "claude-sonnet-4-6".into(),
+                messages: vec![Message::new_text(Role::User, "hello")],
+                metadata: Some(Metadata {
+                    fields: [(
+                        "user_id".into(),
+                        format!("cherry_topic_v1_{}", "cd".repeat(32)),
+                    )]
+                    .into_iter()
+                    .collect(),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        let ClewdrError::Protocol { source } = error else {
+            panic!("expected protocol storage error");
+        };
+        assert_eq!(source.code, "session_storage_unavailable");
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.path == "/api/bootstrap")
+        );
+        assert!(!requests.iter().any(|request| {
+            request.path.contains("/upload-file") || request.path.contains("/completion")
+        }));
+    }
+
+    #[tokio::test]
+    async fn consecutive_user_messages_match_create_and_incremental_prompts() {
+        let (endpoint, requests) = mock_endpoint().await;
+        let handle = crate::services::cookie_actor::CookieActorHandle::start()
+            .await
+            .unwrap();
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
+        state.endpoint = endpoint;
+        state.org_uuid = Some("org".into());
+        let create = params(vec![
+            Message::new_text(Role::User, "first"),
+            Message::new_text(Role::User, "second"),
+        ]);
+        state
+            .send_explicit_plan(
+                &ExplicitReusePlan::Create,
+                None,
+                None,
+                0,
+                &[0, 1],
+                &[1, 2],
+                &create,
+            )
+            .await
+            .unwrap();
+        let PendingCacheWrite::Init { conv: cached, .. } =
+            state.pending_cache_write.take().unwrap()
+        else {
+            panic!("create must use send_full");
+        };
+        let parent = cached.turns[0].assistant_uuid.clone();
+        let append = params(vec![
+            Message::new_text(Role::User, "history"),
+            Message::new_text(Role::Assistant, "answer"),
+            Message::new_text(Role::User, "first"),
+            Message::new_text(Role::User, "second"),
+        ]);
+        state
+            .send_explicit_plan(
+                &ExplicitReusePlan::Append {
+                    parent_uuid: parent.clone(),
+                    suffix_start: 1,
+                },
+                Some(&cached),
+                Some(&parent),
+                1,
+                &[2, 3],
+                &[3, 4],
+                &append,
+            )
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        let completions = requests
+            .iter()
+            .filter(|request| request.path.contains("/completion"))
+            .collect::<Vec<_>>();
+        assert_eq!(completions[0].body["prompt"], "first\nsecond");
+        assert_eq!(completions[0].body["prompt"], completions[1].body["prompt"]);
     }
 
     #[tokio::test]

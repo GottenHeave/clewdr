@@ -99,16 +99,7 @@ impl ExplicitLifecycle {
     }
 
     pub async fn uncertain(&self) -> Result<(), ProtocolError> {
-        let mut operation = self.inner.operation.lock().await;
-        if operation.is_some() {
-            self.inner
-                .cache
-                .mark_explicit_uncertain(&self.inner.key)
-                .await?;
-        }
-        operation.take();
-        self.inner.finalized.store(true, Ordering::Release);
-        Ok(())
+        finalize_uncertain(&self.inner).await
     }
 }
 
@@ -117,13 +108,31 @@ impl Drop for ExplicitLifecycle {
         if Arc::strong_count(&self.inner) != 1 || self.inner.finalized.load(Ordering::Acquire) {
             return;
         }
-        let lifecycle = self.clone();
+        let inner = self.inner.clone();
         tokio::spawn(async move {
-            if let Err(error) = lifecycle.uncertain().await {
+            if let Err(error) = finalize_uncertain(&inner).await {
                 tracing::warn!("Failed to persist explicit session uncertainty: {error}");
             }
         });
     }
+}
+
+async fn finalize_uncertain(inner: &ExplicitLifecycleInner) -> Result<(), ProtocolError> {
+    let mut operation = inner.operation.lock().await;
+    let result = if operation.is_some() {
+        inner.cache.mark_explicit_uncertain(&inner.key).await
+    } else {
+        Ok(())
+    };
+    if result.is_err() {
+        inner
+            .cache
+            .mark_explicit_uncertain_in_memory(&inner.key)
+            .await;
+    }
+    operation.take();
+    inner.finalized.store(true, Ordering::Release);
+    result
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
