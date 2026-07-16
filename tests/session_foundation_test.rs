@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use clewdr::claude_web_state::conversation_cache::{
-    CacheKey, CachedConversation, ConversationCache,
+    CacheKey, CachedConversation, CachedTurn, ConversationCache, ExplicitSessionKey,
 };
 use clewdr::protocol::{AuthPrincipal, parse_session_id};
 use clewdr::utils::write_json_atomically;
@@ -51,7 +51,13 @@ async fn reads_v1_cache_keys_without_a_scope_field() {
     std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
 
     let cache = ConversationCache::persistent(path).await;
-    let conversation = cache.get(&CacheKey::legacy(3, 42)).await.unwrap();
+    let conversation = cache
+        .get(&CacheKey {
+            key_index: 3,
+            request_fingerprint: 42,
+        })
+        .await
+        .unwrap();
 
     assert_eq!(conversation.conv_uuid, "legacy-conversation");
 }
@@ -61,30 +67,43 @@ async fn explicit_sessions_are_separate_cache_scopes() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("conversation_cache.json");
     let cache = ConversationCache::persistent(&path).await;
-    let first = CacheKey::explicit_session("principal", "a".repeat(64));
-    let second = CacheKey::explicit_session("principal", "b".repeat(64));
-    cache.set(first.clone(), cached_conversation("first")).await;
+    let first = ExplicitSessionKey::new("principal", "a".repeat(64));
+    let second = ExplicitSessionKey::new("principal", "b".repeat(64));
     cache
-        .set(second.clone(), cached_conversation("second"))
+        .set_explicit(first.clone(), cached_conversation("first"))
+        .await;
+    cache
+        .set_explicit(second.clone(), cached_conversation("second"))
         .await;
     let cache = ConversationCache::persistent(&path).await;
 
-    assert_eq!(cache.get(&first).await.unwrap().conv_uuid, "first");
-    assert_eq!(cache.get(&second).await.unwrap().conv_uuid, "second");
-    assert!(cache.get(&CacheKey::legacy(0, 0)).await.is_none());
+    assert_eq!(cache.get_explicit(&first).await.unwrap().conv_uuid, "first");
+    assert_eq!(
+        cache.get_explicit(&second).await.unwrap().conv_uuid,
+        "second"
+    );
+    assert!(
+        cache
+            .get(&CacheKey {
+                key_index: 0,
+                request_fingerprint: 0,
+            })
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
 async fn operation_locks_serialize_only_matching_keys() {
     let cache = ConversationCache::new();
-    let key = CacheKey::explicit_session("principal", "a".repeat(64));
-    let other_key = CacheKey::explicit_session("principal", "b".repeat(64));
-    let held = cache.lock_operation(&key).await;
+    let key = ExplicitSessionKey::new("principal", "a".repeat(64));
+    let other_key = ExplicitSessionKey::new("principal", "b".repeat(64));
+    let held = cache.lock_explicit_operation(&key).await;
 
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(20),
-            cache.lock_operation(&key)
+            cache.lock_explicit_operation(&key)
         )
         .await
         .is_err()
@@ -92,7 +111,7 @@ async fn operation_locks_serialize_only_matching_keys() {
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(20),
-            cache.lock_operation(&other_key)
+            cache.lock_explicit_operation(&other_key)
         )
         .await
         .is_ok()
@@ -102,11 +121,51 @@ async fn operation_locks_serialize_only_matching_keys() {
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(20),
-            cache.lock_operation(&key)
+            cache.lock_explicit_operation(&key)
         )
         .await
         .is_ok()
     );
+}
+
+#[tokio::test]
+async fn explicit_session_mutations_use_the_explicit_scope() {
+    let cache = ConversationCache::new();
+    let key = ExplicitSessionKey::new("principal", "a".repeat(64));
+    cache
+        .set_explicit(key.clone(), cached_conversation("explicit"))
+        .await;
+    cache
+        .append_explicit_turn(
+            &key,
+            CachedTurn {
+                user_hashes: vec![1],
+                assistant_uuid: "first".to_owned(),
+            },
+        )
+        .await;
+    cache
+        .fork_and_append_explicit(
+            &key,
+            0,
+            CachedTurn {
+                user_hashes: vec![2],
+                assistant_uuid: "fork".to_owned(),
+            },
+        )
+        .await;
+
+    let conversation = cache.get_explicit(&key).await.unwrap();
+    assert_eq!(conversation.turns.len(), 1);
+    assert_eq!(conversation.turns[0].assistant_uuid, "fork");
+
+    cache
+        .update_explicit_stream_health(&key, Arc::new(AtomicBool::new(false)))
+        .await;
+    assert!(!cache.is_last_explicit_stream_healthy(&key).await);
+
+    cache.invalidate_explicit(&key).await;
+    assert!(cache.get_explicit(&key).await.is_none());
 }
 
 #[tokio::test]
