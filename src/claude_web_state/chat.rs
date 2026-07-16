@@ -38,10 +38,12 @@ struct BundledMessages {
     images: Vec<ImageSource>,
 }
 
+#[derive(Clone)]
 struct PreparedExplicitTurn {
     conversation_uuid: String,
     human_uuid: String,
     assistant_uuid: String,
+    cache_write: PendingCacheWrite,
 }
 
 struct IncrementalTurn<'a> {
@@ -288,56 +290,17 @@ impl ClaudeWebState {
             .map(|(_, hash)| *hash)
             .collect::<Vec<_>>();
 
-        let prepared = PreparedExplicitTurn {
-            conversation_uuid: existing
-                .as_ref()
-                .map(|conversation| conversation.conv_uuid.clone())
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            human_uuid: uuid::Uuid::new_v4().to_string(),
-            assistant_uuid: uuid::Uuid::new_v4().to_string(),
-        };
-        let cache_write = match reuse {
-            ExplicitReusePlan::Create => PendingCacheWrite::Init {
-                key: self.cache_key_for(&p),
-                conv: Box::new(CachedConversation {
-                    conv_uuid: prepared.conversation_uuid.clone(),
-                    org_uuid: organization_uuid,
-                    cookie_id: self.cookie_id(),
-                    model: p.model.clone(),
-                    is_pro: self.is_pro(),
-                    system_hash: hash_system(&p.system),
-                    turns: vec![CachedTurn {
-                        user_hashes: suffix_hashes.clone(),
-                        assistant_uuid: prepared.assistant_uuid.clone(),
-                    }],
-                    created_at: chrono::Utc::now(),
-                    last_used: chrono::Utc::now(),
-                    valid: true,
-                    last_stream_healthy: Arc::new(AtomicBool::new(true)),
-                    explicit: None,
-                }),
-            },
-            ExplicitReusePlan::Append { .. } => PendingCacheWrite::AppendTurn {
-                key: self.cache_key_for(&p),
-                turn: CachedTurn {
-                    user_hashes: suffix_hashes.clone(),
-                    assistant_uuid: prepared.assistant_uuid.clone(),
-                },
-            },
-            ExplicitReusePlan::Fork { .. } | ExplicitReusePlan::Regenerate { .. } => {
-                PendingCacheWrite::ForkAndAppend {
-                    key: self.cache_key_for(&p),
-                    fork_turn_index: replace_from_turn,
-                    turn: CachedTurn {
-                        user_hashes: suffix_hashes.clone(),
-                        assistant_uuid: prepared.assistant_uuid.clone(),
-                    },
-                }
-            }
-        };
+        let prepared = self.prepare_explicit_turn(
+            &reuse,
+            existing.as_ref(),
+            replace_from_turn,
+            &suffix_hashes,
+            &p,
+            &organization_uuid,
+        );
         self.stage_explicit_write(
             key.clone(),
-            cache_write,
+            prepared.cache_write.clone(),
             model_digest,
             system_digest,
             parent_uuid.clone(),
@@ -447,13 +410,18 @@ impl ClaudeWebState {
         hashes: &[u64],
         p: &CreateMessageParams,
     ) -> Result<Response, ClewdrError> {
-        let prepared = PreparedExplicitTurn {
-            conversation_uuid: existing
-                .map(|conversation| conversation.conv_uuid.clone())
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            human_uuid: uuid::Uuid::new_v4().to_string(),
-            assistant_uuid: uuid::Uuid::new_v4().to_string(),
-        };
+        let organization_uuid = existing
+            .map(|conversation| conversation.org_uuid.as_str())
+            .or(self.org_uuid.as_deref())
+            .expect("explicit send requires an organization");
+        let prepared = self.prepare_explicit_turn(
+            reuse,
+            existing,
+            replace_from_turn,
+            hashes,
+            p,
+            organization_uuid,
+        );
         self.send_explicit_plan_prepared(
             reuse,
             existing,
@@ -465,6 +433,69 @@ impl ClaudeWebState {
             &prepared,
         )
         .await
+    }
+
+    fn prepare_explicit_turn(
+        &self,
+        reuse: &ExplicitReusePlan,
+        existing: Option<&CachedConversation>,
+        replace_from_turn: usize,
+        user_hashes: &[u64],
+        p: &CreateMessageParams,
+        organization_uuid: &str,
+    ) -> PreparedExplicitTurn {
+        let conversation_uuid = existing
+            .map(|conversation| conversation.conv_uuid.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let assistant_uuid = uuid::Uuid::new_v4().to_string();
+        let cache_write = match reuse {
+            ExplicitReusePlan::Create => PendingCacheWrite::Init {
+                key: self.cache_key_for(p),
+                conv: Box::new(CachedConversation {
+                    conv_uuid: conversation_uuid.clone(),
+                    org_uuid: organization_uuid.to_owned(),
+                    cookie_id: self.cookie_id(),
+                    model: p.model.clone(),
+                    is_pro: self.is_pro(),
+                    system_hash: hash_system(&p.system),
+                    turns: vec![CachedTurn {
+                        user_hashes: user_hashes.to_vec(),
+                        assistant_uuid: assistant_uuid.clone(),
+                    }],
+                    created_at: chrono::Utc::now(),
+                    last_used: chrono::Utc::now(),
+                    valid: true,
+                    last_stream_healthy: self
+                        .stream_health_flag
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(AtomicBool::new(true))),
+                    explicit: None,
+                }),
+            },
+            ExplicitReusePlan::Append { .. } => PendingCacheWrite::AppendTurn {
+                key: self.cache_key_for(p),
+                turn: CachedTurn {
+                    user_hashes: user_hashes.to_vec(),
+                    assistant_uuid: assistant_uuid.clone(),
+                },
+            },
+            ExplicitReusePlan::Fork { .. } | ExplicitReusePlan::Regenerate { .. } => {
+                PendingCacheWrite::ForkAndAppend {
+                    key: self.cache_key_for(p),
+                    fork_turn_index: replace_from_turn,
+                    turn: CachedTurn {
+                        user_hashes: user_hashes.to_vec(),
+                        assistant_uuid: assistant_uuid.clone(),
+                    },
+                }
+            }
+        };
+        PreparedExplicitTurn {
+            conversation_uuid,
+            human_uuid: uuid::Uuid::new_v4().to_string(),
+            assistant_uuid,
+            cache_write,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -660,14 +691,27 @@ impl ClaudeWebState {
             .ok_or(ClewdrError::UnexpectedNone {
                 msg: "Organization UUID is not set",
             })?;
+        let user_hashes = extract_user_hashes(&p.messages)
+            .into_iter()
+            .map(|(_, hash)| hash)
+            .collect::<Vec<_>>();
+        let generated = prepared.is_none().then(|| {
+            self.prepare_explicit_turn(
+                &ExplicitReusePlan::Create,
+                None,
+                0,
+                &user_hashes,
+                &p,
+                &org_uuid,
+            )
+        });
+        let prepared = prepared.or(generated.as_ref()).unwrap();
 
         self.sync_model_selector_state(&p).await?;
 
         // Claude Web generates the UUID client-side and creates the conversation
         // as part of the first completion request.
-        let new_uuid = prepared
-            .map(|prepared| prepared.conversation_uuid.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let new_uuid = prepared.conversation_uuid.clone();
         let is_temporary = !CLEWDR_CONFIG.load().preserve_chats;
         self.conv_uuid = Some(new_uuid.clone());
         self.last_params = Some(p.clone());
@@ -683,46 +727,15 @@ impl ClaudeWebState {
             Some(create_conversation_params(&p, is_temporary, self.is_pro()));
 
         // Generate turn_message_uuids
-        let human_uuid = prepared
-            .map(|prepared| prepared.human_uuid.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let assistant_uuid = prepared
-            .map(|prepared| prepared.assistant_uuid.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let human_uuid = prepared.human_uuid.clone();
+        let assistant_uuid = prepared.assistant_uuid.clone();
         body.turn_message_uuids = Some(TurnMessageUuids {
             human_message_uuid: human_uuid.clone(),
             assistant_message_uuid: assistant_uuid.clone(),
         });
 
         if write_cache {
-            let user_hashes = extract_user_hashes(&p.messages)
-                .iter()
-                .map(|(_, h)| *h)
-                .collect();
-            let stream_flag = self
-                .stream_health_flag
-                .clone()
-                .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
-            self.pending_cache_write = Some(PendingCacheWrite::Init {
-                key: self.cache_key_for(&p),
-                conv: Box::new(CachedConversation {
-                    conv_uuid: new_uuid.clone(),
-                    org_uuid: org_uuid.clone(),
-                    cookie_id: self.cookie_id(),
-                    model: p.model.clone(),
-                    is_pro: self.is_pro(),
-                    system_hash: hash_system(&p.system),
-                    turns: vec![CachedTurn {
-                        user_hashes,
-                        assistant_uuid: assistant_uuid.clone(),
-                    }],
-                    created_at: chrono::Utc::now(),
-                    last_used: chrono::Utc::now(),
-                    valid: true,
-                    last_stream_healthy: stream_flag,
-                    explicit: None,
-                }),
-            });
+            self.pending_cache_write = Some(prepared.cache_write.clone());
         }
 
         let images = body.images.drain(..).collect::<Vec<_>>();
@@ -765,35 +778,40 @@ impl ClaudeWebState {
     ) -> Result<Response, ClewdrError> {
         self.conv_uuid = Some(cached.conv_uuid.clone());
         self.last_params = Some(p.clone());
+        let is_explicit = prepared.is_some();
+        let generated = prepared.is_none().then(|| {
+            self.prepare_explicit_turn(
+                &ExplicitReusePlan::Append {
+                    parent_uuid: parent_uuid.to_owned(),
+                    suffix_start: 0,
+                },
+                Some(cached),
+                0,
+                new_user_hashes,
+                p,
+                &cached.org_uuid,
+            )
+        });
+        let prepared = prepared.or(generated.as_ref()).unwrap();
 
         self.sync_model_selector_state(p).await?;
 
-        // Update paprika_mode if needed
         let need_thinking = p
             .web_thinking_mode()
             .is_some_and(|mode| mode == crate::types::claude::ThinkingMode::Auto)
             && self.is_pro();
         self.update_paprika(&cached.conv_uuid, need_thinking).await;
 
-        // Extract new user messages from original messages array
         let new_user_msgs: Vec<&Message> = new_user_indices
             .iter()
             .map(|&idx| &p.messages[idx])
             .collect();
 
-        // Bundle user messages into prompt + optional attachment
-        let bundled = self.bundle_user_messages(
-            &new_user_msgs,
-            if prepared.is_some() { "\n" } else { "\n\n" },
-        )?;
+        let bundled =
+            self.bundle_user_messages(&new_user_msgs, if is_explicit { "\n" } else { "\n\n" })?;
 
-        // Generate turn UUIDs
-        let human_uuid = prepared
-            .map(|prepared| prepared.human_uuid.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let assistant_uuid = prepared
-            .map(|prepared| prepared.assistant_uuid.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let human_uuid = prepared.human_uuid.clone();
+        let assistant_uuid = prepared.assistant_uuid.clone();
 
         let body = self
             .build_incremental_body(
@@ -809,13 +827,7 @@ impl ClaudeWebState {
             )
             .await?;
 
-        self.pending_cache_write = Some(PendingCacheWrite::AppendTurn {
-            key: self.cache_key_for(p),
-            turn: CachedTurn {
-                user_hashes: new_user_hashes.to_vec(),
-                assistant_uuid: assistant_uuid.clone(),
-            },
-        });
+        self.pending_cache_write = Some(prepared.cache_write.clone());
 
         print_out_json(&body, "claude_web_incremental_req.json");
 
@@ -855,34 +867,43 @@ impl ClaudeWebState {
     ) -> Result<Response, ClewdrError> {
         self.conv_uuid = Some(cached.conv_uuid.clone());
         self.last_params = Some(p.clone());
+        let is_explicit = prepared.is_some();
+        let generated = prepared.is_none().then(|| {
+            self.prepare_explicit_turn(
+                &ExplicitReusePlan::Fork {
+                    parent_uuid: parent_uuid.map(str::to_owned),
+                    suffix_start: 0,
+                    replace_from_turn: fork_turn_index,
+                },
+                Some(cached),
+                fork_turn_index,
+                remaining_user_hashes,
+                p,
+                &cached.org_uuid,
+            )
+        });
+        let prepared = prepared.or(generated.as_ref()).unwrap();
 
         self.sync_model_selector_state(p).await?;
 
-        // Update paprika_mode if needed
         let need_thinking = p
             .web_thinking_mode()
             .is_some_and(|mode| mode == crate::types::claude::ThinkingMode::Auto)
             && self.is_pro();
         self.update_paprika(&cached.conv_uuid, need_thinking).await;
 
-        // Extract remaining user messages
         let remaining_user_msgs: Vec<&Message> = remaining_user_indices
             .iter()
             .map(|&idx| &p.messages[idx])
             .collect();
 
-        // Bundle all remaining user messages
         let bundled = self.bundle_user_messages(
             &remaining_user_msgs,
-            if prepared.is_some() { "\n" } else { "\n\n" },
+            if is_explicit { "\n" } else { "\n\n" },
         )?;
 
-        let human_uuid = prepared
-            .map(|prepared| prepared.human_uuid.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let assistant_uuid = prepared
-            .map(|prepared| prepared.assistant_uuid.clone())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let human_uuid = prepared.human_uuid.clone();
+        let assistant_uuid = prepared.assistant_uuid.clone();
 
         let body = self
             .build_incremental_body(
@@ -898,14 +919,7 @@ impl ClaudeWebState {
             )
             .await?;
 
-        self.pending_cache_write = Some(PendingCacheWrite::ForkAndAppend {
-            key: self.cache_key_for(p),
-            fork_turn_index,
-            turn: CachedTurn {
-                user_hashes: remaining_user_hashes.to_vec(),
-                assistant_uuid: assistant_uuid.clone(),
-            },
-        });
+        self.pending_cache_write = Some(prepared.cache_write.clone());
 
         let endpoint = self
             .endpoint
@@ -930,7 +944,6 @@ impl ClaudeWebState {
         Ok(response)
     }
 
-    /// PUT paprika_mode setting on existing conversation
     async fn update_paprika(&self, conv_uuid: &str, need_thinking: bool) {
         let paprika = if need_thinking {
             "auto".into()
@@ -1012,7 +1025,6 @@ impl ClaudeWebState {
         if let Some(parent_uuid) = turn.parent_uuid {
             body["parent_message_uuid"] = json!(parent_uuid);
         }
-        // Model (only for pro)
         if self.is_pro() {
             body["model"] = json!(p.model);
         }
@@ -1022,7 +1034,6 @@ impl ClaudeWebState {
         if let Some(mode) = p.web_thinking_mode() {
             body["thinking_mode"] = json!(mode);
         }
-        // Tools (same as full request)
         let mut tools = vec![];
         if CLEWDR_CONFIG.load().web_search {
             tools.push(json!({"type": "web_search_v0", "name": "web_search"}));
@@ -1162,6 +1173,40 @@ mod tests {
 
     static CONFIG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    async fn serve(app: Router) -> url::Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url::Url::parse(&format!("http://{address}/")).unwrap()
+    }
+
+    async fn test_state(endpoint: url::Url, cache: ConversationCache) -> ClaudeWebState {
+        let handle = crate::services::cookie_actor::CookieActorHandle::start()
+            .await
+            .unwrap();
+        let mut state = ClaudeWebState::new(handle, cache);
+        state.endpoint = endpoint;
+        state.org_uuid = Some("org".into());
+        state
+    }
+
+    fn cached_conversation() -> CachedConversation {
+        CachedConversation {
+            conv_uuid: "conversation".into(),
+            org_uuid: "org".into(),
+            cookie_id: "cookie".into(),
+            model: "model".into(),
+            is_pro: false,
+            system_hash: 0,
+            turns: Vec::new(),
+            created_at: chrono::Utc::now(),
+            last_used: chrono::Utc::now(),
+            valid: true,
+            last_stream_healthy: Arc::new(AtomicBool::new(true)),
+            explicit: None,
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct RecordedRequest {
         path: String,
@@ -1199,15 +1244,7 @@ mod tests {
         let app = Router::new()
             .fallback(record_request)
             .with_state(requests.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (
-            url::Url::parse(&format!("http://{address}/")).unwrap(),
-            requests,
-        )
+        (serve(app).await, requests)
     }
 
     #[derive(Clone)]
@@ -1246,12 +1283,7 @@ mod tests {
             .with_state(FailingUploadState {
                 uploads: Arc::new(AtomicUsize::new(0)),
             });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        url::Url::parse(&format!("http://{address}/")).unwrap()
+        serve(app).await
     }
 
     #[derive(Clone)]
@@ -1313,15 +1345,7 @@ mod tests {
                 requests: requests.clone(),
                 completions: Arc::new(AtomicUsize::new(0)),
             });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (
-            url::Url::parse(&format!("http://{address}/")).unwrap(),
-            requests,
-        )
+        (serve(app).await, requests)
     }
 
     struct ConfigRestore(crate::config::ClewdrConfig);
@@ -1341,18 +1365,59 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn explicit_plans_reuse_existing_send_transports_and_parent_uuids() {
+    async fn create_append_requests(
+        create: Vec<Message>,
+        append: Vec<Message>,
+        create_indices: &[usize],
+        append_indices: &[usize],
+    ) -> Vec<RecordedRequest> {
         let (endpoint, requests) = mock_endpoint().await;
-        let handle = crate::services::cookie_actor::CookieActorHandle::start()
+        let mut state = test_state(endpoint, ConversationCache::new()).await;
+        let create_hashes = vec![1; create_indices.len()];
+        state
+            .send_explicit_plan(
+                &ExplicitReusePlan::Create,
+                None,
+                None,
+                0,
+                create_indices,
+                &create_hashes,
+                &params(create),
+            )
             .await
             .unwrap();
-        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
-        state.endpoint = endpoint;
-        state.org_uuid = Some("org".into());
-
-        let create_params = params(vec![Message::new_text(Role::User, "u1")]);
+        let PendingCacheWrite::Init { conv: cached, .. } =
+            state.pending_cache_write.take().unwrap()
+        else {
+            panic!("create must initialize the cache");
+        };
+        let parent = cached.turns[0].assistant_uuid.clone();
+        let append_hashes = vec![2; append_indices.len()];
         state
+            .send_explicit_plan(
+                &ExplicitReusePlan::Append {
+                    parent_uuid: parent.clone(),
+                    suffix_start: 1,
+                },
+                Some(&cached),
+                Some(&parent),
+                1,
+                append_indices,
+                &append_hashes,
+                &params(append),
+            )
+            .await
+            .unwrap();
+        requests.lock().unwrap().clone()
+    }
+
+    async fn send_and_stage_create(
+        state: &mut ClaudeWebState,
+        key: &ExplicitSessionKey,
+        request: &CreateMessageParams,
+    ) -> Result<Response, ClewdrError> {
+        let digested = digest_messages(&request.messages).unwrap();
+        let send = state
             .send_explicit_plan(
                 &ExplicitReusePlan::Create,
                 None,
@@ -1360,111 +1425,91 @@ mod tests {
                 0,
                 &[0],
                 &[1],
-                &create_params,
+                request,
+            )
+            .await;
+        let cache_write = state.pending_cache_write.take().unwrap();
+        state
+            .stage_explicit_write(
+                key.clone(),
+                cache_write,
+                digest_model(&request.model),
+                digest_system(&request.system),
+                None,
+                digested
+                    .users
+                    .into_iter()
+                    .map(|(_, digest)| digest)
+                    .collect(),
+                0,
+                Vec::new(),
+                digested.timeline,
             )
             .await
             .unwrap();
-        let PendingCacheWrite::Init {
-            conv: mut cached, ..
-        } = state.pending_cache_write.take().unwrap()
-        else {
-            panic!("create must use send_full");
-        };
-        let conversation_uuid = cached.conv_uuid.clone();
-        let first_assistant = cached.turns[0].assistant_uuid.clone();
+        send
+    }
 
-        let append_params = params(vec![
+    #[tokio::test]
+    async fn fork_and_regenerate_reuse_incremental_transport_and_parent_uuid() {
+        let (endpoint, requests) = mock_endpoint().await;
+        let mut state = test_state(endpoint, ConversationCache::new()).await;
+        let mut cached = cached_conversation();
+        cached.turns.push(CachedTurn {
+            user_hashes: vec![1],
+            assistant_uuid: "parent".into(),
+        });
+        let request = params(vec![
             Message::new_text(Role::User, "u1"),
             Message::new_text(Role::Assistant, "a1"),
-            Message::new_text(Role::User, "u2"),
+            Message::new_text(Role::User, "replacement"),
         ]);
-        state
-            .send_explicit_plan(
-                &ExplicitReusePlan::Append {
-                    parent_uuid: first_assistant.clone(),
-                    suffix_start: 1,
-                },
-                Some(&cached),
-                Some(&first_assistant),
-                1,
-                &[2],
-                &[2],
-                &append_params,
-            )
-            .await
-            .unwrap();
-        let PendingCacheWrite::AppendTurn { turn, .. } = state.pending_cache_write.take().unwrap()
-        else {
-            panic!("append must use send_incremental");
-        };
-        let second_assistant = turn.assistant_uuid.clone();
-        cached.turns.push(turn);
-
-        let fork_params = params(vec![
-            Message::new_text(Role::User, "u1"),
-            Message::new_text(Role::Assistant, "a1"),
-            Message::new_text(Role::User, "forked"),
-        ]);
-        state
-            .send_explicit_plan(
-                &ExplicitReusePlan::Fork {
-                    parent_uuid: Some(first_assistant.clone()),
-                    suffix_start: 1,
-                    replace_from_turn: 1,
-                },
-                Some(&cached),
-                Some(&first_assistant),
-                1,
-                &[2],
-                &[3],
-                &fork_params,
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            state.pending_cache_write.take(),
-            Some(PendingCacheWrite::ForkAndAppend {
-                fork_turn_index: 1,
-                ..
-            })
-        ));
-
-        state
-            .send_explicit_plan(
-                &ExplicitReusePlan::Regenerate {
-                    parent_uuid: Some(first_assistant.clone()),
-                    suffix_start: 1,
-                    replace_from_turn: 1,
-                },
-                Some(&cached),
-                Some(&first_assistant),
-                1,
-                &[2],
-                &[4],
-                &append_params,
-            )
-            .await
-            .unwrap();
-
+        for plan in [
+            ExplicitReusePlan::Fork {
+                parent_uuid: Some("parent".into()),
+                suffix_start: 1,
+                replace_from_turn: 1,
+            },
+            ExplicitReusePlan::Regenerate {
+                parent_uuid: Some("parent".into()),
+                suffix_start: 1,
+                replace_from_turn: 1,
+            },
+        ] {
+            state
+                .send_explicit_plan(
+                    &plan,
+                    Some(&cached),
+                    Some("parent"),
+                    1,
+                    &[2],
+                    &[2],
+                    &request,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                state.pending_cache_write.take(),
+                Some(PendingCacheWrite::ForkAndAppend {
+                    fork_turn_index: 1,
+                    ..
+                })
+            ));
+        }
         let requests = requests.lock().unwrap();
         let completions = requests
             .iter()
             .filter(|request| request.path.contains("/completion"))
             .collect::<Vec<_>>();
-        assert_eq!(completions.len(), 4);
-        assert!(
-            completions
-                .iter()
-                .all(|request| request.path.contains(&conversation_uuid))
-        );
-        assert_eq!(completions[1].body["parent_message_uuid"], first_assistant);
-        assert_eq!(completions[2].body["parent_message_uuid"], first_assistant);
-        assert_eq!(completions[3].body["parent_message_uuid"], first_assistant);
-        assert_ne!(second_assistant, first_assistant);
+        assert_eq!(completions.len(), 2);
+        assert!(completions.iter().all(|request| {
+            request.path.contains("/conversation/completion")
+                && request.body["parent_message_uuid"] == "parent"
+        }));
     }
 
     #[tokio::test]
-    async fn try_chat_create_then_append_reuses_conversation() {
+    async fn try_chat_reuses_conversation_and_stops_before_unpersisted_side_effects() {
         let _config_guard = CONFIG_TEST_LOCK.lock().await;
         let (endpoint, requests) = black_box_endpoint().await;
         let original = crate::config::CLEWDR_CONFIG.load().as_ref().clone();
@@ -1510,7 +1555,7 @@ mod tests {
         let conversation_uuid = cached.conv_uuid.clone();
         let first_assistant_uuid = cached.turns[0].assistant_uuid.clone();
 
-        let mut second = ClaudeWebState::new(handle, cache.clone());
+        let mut second = ClaudeWebState::new(handle.clone(), cache.clone());
         second.principal = Some(principal);
         second
             .try_chat(request(vec![
@@ -1520,52 +1565,31 @@ mod tests {
             ]))
             .await
             .unwrap();
-        let requests = requests.lock().unwrap();
-        let completions = requests
-            .iter()
-            .filter(|request| request.path.contains("/completion"))
-            .collect::<Vec<_>>();
-        assert_eq!(completions.len(), 2);
-        assert!(
-            completions
+        let request_count = {
+            let requests = requests.lock().unwrap();
+            let completions = requests
                 .iter()
-                .all(|request| request.path.contains(&conversation_uuid))
-        );
-        assert_eq!(
-            completions[1].body["parent_message_uuid"],
-            first_assistant_uuid
-        );
-    }
+                .filter(|request| request.path.contains("/completion"))
+                .collect::<Vec<_>>();
+            assert_eq!(completions.len(), 2);
+            assert!(
+                completions
+                    .iter()
+                    .all(|request| request.path.contains(&conversation_uuid))
+            );
+            assert_eq!(
+                completions[1].body["parent_message_uuid"],
+                first_assistant_uuid
+            );
+            requests.len()
+        };
 
-    #[tokio::test]
-    async fn persistence_failure_prevents_upload_and_completion_requests() {
-        let _config_guard = CONFIG_TEST_LOCK.lock().await;
-        let (endpoint, requests) = black_box_endpoint().await;
-        let original = crate::config::CLEWDR_CONFIG.load().as_ref().clone();
-        let _restore = ConfigRestore(original.clone());
-        crate::config::CLEWDR_CONFIG.rcu(|_| {
-            let mut config = original.clone();
-            config.rproxy = Some(endpoint.clone());
-            config.no_fs = true;
-            config.skip_non_pro = false;
-            config.skip_normal_pro = false;
-            config
-        });
-        let handle = crate::services::cookie_actor::CookieActorHandle::start()
-            .await
-            .unwrap();
-        let cookie =
-            crate::config::CookieStatus::new(&format!("{}-bbbbbbAA", "b".repeat(86)), None)
-                .unwrap();
-        handle.submit(cookie).await.unwrap();
-        tokio::task::yield_now().await;
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("not-a-directory");
         std::fs::write(&blocker, b"block").unwrap();
         let cache = ConversationCache::persistent(blocker.join("cache.json")).await;
-        let principal = crate::protocol::AuthPrincipal::for_authenticated_user();
-        let mut state = ClaudeWebState::new(handle, cache);
-        state.principal = Some(principal);
+        let mut state = ClaudeWebState::new(handle.clone(), cache);
+        state.principal = Some(crate::protocol::AuthPrincipal::for_authenticated_user());
         let error = state
             .try_chat(CreateMessageParams {
                 model: "claude-sonnet-4-6".into(),
@@ -1588,68 +1612,32 @@ mod tests {
         assert_eq!(source.code, "session_storage_unavailable");
         let requests = requests.lock().unwrap();
         assert!(
-            requests
+            requests[request_count..]
                 .iter()
                 .any(|request| request.path == "/api/bootstrap")
         );
-        assert!(!requests.iter().any(|request| {
+        assert!(!requests[request_count..].iter().any(|request| {
             request.path.contains("/upload-file") || request.path.contains("/completion")
         }));
     }
 
     #[tokio::test]
     async fn consecutive_user_messages_match_create_and_incremental_prompts() {
-        let (endpoint, requests) = mock_endpoint().await;
-        let handle = crate::services::cookie_actor::CookieActorHandle::start()
-            .await
-            .unwrap();
-        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
-        state.endpoint = endpoint;
-        state.org_uuid = Some("org".into());
-        let create = params(vec![
-            Message::new_text(Role::User, "first"),
-            Message::new_text(Role::User, "second"),
-        ]);
-        state
-            .send_explicit_plan(
-                &ExplicitReusePlan::Create,
-                None,
-                None,
-                0,
-                &[0, 1],
-                &[1, 2],
-                &create,
-            )
-            .await
-            .unwrap();
-        let PendingCacheWrite::Init { conv: cached, .. } =
-            state.pending_cache_write.take().unwrap()
-        else {
-            panic!("create must use send_full");
-        };
-        let parent = cached.turns[0].assistant_uuid.clone();
-        let append = params(vec![
-            Message::new_text(Role::User, "history"),
-            Message::new_text(Role::Assistant, "answer"),
-            Message::new_text(Role::User, "first"),
-            Message::new_text(Role::User, "second"),
-        ]);
-        state
-            .send_explicit_plan(
-                &ExplicitReusePlan::Append {
-                    parent_uuid: parent.clone(),
-                    suffix_start: 1,
-                },
-                Some(&cached),
-                Some(&parent),
-                1,
-                &[2, 3],
-                &[3, 4],
-                &append,
-            )
-            .await
-            .unwrap();
-        let requests = requests.lock().unwrap();
+        let requests = create_append_requests(
+            vec![
+                Message::new_text(Role::User, "first"),
+                Message::new_text(Role::User, "second"),
+            ],
+            vec![
+                Message::new_text(Role::User, "history"),
+                Message::new_text(Role::Assistant, "answer"),
+                Message::new_text(Role::User, "first"),
+                Message::new_text(Role::User, "second"),
+            ],
+            &[0, 1],
+            &[2, 3],
+        )
+        .await;
         let completions = requests
             .iter()
             .filter(|request| request.path.contains("/completion"))
@@ -1659,86 +1647,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_image_url_and_document_are_forwarded() {
-        let (endpoint, requests) = mock_endpoint().await;
-        let handle = crate::services::cookie_actor::CookieActorHandle::start()
-            .await
-            .unwrap();
-        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
-        state.endpoint = endpoint;
-        state.org_uuid = Some("org".into());
-        let cached = CachedConversation {
-            conv_uuid: "conversation".into(),
-            org_uuid: "org".into(),
-            cookie_id: "cookie".into(),
-            model: "model".into(),
-            is_pro: false,
-            system_hash: 0,
-            turns: vec![CachedTurn {
-                user_hashes: vec![1],
-                assistant_uuid: "parent".into(),
-            }],
-            created_at: chrono::Utc::now(),
-            last_used: chrono::Utc::now(),
-            valid: true,
-            last_stream_healthy: Arc::new(AtomicBool::new(true)),
-            explicit: None,
-        };
-        let suffix: Message = serde_json::from_value(json!({
-            "role":"user",
-            "content":[
-                {"type":"image_url", "image_url":{"url":"data:image/png;base64,aW1hZ2U="}},
-                {"type":"document", "source":{"type":"text", "data":"notes"}, "title":"notes.txt"}
-            ]
-        }))
-        .unwrap();
-        let request = params(vec![
-            Message::new_text(Role::User, "u1"),
-            Message::new_text(Role::Assistant, "a1"),
-            suffix,
-        ]);
-        state
-            .send_explicit_plan(
-                &ExplicitReusePlan::Append {
-                    parent_uuid: "parent".into(),
-                    suffix_start: 1,
-                },
-                Some(&cached),
-                Some("parent"),
-                1,
-                &[2],
-                &[2],
-                &request,
-            )
-            .await
-            .unwrap();
-        let requests = requests.lock().unwrap();
-        assert!(
-            requests
-                .iter()
-                .any(|request| request.path.contains("/upload-file"))
-        );
-        let completion = requests
-            .iter()
-            .find(|request| request.path.contains("/completion"))
-            .unwrap();
-        assert_eq!(completion.body["files"], json!(["uploaded-file"]));
-        assert_eq!(completion.body["attachments"][0]["file_name"], "notes.txt");
-        assert_eq!(
-            completion.body["attachments"][0]["extracted_content"],
-            "notes"
-        );
-    }
-
-    #[tokio::test]
     async fn create_and_incremental_forward_equivalent_rich_content() {
-        let (endpoint, requests) = mock_endpoint().await;
-        let handle = crate::services::cookie_actor::CookieActorHandle::start()
-            .await
-            .unwrap();
-        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
-        state.endpoint = endpoint;
-        state.org_uuid = Some("org".into());
         let rich_message = || {
             serde_json::from_value::<Message>(json!({
                 "role":"user",
@@ -1750,46 +1659,17 @@ mod tests {
             }))
             .unwrap()
         };
-        let create = params(vec![rich_message()]);
-        state
-            .send_explicit_plan(
-                &ExplicitReusePlan::Create,
-                None,
-                None,
-                0,
-                &[0],
-                &[1],
-                &create,
-            )
-            .await
-            .unwrap();
-        let PendingCacheWrite::Init { conv: cached, .. } =
-            state.pending_cache_write.take().unwrap()
-        else {
-            panic!("create must use send_full");
-        };
-        let parent = cached.turns[0].assistant_uuid.clone();
-        let append = params(vec![
-            rich_message(),
-            Message::new_text(Role::Assistant, "answer"),
-            rich_message(),
-        ]);
-        state
-            .send_explicit_plan(
-                &ExplicitReusePlan::Append {
-                    parent_uuid: parent.clone(),
-                    suffix_start: 1,
-                },
-                Some(&cached),
-                Some(&parent),
-                1,
-                &[2],
-                &[2],
-                &append,
-            )
-            .await
-            .unwrap();
-        let requests = requests.lock().unwrap();
+        let requests = create_append_requests(
+            vec![rich_message()],
+            vec![
+                rich_message(),
+                Message::new_text(Role::Assistant, "answer"),
+                rich_message(),
+            ],
+            &[0],
+            &[2],
+        )
+        .await;
         let completions = requests
             .iter()
             .filter(|request| request.path.contains("/completion"))
@@ -1801,20 +1681,24 @@ mod tests {
             completions[1].body["attachments"]
         );
         assert_eq!(completions[0].body["files"], completions[1].body["files"]);
+        assert_eq!(completions[1].body["files"], json!(["uploaded-file"]));
+        assert_eq!(
+            completions[1].body["attachments"][0]["file_name"],
+            "notes.txt"
+        );
+        assert_eq!(
+            completions[1].body["attachments"][0]["extracted_content"],
+            "notes"
+        );
     }
 
     #[tokio::test]
     async fn partial_initial_upload_failure_requires_reset() {
         let endpoint = partial_upload_failure_endpoint().await;
-        let handle = crate::services::cookie_actor::CookieActorHandle::start()
-            .await
-            .unwrap();
         let cache = ConversationCache::new();
         let key = ExplicitSessionKey::new("principal", "partial-upload");
         let operation = cache.try_lock_explicit_operation(&key).await.unwrap();
-        let mut state = ClaudeWebState::new(handle, cache.clone());
-        state.endpoint = endpoint;
-        state.org_uuid = Some("org".into());
+        let mut state = test_state(endpoint, cache.clone()).await;
         let image = || ContentBlock::Image {
             source: ImageSource::Base64 {
                 media_type: "image/png".into(),
@@ -1827,37 +1711,7 @@ mod tests {
             Role::User,
             vec![image(), image()],
         )]);
-        let digested = digest_messages(&request.messages).unwrap();
-        let send = state
-            .send_explicit_plan(
-                &ExplicitReusePlan::Create,
-                None,
-                None,
-                0,
-                &[0],
-                &[1],
-                &request,
-            )
-            .await;
-        let pending = state.pending_cache_write.take().unwrap();
-        state
-            .stage_explicit_write(
-                key.clone(),
-                pending,
-                digest_model(&request.model),
-                digest_system(&request.system),
-                None,
-                digested
-                    .users
-                    .iter()
-                    .map(|(_, digest)| digest.clone())
-                    .collect(),
-                0,
-                Vec::new(),
-                digested.timeline,
-            )
-            .await
-            .unwrap();
+        let send = send_and_stage_create(&mut state, &key, &request).await;
         assert!(state.finish_explicit_send(&key, send).await.is_err());
         drop(operation);
         let explicit = cache.get_explicit(&key).await.unwrap().explicit.unwrap();
@@ -1891,46 +1745,12 @@ mod tests {
     #[tokio::test]
     async fn no_fs_text_only_explicit_session_commits_in_memory() {
         let (endpoint, _) = mock_endpoint().await;
-        let handle = crate::services::cookie_actor::CookieActorHandle::start()
-            .await
-            .unwrap();
         let cache = ConversationCache::new();
         let key = ExplicitSessionKey::new("principal", "aa".repeat(32));
         let operation = cache.try_lock_explicit_operation(&key).await.unwrap();
-        let mut state = ClaudeWebState::new(handle, cache.clone());
-        state.endpoint = endpoint;
-        state.org_uuid = Some("org".into());
+        let mut state = test_state(endpoint, cache.clone()).await;
         let request = params(vec![Message::new_text(Role::User, "hello")]);
-        let digested = digest_messages(&request.messages).unwrap();
-        let upstream = state
-            .send_explicit_plan(
-                &ExplicitReusePlan::Create,
-                None,
-                None,
-                0,
-                &[0],
-                &[1],
-                &request,
-            )
-            .await
-            .unwrap();
-        let pending = state.pending_cache_write.take().unwrap();
-        state
-            .stage_explicit_write(
-                key.clone(),
-                pending,
-                digest_model(&request.model),
-                digest_system(&request.system),
-                None,
-                digested
-                    .users
-                    .into_iter()
-                    .map(|(_, digest)| digest)
-                    .collect(),
-                0,
-                Vec::new(),
-                digested.timeline,
-            )
+        let upstream = send_and_stage_create(&mut state, &key, &request)
             .await
             .unwrap();
         state.explicit_lifecycle = Some(ExplicitLifecycle::new(
@@ -1964,45 +1784,30 @@ mod tests {
         let first_digest = digest_messages(std::slice::from_ref(&first)).unwrap().users[0]
             .1
             .clone();
-        cache
-            .set_explicit(
-                key.clone(),
-                CachedConversation {
-                    conv_uuid: "conversation".into(),
-                    org_uuid: "org".into(),
-                    cookie_id: "missing-cookie-id".into(),
-                    model: "claude-sonnet-4-6".into(),
-                    is_pro: false,
-                    system_hash: 0,
-                    turns: vec![CachedTurn {
-                        user_hashes: vec![1],
-                        assistant_uuid: "assistant".into(),
-                    }],
-                    created_at: chrono::Utc::now(),
-                    last_used: chrono::Utc::now(),
-                    valid: true,
-                    last_stream_healthy: Arc::new(AtomicBool::new(true)),
-                    explicit: Some(ExplicitConversation {
-                        state: ExplicitSessionState::Committed,
-                        model_digest: digest_model("claude-sonnet-4-6"),
-                        system_digest: digest_system(&None),
-                        turns: vec![crate::claude_web_state::explicit_session::ExplicitTurn {
-                            parent_uuid_before: None,
-                            user_digests: vec![first_digest.clone()],
-                            assistant_uuid_after: "assistant".into(),
-                            parent_timeline: Vec::new(),
-                            request_timeline: vec![format!("user:{first_digest}")],
-                            assistant_digest_after: Some(
-                                crate::claude_web_state::explicit_session::digest_assistant_output(
-                                    "generated",
-                                ),
-                            ),
-                        }],
-                        pending: None,
-                    }),
-                },
-            )
-            .await;
+        let mut conversation = cached_conversation();
+        conversation.cookie_id = "missing-cookie-id".into();
+        conversation.model = "claude-sonnet-4-6".into();
+        conversation.turns.push(CachedTurn {
+            user_hashes: vec![1],
+            assistant_uuid: "assistant".into(),
+        });
+        conversation.explicit = Some(ExplicitConversation {
+            state: ExplicitSessionState::Committed,
+            model_digest: digest_model("claude-sonnet-4-6"),
+            system_digest: digest_system(&None),
+            turns: vec![crate::claude_web_state::explicit_session::ExplicitTurn {
+                parent_uuid_before: None,
+                user_digests: vec![first_digest.clone()],
+                assistant_uuid_after: "assistant".into(),
+                parent_timeline: Vec::new(),
+                request_timeline: vec![format!("user:{first_digest}")],
+                assistant_digest_after: Some(
+                    crate::claude_web_state::explicit_session::digest_assistant_output("generated"),
+                ),
+            }],
+            pending: None,
+        });
+        cache.set_explicit(key.clone(), conversation).await;
         let mut state = ClaudeWebState::new(handle, cache.clone());
         state.principal = Some(principal);
         let error = state
@@ -2035,20 +1840,7 @@ mod tests {
 
     #[test]
     fn cookie_and_organization_binding_mismatches_expire_session() {
-        let mut cached = CachedConversation {
-            conv_uuid: "conversation".into(),
-            org_uuid: "org".into(),
-            cookie_id: "cookie".into(),
-            model: "model".into(),
-            is_pro: false,
-            system_hash: 0,
-            turns: Vec::new(),
-            created_at: chrono::Utc::now(),
-            last_used: chrono::Utc::now(),
-            valid: true,
-            last_stream_healthy: Arc::new(AtomicBool::new(true)),
-            explicit: None,
-        };
+        let mut cached = cached_conversation();
         assert!(explicit_binding_error(&cached, "other", "org").is_some());
         cached.cookie_id = "cookie".into();
         assert!(explicit_binding_error(&cached, "cookie", "other").is_some());
@@ -2063,31 +1855,15 @@ mod tests {
                 .unwrap();
             let cache = ConversationCache::new();
             let key = ExplicitSessionKey::new("principal", status.as_u16().to_string());
-            cache
-                .set_explicit(
-                    key.clone(),
-                    CachedConversation {
-                        conv_uuid: "conversation".into(),
-                        org_uuid: "org".into(),
-                        cookie_id: "cookie".into(),
-                        model: "model".into(),
-                        is_pro: false,
-                        system_hash: 0,
-                        turns: Vec::new(),
-                        created_at: chrono::Utc::now(),
-                        last_used: chrono::Utc::now(),
-                        valid: true,
-                        last_stream_healthy: Arc::new(AtomicBool::new(true)),
-                        explicit: Some(ExplicitConversation {
-                            state: ExplicitSessionState::InFlight,
-                            model_digest: "model".into(),
-                            system_digest: "system".into(),
-                            turns: Vec::new(),
-                            pending: None,
-                        }),
-                    },
-                )
-                .await;
+            let mut conversation = cached_conversation();
+            conversation.explicit = Some(ExplicitConversation {
+                state: ExplicitSessionState::InFlight,
+                model_digest: "model".into(),
+                system_digest: "system".into(),
+                turns: Vec::new(),
+                pending: None,
+            });
+            cache.set_explicit(key.clone(), conversation).await;
             let state = ClaudeWebState::new(handle, cache.clone());
             let error = state
                 .finish_explicit_send(

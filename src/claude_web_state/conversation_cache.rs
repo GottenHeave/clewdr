@@ -37,6 +37,21 @@ fn storage_error(error: impl std::fmt::Display) -> ProtocolError {
     )
 }
 
+fn restore_record(
+    map: &mut HashMap<StoredCacheKey, CachedConversation>,
+    key: StoredCacheKey,
+    previous: Option<CachedConversation>,
+) {
+    match previous {
+        Some(previous) => {
+            map.insert(key, previous);
+        }
+        None => {
+            map.remove(&key);
+        }
+    }
+}
+
 /// Represents one round-trip (ClewdR request → Claude response) in a cached conversation
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CachedTurn {
@@ -384,18 +399,15 @@ impl ConversationCache {
         key: ExplicitSessionKey,
         conv: CachedConversation,
     ) -> Result<(), ProtocolError> {
-        let _mutation = self.explicit_mutation_lock.lock().await;
-        let _persist = self.persist_lock.lock().await;
-        let stored_key = StoredCacheKey::ExplicitSession(key.clone());
-        let previous = {
-            let mut map = self.inner.lock().await;
-            if !map.contains_key(&stored_key) {
-                enforce_explicit_capacity(&map, &key.session_principal)?;
+        self.mutate_explicit(&key, |map, stored_key| {
+            if !map.contains_key(stored_key) {
+                enforce_explicit_capacity(map, &key.session_principal)?;
             }
-            map.insert(stored_key.clone(), conv)
-        };
-        self.persist_explicit_change_locked(stored_key, previous)
-            .await
+            map.insert(stored_key.clone(), conv);
+            Ok(true)
+        })
+        .await?;
+        Ok(())
     }
 
     async fn set_stored(&self, key: StoredCacheKey, conv: CachedConversation) {
@@ -411,15 +423,10 @@ impl ConversationCache {
         key: &ExplicitSessionKey,
         pending: PendingExplicitTurn,
     ) -> Result<(), ProtocolError> {
-        let _mutation = self.explicit_mutation_lock.lock().await;
-        let _persist = self.persist_lock.lock().await;
-        let stored_key = StoredCacheKey::ExplicitSession(key.clone());
-        let previous = {
-            let mut map = self.inner.lock().await;
+        self.mutate_explicit(key, |map, stored_key| {
             let conversation = map
-                .get_mut(&stored_key)
+                .get_mut(stored_key)
                 .ok_or_else(|| explicit_missing("Session disappeared before completion"))?;
-            let previous = conversation.clone();
             let explicit = conversation
                 .explicit
                 .as_mut()
@@ -427,10 +434,10 @@ impl ConversationCache {
             explicit.state = ExplicitSessionState::InFlight;
             explicit.pending = Some(pending);
             conversation.last_used = Utc::now();
-            previous
-        };
-        self.persist_explicit_change_locked(stored_key, Some(previous))
-            .await
+            Ok(true)
+        })
+        .await?;
+        Ok(())
     }
 
     pub async fn commit_explicit_turn(
@@ -438,15 +445,10 @@ impl ConversationCache {
         key: &ExplicitSessionKey,
         assistant_digest_after: Option<String>,
     ) -> Result<(), ProtocolError> {
-        let _mutation = self.explicit_mutation_lock.lock().await;
-        let _persist = self.persist_lock.lock().await;
-        let stored_key = StoredCacheKey::ExplicitSession(key.clone());
-        let previous = {
-            let mut map = self.inner.lock().await;
+        self.mutate_explicit(key, |map, stored_key| {
             let conversation = map
-                .get_mut(&stored_key)
+                .get_mut(stored_key)
                 .ok_or_else(|| explicit_missing("Session disappeared before commit"))?;
-            let previous = conversation.clone();
             let explicit = conversation
                 .explicit
                 .as_mut()
@@ -471,34 +473,29 @@ impl ConversationCache {
             });
             explicit.state = ExplicitSessionState::Committed;
             conversation.last_used = Utc::now();
-            previous
-        };
-        self.persist_explicit_change_locked(stored_key, Some(previous))
-            .await
+            Ok(true)
+        })
+        .await?;
+        Ok(())
     }
 
     pub async fn mark_explicit_uncertain(
         &self,
         key: &ExplicitSessionKey,
     ) -> Result<(), ProtocolError> {
-        let _mutation = self.explicit_mutation_lock.lock().await;
-        let _persist = self.persist_lock.lock().await;
-        let stored_key = StoredCacheKey::ExplicitSession(key.clone());
-        let previous = {
-            let mut map = self.inner.lock().await;
+        self.mutate_explicit(key, |map, stored_key| {
             let conversation = map
-                .get_mut(&stored_key)
+                .get_mut(stored_key)
                 .ok_or_else(|| explicit_missing("Session disappeared before uncertain state"))?;
-            let previous = conversation.clone();
             let explicit = conversation
                 .explicit
                 .as_mut()
                 .ok_or_else(|| explicit_missing("Session metadata is unavailable"))?;
             explicit.state = ExplicitSessionState::Uncertain;
-            previous
-        };
-        self.persist_explicit_change_locked(stored_key, Some(previous))
-            .await
+            Ok(true)
+        })
+        .await?;
+        Ok(())
     }
 
     pub async fn mark_explicit_uncertain_in_memory(&self, key: &ExplicitSessionKey) {
@@ -512,15 +509,10 @@ impl ConversationCache {
     }
 
     pub async fn tombstone_explicit(&self, key: &ExplicitSessionKey) -> Result<(), ProtocolError> {
-        let _mutation = self.explicit_mutation_lock.lock().await;
-        let _persist = self.persist_lock.lock().await;
-        let stored_key = StoredCacheKey::ExplicitSession(key.clone());
-        let previous = {
-            let mut map = self.inner.lock().await;
+        self.mutate_explicit(key, |map, stored_key| {
             let conversation = map
-                .get_mut(&stored_key)
+                .get_mut(stored_key)
                 .ok_or_else(|| explicit_missing("Session disappeared before tombstone"))?;
-            let previous = conversation.clone();
             let explicit = conversation
                 .explicit
                 .as_mut()
@@ -528,43 +520,46 @@ impl ConversationCache {
             explicit.state = ExplicitSessionState::Tombstoned;
             explicit.pending = None;
             conversation.last_used = Utc::now();
-            previous
-        };
-        self.persist_explicit_change_locked(stored_key, Some(previous))
-            .await
+            Ok(true)
+        })
+        .await?;
+        Ok(())
     }
 
     pub async fn reset_explicit(&self, key: &ExplicitSessionKey) -> Result<bool, ProtocolError> {
+        self.mutate_explicit(key, |map, stored_key| Ok(map.remove(stored_key).is_some()))
+            .await
+    }
+
+    async fn mutate_explicit(
+        &self,
+        key: &ExplicitSessionKey,
+        mutation: impl FnOnce(
+            &mut HashMap<StoredCacheKey, CachedConversation>,
+            &StoredCacheKey,
+        ) -> Result<bool, ProtocolError>,
+    ) -> Result<bool, ProtocolError> {
         let _mutation = self.explicit_mutation_lock.lock().await;
         let _persist = self.persist_lock.lock().await;
         let stored_key = StoredCacheKey::ExplicitSession(key.clone());
-        let removed = self.inner.lock().await.remove(&stored_key);
-        let Some(removed) = removed else {
-            return Ok(false);
-        };
-        self.persist_explicit_change_locked(stored_key, Some(removed))
-            .await?;
-        Ok(true)
-    }
-
-    async fn persist_explicit_change_locked(
-        &self,
-        key: StoredCacheKey,
-        previous: Option<CachedConversation>,
-    ) -> Result<(), ProtocolError> {
-        if let Err(error) = self.persist_snapshot().await {
+        let previous = {
             let mut map = self.inner.lock().await;
-            match previous {
-                Some(previous) => {
-                    map.insert(key, previous);
-                }
-                None => {
-                    map.remove(&key);
+            let previous = map.get(&stored_key).cloned();
+            match mutation(&mut map, &stored_key) {
+                Ok(true) => previous,
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    restore_record(&mut map, stored_key, previous);
+                    return Err(error);
                 }
             }
+        };
+        if let Err(error) = self.persist_snapshot().await {
+            let mut map = self.inner.lock().await;
+            restore_record(&mut map, stored_key, previous);
             return Err(storage_error(error));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Append a new turn to an existing cached conversation
@@ -832,21 +827,28 @@ mod explicit_tests {
         }
     }
 
+    async fn fill_sessions(cache: &ConversationCache, count: usize, state: ExplicitSessionState) {
+        let mut map = cache.inner.lock().await;
+        for index in 0..count {
+            map.insert(
+                StoredCacheKey::ExplicitSession(ExplicitSessionKey::new(
+                    "principal",
+                    index.to_string(),
+                )),
+                conversation(state),
+            );
+        }
+    }
+
     #[tokio::test]
     async fn enforces_live_and_record_capacity_per_principal() {
         let cache = ConversationCache::new();
-        {
-            let mut map = cache.inner.lock().await;
-            for index in 0..MAX_LIVE_SESSIONS_PER_PRINCIPAL {
-                map.insert(
-                    StoredCacheKey::ExplicitSession(ExplicitSessionKey::new(
-                        "principal",
-                        index.to_string(),
-                    )),
-                    conversation(ExplicitSessionState::Committed),
-                );
-            }
-        }
+        fill_sessions(
+            &cache,
+            MAX_LIVE_SESSIONS_PER_PRINCIPAL,
+            ExplicitSessionState::Committed,
+        )
+        .await;
         let error = cache
             .set_explicit_checked(
                 ExplicitSessionKey::new("principal", "overflow"),
@@ -857,18 +859,12 @@ mod explicit_tests {
         assert_eq!(error.code, "session_capacity_exceeded");
 
         let cache = ConversationCache::new();
-        {
-            let mut map = cache.inner.lock().await;
-            for index in 0..MAX_SESSION_RECORDS_PER_PRINCIPAL {
-                map.insert(
-                    StoredCacheKey::ExplicitSession(ExplicitSessionKey::new(
-                        "principal",
-                        index.to_string(),
-                    )),
-                    conversation(ExplicitSessionState::Tombstoned),
-                );
-            }
-        }
+        fill_sessions(
+            &cache,
+            MAX_SESSION_RECORDS_PER_PRINCIPAL,
+            ExplicitSessionState::Tombstoned,
+        )
+        .await;
         let error = cache
             .set_explicit_checked(
                 ExplicitSessionKey::new("principal", "overflow"),

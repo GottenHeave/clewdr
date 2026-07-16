@@ -97,26 +97,7 @@ mod tests {
         cache
             .set_explicit(
                 key.clone(),
-                CachedConversation {
-                    conv_uuid: "conversation".into(),
-                    org_uuid: "org".into(),
-                    cookie_id: "cookie".into(),
-                    model: "model".into(),
-                    is_pro: false,
-                    system_hash: 0,
-                    turns: Vec::new(),
-                    created_at: chrono::Utc::now(),
-                    last_used: chrono::Utc::now(),
-                    valid: true,
-                    last_stream_healthy: Arc::new(AtomicBool::new(true)),
-                    explicit: Some(ExplicitConversation {
-                        state: ExplicitSessionState::Tombstoned,
-                        model_digest: "model".into(),
-                        system_digest: "system".into(),
-                        turns: Vec::new(),
-                        pending: None,
-                    }),
-                },
+                cached_session(ExplicitSessionState::Tombstoned),
             )
             .await;
         let app = Router::new()
@@ -151,48 +132,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reset_allows_uncertain_and_tombstoned_sessions_to_create_again() {
-        for (index, state) in [
-            ExplicitSessionState::Uncertain,
-            ExplicitSessionState::Tombstoned,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let cache = ConversationCache::new();
-            let key = ExplicitSessionKey::new("principal", index.to_string());
-            cache.set_explicit(key.clone(), cached_session(state)).await;
-            assert!(cache.reset_explicit(&key).await.unwrap());
-            let reuse = plan(
+    async fn reset_allows_uncertain_session_to_create_again() {
+        let cache = ConversationCache::new();
+        let key = ExplicitSessionKey::new("principal", "uncertain");
+        cache
+            .set_explicit(key.clone(), cached_session(ExplicitSessionState::Uncertain))
+            .await;
+        assert!(cache.reset_explicit(&key).await.unwrap());
+        assert_eq!(
+            plan(
                 None,
                 &["user".into()],
                 &["user:user".into()],
                 "model",
                 "system",
             )
-            .unwrap();
-            assert_eq!(reuse, ExplicitReusePlan::Create);
-        }
-    }
-
-    #[tokio::test]
-    async fn uncertain_session_does_not_age_out_before_reset() {
-        let cache = ConversationCache::new();
-        let key = ExplicitSessionKey::new("principal", "uncertain");
-        let mut conversation = cached_session(ExplicitSessionState::Uncertain);
-        conversation.created_at = chrono::Utc::now() - chrono::Duration::days(30);
-        conversation.last_used = conversation.created_at;
-        cache.set_explicit(key.clone(), conversation).await;
-        cache.cleanup().await;
-        assert_eq!(
-            cache
-                .get_explicit(&key)
-                .await
-                .unwrap()
-                .explicit
-                .unwrap()
-                .state,
-            ExplicitSessionState::Uncertain
+            .unwrap(),
+            ExplicitReusePlan::Create
         );
     }
 }

@@ -343,67 +343,6 @@ fn default_upload_file_name(media_type: &str) -> &'static str {
     }
 }
 
-pub(super) fn extract_document_file_name(source: &Value, title: Option<&str>) -> Option<String> {
-    title.and_then(normalize_file_name).or_else(|| {
-        ["file_name", "filename", "name", "title"]
-            .into_iter()
-            .find_map(|key| {
-                source
-                    .get(key)
-                    .and_then(Value::as_str)
-                    .and_then(normalize_file_name)
-            })
-    })
-}
-
-pub(super) fn extract_document_text(source: &Value) -> Option<String> {
-    let source_type = source.get("type").and_then(Value::as_str)?;
-    if source_type != "text" {
-        return None;
-    }
-    let text = source
-        .get("data")
-        .or_else(|| source.get("text"))
-        .and_then(Value::as_str)?
-        .trim()
-        .to_string();
-    (!text.is_empty()).then_some(text)
-}
-
-pub(super) fn extract_file_id(source: &Value) -> Option<String> {
-    let source_type = source.get("type").and_then(Value::as_str)?;
-    if source_type != "file" {
-        return None;
-    }
-    source
-        .get("file_id")
-        .or_else(|| source.get("id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-pub(super) fn extract_base64_file(source: &Value) -> Option<(String, String)> {
-    let source_type = source.get("type").and_then(Value::as_str)?;
-    if source_type != "base64" {
-        return None;
-    }
-    let media_type = source
-        .get("media_type")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|media_type| !media_type.is_empty())?
-        .to_string();
-    let data = source
-        .get("data")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|data| !data.is_empty())?
-        .to_string();
-    Some((media_type, data))
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;

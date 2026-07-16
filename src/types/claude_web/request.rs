@@ -198,46 +198,33 @@ fn normalize_document(
     let file_name = extract_document_file_name(source, title);
     match source.get("type").and_then(Value::as_str) {
         Some("text") => {
-            let text = source
-                .get("data")
-                .or_else(|| source.get("text"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
+            let text = extract_document_text(source)
                 .ok_or_else(|| ExplicitContentError::invalid("Document text must not be empty"))?;
             let attachment = match &file_name {
-                Some(file_name) => Attachment::new_with_file_name(text.to_owned(), file_name),
-                None => Attachment::new(text.to_owned()),
+                Some(file_name) => Attachment::new_with_file_name(text, file_name),
+                None => Attachment::new(text),
             };
             identity.push(serde_json::to_value(&attachment).expect("attachment serializes"));
             attachments.push(attachment);
         }
         Some("file") => {
-            let file_id = source
-                .get("file_id")
-                .or_else(|| source.get("id"))
-                .and_then(Value::as_str)
+            let file_id = extract_file_id(source)
                 .ok_or_else(|| ExplicitContentError::invalid("Document file ID is missing"))?;
-            let source = normalized_file_source(file_id)?;
+            let source = normalized_file_source(&file_id)?;
             identity.push(serde_json::json!({ "type": "image", "source": source }));
             images.push(source);
         }
         Some("base64") => {
-            let media_type = source
-                .get("media_type")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| ExplicitContentError::invalid("Document media type is missing"))?;
-            let data = source
-                .get("data")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| ExplicitContentError::invalid("Document data is missing"))?;
+            let (media_type, data) = extract_base64_file(source).ok_or_else(|| {
+                let message = match source.get("media_type").and_then(Value::as_str) {
+                    Some(media_type) if !media_type.trim().is_empty() => "Document data is missing",
+                    _ => "Document media type is missing",
+                };
+                ExplicitContentError::invalid(message)
+            })?;
             let source = ImageSource::Base64 {
-                media_type: media_type.to_owned(),
-                data: data.to_owned(),
+                media_type,
+                data,
                 file_name,
             };
             identity.push(serde_json::json!({ "type": "image", "source": source }));
@@ -252,7 +239,7 @@ fn normalize_document(
     Ok(())
 }
 
-fn extract_document_file_name(source: &Value, title: Option<&str>) -> Option<String> {
+pub(crate) fn extract_document_file_name(source: &Value, title: Option<&str>) -> Option<String> {
     title.and_then(normalize_file_name).or_else(|| {
         ["file_name", "filename", "name", "title"]
             .into_iter()
@@ -263,6 +250,49 @@ fn extract_document_file_name(source: &Value, title: Option<&str>) -> Option<Str
                     .and_then(normalize_file_name)
             })
     })
+}
+
+pub(crate) fn extract_document_text(source: &Value) -> Option<String> {
+    (source.get("type").and_then(Value::as_str) == Some("text"))
+        .then(|| {
+            source
+                .get("data")
+                .or_else(|| source.get("text"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .flatten()
+}
+
+pub(crate) fn extract_file_id(source: &Value) -> Option<String> {
+    (source.get("type").and_then(Value::as_str) == Some("file"))
+        .then(|| {
+            source
+                .get("file_id")
+                .or_else(|| source.get("id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .flatten()
+}
+
+pub(crate) fn extract_base64_file(source: &Value) -> Option<(String, String)> {
+    if source.get("type").and_then(Value::as_str) != Some("base64") {
+        return None;
+    }
+    let field = |name| {
+        source
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    Some((field("media_type")?, field("data")?))
 }
 
 pub fn normalize_file_name(file_name: &str) -> Option<String> {
