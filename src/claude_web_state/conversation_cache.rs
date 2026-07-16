@@ -412,23 +412,9 @@ impl ConversationCache {
 
     /// Update the stream health flag on an existing cached conversation
     pub async fn update_stream_health(&self, key: &CacheKey, flag: Arc<AtomicBool>) {
-        self.update_stored_stream_health(&StoredCacheKey::Legacy(key.clone()), flag)
-            .await;
-    }
-
-    pub async fn update_explicit_stream_health(
-        &self,
-        key: &ExplicitSessionKey,
-        flag: Arc<AtomicBool>,
-    ) {
-        self.update_stored_stream_health(&StoredCacheKey::ExplicitSession(key.clone()), flag)
-            .await;
-    }
-
-    async fn update_stored_stream_health(&self, key: &StoredCacheKey, flag: Arc<AtomicBool>) {
         let updated = {
             let mut map = self.inner.lock().await;
-            if let Some(conv) = map.get_mut(key) {
+            if let Some(conv) = map.get_mut(&StoredCacheKey::Legacy(key.clone())) {
                 conv.last_stream_healthy = flag;
                 true
             } else {
@@ -442,18 +428,8 @@ impl ConversationCache {
 
     /// Check if the last stream completed healthily for a given cache key
     pub async fn is_last_stream_healthy(&self, key: &CacheKey) -> bool {
-        self.is_last_stored_stream_healthy(&StoredCacheKey::Legacy(key.clone()))
-            .await
-    }
-
-    pub async fn is_last_explicit_stream_healthy(&self, key: &ExplicitSessionKey) -> bool {
-        self.is_last_stored_stream_healthy(&StoredCacheKey::ExplicitSession(key.clone()))
-            .await
-    }
-
-    async fn is_last_stored_stream_healthy(&self, key: &StoredCacheKey) -> bool {
         let map = self.inner.lock().await;
-        map.get(key)
+        map.get(&StoredCacheKey::Legacy(key.clone()))
             .map(|c| c.last_stream_healthy.load(Ordering::Relaxed))
             .unwrap_or(true)
     }

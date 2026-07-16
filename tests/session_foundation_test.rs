@@ -159,11 +159,6 @@ async fn explicit_session_mutations_use_the_explicit_scope() {
     assert_eq!(conversation.turns.len(), 1);
     assert_eq!(conversation.turns[0].assistant_uuid, "fork");
 
-    cache
-        .update_explicit_stream_health(&key, Arc::new(AtomicBool::new(false)))
-        .await;
-    assert!(!cache.is_last_explicit_stream_healthy(&key).await);
-
     cache.invalidate_explicit(&key).await;
     assert!(cache.get_explicit(&key).await.is_none());
 }
