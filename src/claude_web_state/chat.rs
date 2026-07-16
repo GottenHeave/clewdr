@@ -8,24 +8,22 @@ use snafu::ResultExt;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 use wreq::{Method, Response, header::ACCEPT};
 
-use super::{
-    ClaudeWebState, PendingCacheWrite,
-    transform::{
-        extract_base64_file, extract_document_file_name, extract_document_text, extract_file_id,
-    },
-};
+use super::{ClaudeWebState, PendingCacheWrite};
 use crate::{
     claude_web_state::conversation_cache::{CachedConversation, CachedTurn, ExplicitSessionKey},
     claude_web_state::diff::{self, DiffResult, extract_user_hashes, hash_system},
     claude_web_state::explicit_session::{
         ExplicitConversation, ExplicitLifecycle, ExplicitReusePlan, ExplicitSessionState,
-        PendingExplicitTurn, digest_messages, digest_model, digest_system, parent_timeline, plan,
+        PendingExplicitTurn, content_error, digest_messages, digest_model, digest_system,
+        parent_timeline, plan,
     },
     config::CLEWDR_CONFIG,
     error::{CheckClaudeErr, ClewdrError, WreqSnafu},
     protocol::{ProtocolError, parse_session_id},
-    types::claude::{ContentBlock, CreateMessageParams, ImageSource, Message, MessageContent},
-    types::claude_web::request::{Attachment, CreateConversationParams, TurnMessageUuids},
+    types::claude::{CreateMessageParams, ImageSource, Message},
+    types::claude_web::request::{
+        Attachment, CreateConversationParams, TurnMessageUuids, normalize_explicit_message,
+    },
     utils::{TIME_ZONE, print_out_json},
 };
 
@@ -216,7 +214,7 @@ impl ClaudeWebState {
             )
             .await;
         if matches!(cookie, Err(ClewdrError::NoCookieAvailable)) && existing.is_some() {
-            self.conv_cache.tombstone_explicit(&key).await;
+            self.conv_cache.tombstone_explicit(&key).await?;
             return Err(ProtocolError::new(
                 http::StatusCode::GONE,
                 "conversation_expired",
@@ -232,7 +230,7 @@ impl ClaudeWebState {
         if let Some(existing) = &existing
             && explicit_binding_error(existing, &self.cookie_id(), &organization_uuid).is_some()
         {
-            self.conv_cache.tombstone_explicit(&key).await;
+            self.conv_cache.tombstone_explicit(&key).await?;
             return Err(ProtocolError::new(
                 http::StatusCode::GONE,
                 "conversation_expired",
@@ -328,7 +326,7 @@ impl ClaudeWebState {
             Err(ClewdrError::ClaudeHttpError { code, .. })
                 if code == http::StatusCode::NOT_FOUND || code == http::StatusCode::GONE =>
             {
-                self.conv_cache.tombstone_explicit(key).await;
+                self.conv_cache.tombstone_explicit(key).await?;
                 Err(ProtocolError::new(
                     http::StatusCode::GONE,
                     "conversation_expired",
@@ -337,7 +335,7 @@ impl ClaudeWebState {
                 .into())
             }
             Err(error) => {
-                self.conv_cache.mark_explicit_uncertain(key).await;
+                self.conv_cache.mark_explicit_uncertain(key).await?;
                 Err(error)
             }
         }
@@ -393,41 +391,42 @@ impl ClaudeWebState {
         parent_timeline: Vec<String>,
         request_timeline: Vec<String>,
     ) -> Result<(), ProtocolError> {
-        let assistant_uuid_after = match write {
-            PendingCacheWrite::Init { mut conv, .. } => {
+        let (assistant_uuid_after, initial) = match write {
+            PendingCacheWrite::Init { conv, .. } => {
                 let assistant_uuid = conv
                     .turns
                     .last()
                     .expect("initial cache write has a turn")
                     .assistant_uuid
                     .clone();
-                conv.turns.clear();
-                conv.explicit = Some(ExplicitConversation {
-                    state: ExplicitSessionState::InFlight,
-                    model_digest,
-                    system_digest,
-                    turns: Vec::new(),
-                    pending: None,
-                });
-                self.conv_cache.set_explicit(key.clone(), *conv).await;
-                assistant_uuid
+                (assistant_uuid, Some(conv))
             }
             PendingCacheWrite::AppendTurn { turn, .. }
-            | PendingCacheWrite::ForkAndAppend { turn, .. } => turn.assistant_uuid,
+            | PendingCacheWrite::ForkAndAppend { turn, .. } => (turn.assistant_uuid, None),
         };
-        self.conv_cache
-            .stage_explicit_turn(
-                &key,
-                PendingExplicitTurn {
-                    parent_uuid_before,
-                    user_digests,
-                    assistant_uuid_after,
-                    replace_from_turn,
-                    parent_timeline,
-                    request_timeline,
-                },
-            )
-            .await?;
+        let pending = PendingExplicitTurn {
+            parent_uuid_before,
+            user_digests,
+            assistant_uuid_after,
+            replace_from_turn,
+            parent_timeline,
+            request_timeline,
+        };
+        if let Some(mut conversation) = initial {
+            conversation.turns.clear();
+            conversation.explicit = Some(ExplicitConversation {
+                state: ExplicitSessionState::InFlight,
+                model_digest,
+                system_digest,
+                turns: Vec::new(),
+                pending: Some(pending),
+            });
+            self.conv_cache
+                .set_explicit_checked(key, *conversation)
+                .await?;
+        } else {
+            self.conv_cache.stage_explicit_turn(&key, pending).await?;
+        }
         Ok(())
     }
 
@@ -597,11 +596,6 @@ impl ClaudeWebState {
             assistant_message_uuid: assistant_uuid.clone(),
         });
 
-        let images = body.images.drain(..).collect::<Vec<_>>();
-
-        let files = self.upload_files(images, &org_uuid, &new_uuid).await?;
-        body.files = files;
-
         if write_cache {
             let user_hashes = extract_user_hashes(&p.messages)
                 .iter()
@@ -632,6 +626,10 @@ impl ClaudeWebState {
                 }),
             });
         }
+
+        let images = body.images.drain(..).collect::<Vec<_>>();
+        let files = self.upload_files(images, &org_uuid, &new_uuid).await?;
+        body.files = files;
 
         // send the request
         print_out_json(&body, "claude_web_clewdr_req.json");
@@ -685,7 +683,7 @@ impl ClaudeWebState {
             .collect();
 
         // Bundle user messages into prompt + optional attachment
-        let bundled = self.bundle_user_messages(&new_user_msgs);
+        let bundled = self.bundle_user_messages(&new_user_msgs)?;
 
         // Generate turn UUIDs
         let human_uuid = uuid::Uuid::new_v4().to_string();
@@ -765,7 +763,7 @@ impl ClaudeWebState {
             .collect();
 
         // Bundle all remaining user messages
-        let bundled = self.bundle_user_messages(&remaining_user_msgs);
+        let bundled = self.bundle_user_messages(&remaining_user_msgs)?;
 
         let human_uuid = uuid::Uuid::new_v4().to_string();
         let assistant_uuid = uuid::Uuid::new_v4().to_string();
@@ -918,56 +916,21 @@ impl ClaudeWebState {
     }
 
     /// Merge user messages into prompt or attachment based on length
-    fn bundle_user_messages(&self, user_msgs: &[&Message]) -> BundledMessages {
+    fn bundle_user_messages(
+        &self,
+        user_msgs: &[&Message],
+    ) -> Result<BundledMessages, ProtocolError> {
         let mut texts: Vec<String> = vec![];
         let mut attachments: Vec<Attachment> = vec![];
         let mut images: Vec<ImageSource> = vec![];
 
         for msg in user_msgs {
-            match &msg.content {
-                MessageContent::Text { content } => {
-                    texts.push(content.trim().to_string());
-                }
-                MessageContent::Blocks { content } => {
-                    for block in content {
-                        match block {
-                            ContentBlock::Text { text, .. } => {
-                                texts.push(text.trim().to_string());
-                            }
-                            ContentBlock::Image { source, .. } => {
-                                images.push(source.clone());
-                            }
-                            ContentBlock::Document { source, title, .. } => {
-                                let file_name =
-                                    extract_document_file_name(source, title.as_deref());
-                                if let Some(text) = extract_document_text(source) {
-                                    attachments.push(match file_name {
-                                        Some(file_name) => {
-                                            Attachment::new_with_file_name(text, file_name)
-                                        }
-                                        None => Attachment::new(text),
-                                    });
-                                } else if let Some(file_id) = extract_file_id(source) {
-                                    images.push(ImageSource::File { file_id });
-                                } else if let Some((media_type, data)) = extract_base64_file(source)
-                                {
-                                    images.push(ImageSource::Base64 {
-                                        media_type,
-                                        data,
-                                        file_name,
-                                    });
-                                }
-                            }
-                            ContentBlock::ContainerUpload { file_id, .. } => {
-                                images.push(ImageSource::File {
-                                    file_id: file_id.clone(),
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+            let normalized = normalize_explicit_message(msg).map_err(content_error)?;
+            if !normalized.text_blocks.is_empty() {
+                texts.push(normalized.text_blocks.join("\n"));
             }
+            attachments.extend(normalized.attachments);
+            images.extend(normalized.images);
         }
 
         let combined = texts.join("\n\n");
@@ -981,22 +944,22 @@ impl ClaudeWebState {
             if prompt.is_empty() && (!attachments.is_empty() || !images.is_empty()) {
                 prompt = "Please answer using the attached content.".to_string();
             }
-            BundledMessages {
+            Ok(BundledMessages {
                 prompt,
                 attachments,
                 images,
-            }
+            })
         } else {
             attachments.push(Attachment::new(combined));
             let mut p_str = CLEWDR_CONFIG.load().custom_prompt.clone();
             if p_str.is_empty() {
                 p_str = "Please answer using the attached content.".to_string();
             }
-            BundledMessages {
+            Ok(BundledMessages {
                 prompt: p_str,
                 attachments,
                 images,
-            }
+            })
         }
     }
 
@@ -1056,7 +1019,10 @@ fn explicit_binding_error(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     use axum::{
         Router,
@@ -1070,7 +1036,10 @@ mod tests {
     use crate::claude_web_state::conversation_cache::ConversationCache;
 
     use super::*;
-    use crate::types::claude::{OutputConfig, OutputEffort, Role, Thinking, ThinkingMode};
+    use crate::types::claude::{
+        ContentBlock, ImageSource, Metadata, OutputConfig, OutputEffort, Role, Thinking,
+        ThinkingMode,
+    };
 
     #[derive(Clone, Debug)]
     struct RecordedRequest {
@@ -1083,12 +1052,20 @@ mod tests {
         request: Request,
     ) -> AxumResponse {
         let path = request.uri().path().to_owned();
+        let is_upload = path.contains("/upload-file");
         let bytes = to_bytes(request.into_body(), usize::MAX).await.unwrap();
         let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         requests
             .lock()
             .unwrap()
             .push(RecordedRequest { path, body });
+        if is_upload {
+            return AxumResponse::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from("{\"file_uuid\":\"uploaded-file\"}"))
+                .unwrap();
+        }
         AxumResponse::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "text/event-stream")
@@ -1110,6 +1087,129 @@ mod tests {
             url::Url::parse(&format!("http://{address}/")).unwrap(),
             requests,
         )
+    }
+
+    #[derive(Clone)]
+    struct FailingUploadState {
+        uploads: Arc<AtomicUsize>,
+    }
+
+    async fn fail_second_upload(
+        State(state): State<FailingUploadState>,
+        request: Request,
+    ) -> AxumResponse {
+        if request.uri().path().contains("/upload-file") {
+            let upload = state.uploads.fetch_add(1, Ordering::SeqCst);
+            if upload == 1 {
+                return AxumResponse::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("upload failed"))
+                    .unwrap();
+            }
+            return AxumResponse::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from("{\"file_uuid\":\"uploaded-file\"}"))
+                .unwrap();
+        }
+        AxumResponse::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from("data: {\"type\":\"message_stop\"}\n\n"))
+            .unwrap()
+    }
+
+    async fn partial_upload_failure_endpoint() -> url::Url {
+        let app = Router::new()
+            .fallback(fail_second_upload)
+            .with_state(FailingUploadState {
+                uploads: Arc::new(AtomicUsize::new(0)),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        url::Url::parse(&format!("http://{address}/")).unwrap()
+    }
+
+    #[derive(Clone)]
+    struct BlackBoxState {
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        completions: Arc<AtomicUsize>,
+    }
+
+    async fn black_box_upstream(
+        State(state): State<BlackBoxState>,
+        request: Request,
+    ) -> AxumResponse {
+        let path = request.uri().path().to_owned();
+        let bytes = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        state.requests.lock().unwrap().push(RecordedRequest {
+            path: path.clone(),
+            body,
+        });
+        let json_response = |value: serde_json::Value| {
+            AxumResponse::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&value).unwrap()))
+                .unwrap()
+        };
+        if path == "/api/bootstrap" {
+            return json_response(json!({
+                "account": {
+                    "email_address": "test@example.com",
+                    "memberships": [{"organization":{"capabilities":["chat"]}}]
+                }
+            }));
+        }
+        if path == "/api/organizations" {
+            return json_response(json!([{
+                "uuid":"org", "capabilities":["chat"], "active_flags":[]
+            }]));
+        }
+        if path.contains("/completion") {
+            let index = state.completions.fetch_add(1, Ordering::SeqCst);
+            let answer = if index == 0 { "a1" } else { "a2" };
+            return AxumResponse::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(format!(
+                    "data: {{\"completion\":\"{answer}\"}}\n\ndata: {{\"type\":\"message_stop\"}}\n\n"
+                )))
+                .unwrap();
+        }
+        json_response(json!({}))
+    }
+
+    async fn black_box_endpoint() -> (url::Url, Arc<Mutex<Vec<RecordedRequest>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(black_box_upstream)
+            .with_state(BlackBoxState {
+                requests: requests.clone(),
+                completions: Arc::new(AtomicUsize::new(0)),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            url::Url::parse(&format!("http://{address}/")).unwrap(),
+            requests,
+        )
+    }
+
+    struct ConfigRestore(crate::config::ClewdrConfig);
+
+    impl Drop for ConfigRestore {
+        fn drop(&mut self) {
+            let config = self.0.clone();
+            crate::config::CLEWDR_CONFIG.rcu(|_| config.clone());
+        }
     }
 
     fn params(messages: Vec<Message>) -> CreateMessageParams {
@@ -1240,6 +1340,309 @@ mod tests {
         assert_eq!(completions[2].body["parent_message_uuid"], first_assistant);
         assert_eq!(completions[3].body["parent_message_uuid"], first_assistant);
         assert_ne!(second_assistant, first_assistant);
+    }
+
+    #[tokio::test]
+    async fn try_chat_create_then_append_reuses_conversation() {
+        let (endpoint, requests) = black_box_endpoint().await;
+        let original = crate::config::CLEWDR_CONFIG.load().as_ref().clone();
+        let _restore = ConfigRestore(original.clone());
+        crate::config::CLEWDR_CONFIG.rcu(|_| {
+            let mut config = original.clone();
+            config.rproxy = Some(endpoint.clone());
+            config.no_fs = true;
+            config.skip_non_pro = false;
+            config.skip_normal_pro = false;
+            config
+        });
+        let handle = crate::services::cookie_actor::CookieActorHandle::start()
+            .await
+            .unwrap();
+        let cookie =
+            crate::config::CookieStatus::new(&format!("{}-bbbbbbAA", "a".repeat(86)), None)
+                .unwrap();
+        handle.submit(cookie).await.unwrap();
+        tokio::task::yield_now().await;
+        let cache = ConversationCache::new();
+        let principal = crate::protocol::AuthPrincipal::for_authenticated_user();
+        let session_id = format!("cherry_topic_v1_{}", "ab".repeat(32));
+        let request = |messages| CreateMessageParams {
+            model: "claude-sonnet-4-6".into(),
+            messages,
+            metadata: Some(Metadata {
+                fields: [("user_id".into(), session_id.clone())]
+                    .into_iter()
+                    .collect(),
+            }),
+            ..Default::default()
+        };
+
+        let mut first = ClaudeWebState::new(handle.clone(), cache.clone());
+        first.principal = Some(principal.clone());
+        first
+            .try_chat(request(vec![Message::new_text(Role::User, "u1")]))
+            .await
+            .unwrap();
+        let key = ExplicitSessionKey::new(principal.as_str(), "ab".repeat(32));
+        let cached = cache.get_explicit(&key).await.unwrap();
+        let conversation_uuid = cached.conv_uuid.clone();
+        let first_assistant_uuid = cached.turns[0].assistant_uuid.clone();
+
+        let mut second = ClaudeWebState::new(handle, cache.clone());
+        second.principal = Some(principal);
+        second
+            .try_chat(request(vec![
+                Message::new_text(Role::User, "u1"),
+                Message::new_text(Role::Assistant, "a1"),
+                Message::new_text(Role::User, "u2"),
+            ]))
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        let completions = requests
+            .iter()
+            .filter(|request| request.path.contains("/completion"))
+            .collect::<Vec<_>>();
+        assert_eq!(completions.len(), 2);
+        assert!(
+            completions
+                .iter()
+                .all(|request| request.path.contains(&conversation_uuid))
+        );
+        assert_eq!(
+            completions[1].body["parent_message_uuid"],
+            first_assistant_uuid
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_image_url_and_document_are_forwarded() {
+        let (endpoint, requests) = mock_endpoint().await;
+        let handle = crate::services::cookie_actor::CookieActorHandle::start()
+            .await
+            .unwrap();
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
+        state.endpoint = endpoint;
+        state.org_uuid = Some("org".into());
+        let cached = CachedConversation {
+            conv_uuid: "conversation".into(),
+            org_uuid: "org".into(),
+            cookie_id: "cookie".into(),
+            model: "model".into(),
+            is_pro: false,
+            system_hash: 0,
+            turns: vec![CachedTurn {
+                user_hashes: vec![1],
+                assistant_uuid: "parent".into(),
+            }],
+            created_at: chrono::Utc::now(),
+            last_used: chrono::Utc::now(),
+            valid: true,
+            last_stream_healthy: Arc::new(AtomicBool::new(true)),
+            explicit: None,
+        };
+        let suffix: Message = serde_json::from_value(json!({
+            "role":"user",
+            "content":[
+                {"type":"image_url", "image_url":{"url":"data:image/png;base64,aW1hZ2U="}},
+                {"type":"document", "source":{"type":"text", "data":"notes"}, "title":"notes.txt"}
+            ]
+        }))
+        .unwrap();
+        let request = params(vec![
+            Message::new_text(Role::User, "u1"),
+            Message::new_text(Role::Assistant, "a1"),
+            suffix,
+        ]);
+        state
+            .send_explicit_plan(
+                &ExplicitReusePlan::Append {
+                    parent_uuid: "parent".into(),
+                    suffix_start: 1,
+                },
+                Some(&cached),
+                Some("parent"),
+                1,
+                &[2],
+                &[2],
+                &request,
+            )
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.path.contains("/upload-file"))
+        );
+        let completion = requests
+            .iter()
+            .find(|request| request.path.contains("/completion"))
+            .unwrap();
+        assert_eq!(completion.body["files"], json!(["uploaded-file"]));
+        assert_eq!(completion.body["attachments"][0]["file_name"], "notes.txt");
+        assert_eq!(
+            completion.body["attachments"][0]["extracted_content"],
+            "notes"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_and_incremental_forward_equivalent_rich_content() {
+        let (endpoint, requests) = mock_endpoint().await;
+        let handle = crate::services::cookie_actor::CookieActorHandle::start()
+            .await
+            .unwrap();
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
+        state.endpoint = endpoint;
+        state.org_uuid = Some("org".into());
+        let rich_message = || {
+            serde_json::from_value::<Message>(json!({
+                "role":"user",
+                "content":[
+                    {"type":"text", "text":"question"},
+                    {"type":"image_url", "image_url":{"url":"data:image/png;base64,aW1hZ2U="}},
+                    {"type":"document", "source":{"type":"text", "data":"notes"}, "title":"notes.txt"}
+                ]
+            }))
+            .unwrap()
+        };
+        let create = params(vec![rich_message()]);
+        state
+            .send_explicit_plan(
+                &ExplicitReusePlan::Create,
+                None,
+                None,
+                0,
+                &[0],
+                &[1],
+                &create,
+            )
+            .await
+            .unwrap();
+        let PendingCacheWrite::Init { conv: cached, .. } =
+            state.pending_cache_write.take().unwrap()
+        else {
+            panic!("create must use send_full");
+        };
+        let parent = cached.turns[0].assistant_uuid.clone();
+        let append = params(vec![
+            rich_message(),
+            Message::new_text(Role::Assistant, "answer"),
+            rich_message(),
+        ]);
+        state
+            .send_explicit_plan(
+                &ExplicitReusePlan::Append {
+                    parent_uuid: parent.clone(),
+                    suffix_start: 1,
+                },
+                Some(&cached),
+                Some(&parent),
+                1,
+                &[2],
+                &[2],
+                &append,
+            )
+            .await
+            .unwrap();
+        let requests = requests.lock().unwrap();
+        let completions = requests
+            .iter()
+            .filter(|request| request.path.contains("/completion"))
+            .collect::<Vec<_>>();
+        assert_eq!(completions.len(), 2);
+        assert_eq!(completions[0].body["prompt"], completions[1].body["prompt"]);
+        assert_eq!(
+            completions[0].body["attachments"],
+            completions[1].body["attachments"]
+        );
+        assert_eq!(completions[0].body["files"], completions[1].body["files"]);
+    }
+
+    #[tokio::test]
+    async fn partial_initial_upload_failure_requires_reset() {
+        let endpoint = partial_upload_failure_endpoint().await;
+        let handle = crate::services::cookie_actor::CookieActorHandle::start()
+            .await
+            .unwrap();
+        let cache = ConversationCache::new();
+        let key = ExplicitSessionKey::new("principal", "partial-upload");
+        let operation = cache.try_lock_explicit_operation(&key).await.unwrap();
+        let mut state = ClaudeWebState::new(handle, cache.clone());
+        state.endpoint = endpoint;
+        state.org_uuid = Some("org".into());
+        let image = || ContentBlock::Image {
+            source: ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "aW1hZ2U=".into(),
+                file_name: None,
+            },
+            cache_control: None,
+        };
+        let request = params(vec![Message::new_blocks(
+            Role::User,
+            vec![image(), image()],
+        )]);
+        let digested = digest_messages(&request.messages).unwrap();
+        let send = state
+            .send_explicit_plan(
+                &ExplicitReusePlan::Create,
+                None,
+                None,
+                0,
+                &[0],
+                &[1],
+                &request,
+            )
+            .await;
+        let pending = state.pending_cache_write.take().unwrap();
+        state
+            .stage_explicit_write(
+                key.clone(),
+                pending,
+                digest_model(&request.model),
+                digest_system(&request.system),
+                None,
+                digested
+                    .users
+                    .iter()
+                    .map(|(_, digest)| digest.clone())
+                    .collect(),
+                0,
+                Vec::new(),
+                digested.timeline,
+            )
+            .await
+            .unwrap();
+        assert!(state.finish_explicit_send(&key, send).await.is_err());
+        drop(operation);
+        let explicit = cache.get_explicit(&key).await.unwrap().explicit.unwrap();
+        assert_eq!(explicit.state, ExplicitSessionState::Uncertain);
+        assert_eq!(
+            plan(
+                Some(&explicit),
+                &["user".into()],
+                &["user:user".into()],
+                "model",
+                "system"
+            )
+            .unwrap_err()
+            .code,
+            "conversation_state_uncertain"
+        );
+        assert!(cache.reset_explicit(&key).await.unwrap());
+        assert_eq!(
+            plan(
+                None,
+                &["user".into()],
+                &["user:user".into()],
+                "model",
+                "system"
+            )
+            .unwrap(),
+            ExplicitReusePlan::Create
+        );
     }
 
     #[tokio::test]

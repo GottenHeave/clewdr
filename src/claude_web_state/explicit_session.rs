@@ -10,7 +10,12 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use crate::{
     claude_web_state::conversation_cache::{ConversationCache, ExplicitSessionKey},
     protocol::ProtocolError,
-    types::claude::{Message, MessageContent, Role},
+    types::{
+        claude::{Message, Role},
+        claude_web::request::{
+            ExplicitContentError, ExplicitContentErrorKind, normalize_explicit_message,
+        },
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,16 +98,17 @@ impl ExplicitLifecycle {
         Ok(())
     }
 
-    pub async fn uncertain(&self) {
+    pub async fn uncertain(&self) -> Result<(), ProtocolError> {
         let mut operation = self.inner.operation.lock().await;
         if operation.is_some() {
             self.inner
                 .cache
                 .mark_explicit_uncertain(&self.inner.key)
-                .await;
+                .await?;
         }
         operation.take();
         self.inner.finalized.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -113,7 +119,9 @@ impl Drop for ExplicitLifecycle {
         }
         let lifecycle = self.clone();
         tokio::spawn(async move {
-            lifecycle.uncertain().await;
+            if let Err(error) = lifecycle.uncertain().await {
+                tracing::warn!("Failed to persist explicit session uncertainty: {error}");
+            }
         });
     }
 }
@@ -157,7 +165,7 @@ pub fn digest_messages(messages: &[Message]) -> Result<DigestedMessages, Protoco
     let mut timeline = Vec::new();
     for (index, message) in messages.iter().enumerate() {
         if message.role == Role::System {
-            return Err(reuse_failed(
+            return Err(invalid_request(
                 "Explicit sessions require system instructions in the top-level system field",
             ));
         }
@@ -173,7 +181,7 @@ pub fn digest_messages(messages: &[Message]) -> Result<DigestedMessages, Protoco
         timeline.push(format!("{role}:{digest}"));
     }
     if users.is_empty() {
-        return Err(reuse_failed(
+        return Err(invalid_request(
             "An explicit session request must contain user content",
         ));
     }
@@ -318,79 +326,19 @@ fn validate_timeline(
 }
 
 fn digest_message(message: &Message) -> Result<String, ProtocolError> {
-    let value = match &message.content {
-        MessageContent::Text { content } if !content.trim().is_empty() => {
-            serde_json::json!([{ "type": "text", "text": content.trim() }])
-        }
-        MessageContent::Text { .. } => {
-            return Err(reuse_failed(
-                "Explicit session message has no forwardable content",
-            ));
-        }
-        MessageContent::Blocks { content } => {
-            serde_json::to_value(content).expect("content blocks serialize")
-        }
-    };
-    reject_unsupported_content(&value)?;
-    Ok(digest_json(&value))
+    normalize_explicit_message(message)
+        .map(|normalized| digest_json(&normalized.identity))
+        .map_err(content_error)
 }
 
-fn reject_unsupported_content(value: &serde_json::Value) -> Result<(), ProtocolError> {
-    let blocks = match value {
-        serde_json::Value::String(text) if !text.trim().is_empty() => return Ok(()),
-        serde_json::Value::Array(blocks) => blocks,
-        _ => {
-            return Err(reuse_failed(
-                "Explicit session message has no forwardable content",
-            ));
-        }
-    };
-    for block in blocks {
-        let kind = block
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        match kind {
-            "text" | "image" | "image_url" | "document" | "container_upload" => {}
-            _ => {
-                return Err(reuse_failed(
-                    "Explicit session content block is not forwardable",
-                ));
-            }
-        }
-        if contains_staged_reference(block) {
-            return Err(ProtocolError::new(
-                StatusCode::NOT_IMPLEMENTED,
-                "staged_files_unavailable",
-                "Staged file references require the staged-files extension",
-            ));
-        }
-        if matches!(kind, "image" | "image_url") && contains_remote_url(block) {
-            return Err(reuse_failed(
-                "Explicit sessions do not support remote image URLs",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn contains_remote_url(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::String(value) => {
-            value.starts_with("http://") || value.starts_with("https://")
-        }
-        serde_json::Value::Array(values) => values.iter().any(contains_remote_url),
-        serde_json::Value::Object(values) => values.values().any(contains_remote_url),
-        _ => false,
-    }
-}
-
-fn contains_staged_reference(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::String(value) => value.starts_with("file_clewdr_v1_"),
-        serde_json::Value::Array(values) => values.iter().any(contains_staged_reference),
-        serde_json::Value::Object(values) => values.values().any(contains_staged_reference),
-        _ => false,
+pub(super) fn content_error(error: ExplicitContentError) -> ProtocolError {
+    match error.kind {
+        ExplicitContentErrorKind::InvalidRequest => invalid_request(error.message),
+        ExplicitContentErrorKind::StagedFilesUnavailable => ProtocolError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "staged_files_unavailable",
+            error.message,
+        ),
     }
 }
 
@@ -408,6 +356,14 @@ fn digest_tagged(tag: &[u8], value: &[u8]) -> String {
 
 fn reuse_failed(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(StatusCode::CONFLICT, "conversation_reuse_failed", message)
+}
+
+fn invalid_request(message: impl Into<String>) -> ProtocolError {
+    ProtocolError::new(
+        StatusCode::BAD_REQUEST,
+        "conversation_reuse_failed",
+        message,
+    )
 }
 
 #[cfg(test)]
@@ -545,5 +501,24 @@ mod tests {
             digest_messages(&[message]).unwrap_err().code,
             "staged_files_unavailable"
         );
+    }
+
+    #[test]
+    fn malformed_explicit_requests_are_bad_requests() {
+        let invalid = [
+            vec![Message::new_text(Role::System, "system")],
+            vec![Message::new_text(Role::Assistant, "assistant")],
+            vec![Message::new_text(Role::User, "   ")],
+            vec![serde_json::from_value(serde_json::json!({
+                "role":"user",
+                "content":[{"type":"image_url", "image_url":{"url":"https://example.com/a.png"}}]
+            }))
+            .unwrap()],
+        ];
+        for messages in invalid {
+            let error = digest_messages(&messages).unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert_eq!(error.code, "conversation_reuse_failed");
+        }
     }
 }

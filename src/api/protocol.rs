@@ -39,7 +39,7 @@ pub(crate) async fn api_reset_session(
         })?;
     let key = ExplicitSessionKey::new(principal.as_str(), digest);
     let _operation = cache.try_lock_explicit_operation(&key).await?;
-    if !cache.reset_explicit(&key).await {
+    if !cache.reset_explicit(&key).await? {
         return Err(ProtocolError::new(
             StatusCode::NOT_FOUND,
             "session_not_found",
@@ -162,7 +162,7 @@ mod tests {
             let cache = ConversationCache::new();
             let key = ExplicitSessionKey::new("principal", index.to_string());
             cache.set_explicit(key.clone(), cached_session(state)).await;
-            assert!(cache.reset_explicit(&key).await);
+            assert!(cache.reset_explicit(&key).await.unwrap());
             let reuse = plan(
                 None,
                 &["user".into()],

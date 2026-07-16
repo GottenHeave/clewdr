@@ -16,12 +16,22 @@ use crate::protocol::ProtocolError;
 use crate::utils::write_json_atomically;
 
 const CACHE_FILE_VERSION: u32 = 1;
+const MAX_SESSION_RECORDS_PER_PRINCIPAL: usize = 4096;
+const MAX_LIVE_SESSIONS_PER_PRINCIPAL: usize = 1024;
 
 fn explicit_missing(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(
         http::StatusCode::CONFLICT,
         "conversation_reuse_failed",
         message,
+    )
+}
+
+fn storage_error(error: impl std::fmt::Display) -> ProtocolError {
+    ProtocolError::new(
+        http::StatusCode::INTERNAL_SERVER_ERROR,
+        "session_storage_unavailable",
+        format!("Session storage error: {error}"),
     )
 }
 
@@ -208,6 +218,41 @@ impl PersistedConversationCache {
     }
 }
 
+fn enforce_explicit_capacity(
+    map: &HashMap<StoredCacheKey, CachedConversation>,
+    principal: &str,
+) -> Result<(), ProtocolError> {
+    let sessions = map.iter().filter_map(|(key, conversation)| match key {
+        StoredCacheKey::ExplicitSession(key) if key.session_principal == principal => {
+            Some(conversation)
+        }
+        _ => None,
+    });
+    let sessions = sessions.collect::<Vec<_>>();
+    let live = sessions
+        .iter()
+        .filter(|conversation| {
+            !matches!(
+                conversation
+                    .explicit
+                    .as_ref()
+                    .map(|explicit| explicit.state),
+                Some(ExplicitSessionState::Tombstoned)
+            )
+        })
+        .count();
+    if sessions.len() >= MAX_SESSION_RECORDS_PER_PRINCIPAL
+        || live >= MAX_LIVE_SESSIONS_PER_PRINCIPAL
+    {
+        return Err(ProtocolError::new(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "session_capacity_exceeded",
+            "Authenticated principal has reached the session capacity limit",
+        ));
+    }
+    Ok(())
+}
+
 /// Thread-safe conversation cache
 #[derive(Clone)]
 pub struct ConversationCache {
@@ -215,6 +260,7 @@ pub struct ConversationCache {
     operation_locks: Arc<Mutex<HashMap<StoredCacheKey, Weak<Mutex<()>>>>>,
     persist_path: Option<Arc<PathBuf>>,
     persist_lock: Arc<Mutex<()>>,
+    explicit_mutation_lock: Arc<Mutex<()>>,
 }
 
 impl ConversationCache {
@@ -224,6 +270,7 @@ impl ConversationCache {
             operation_locks: Arc::new(Mutex::new(HashMap::new())),
             persist_path: None,
             persist_lock: Arc::new(Mutex::new(())),
+            explicit_mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -253,6 +300,7 @@ impl ConversationCache {
             operation_locks: Arc::new(Mutex::new(HashMap::new())),
             persist_path: Some(Arc::new(persist_path)),
             persist_lock: Arc::new(Mutex::new(())),
+            explicit_mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -323,6 +371,23 @@ impl ConversationCache {
             .await;
     }
 
+    pub async fn set_explicit_checked(
+        &self,
+        key: ExplicitSessionKey,
+        conv: CachedConversation,
+    ) -> Result<(), ProtocolError> {
+        let _mutation = self.explicit_mutation_lock.lock().await;
+        let stored_key = StoredCacheKey::ExplicitSession(key.clone());
+        let previous = {
+            let mut map = self.inner.lock().await;
+            if !map.contains_key(&stored_key) {
+                enforce_explicit_capacity(&map, &key.session_principal)?;
+            }
+            map.insert(stored_key.clone(), conv)
+        };
+        self.persist_explicit_change(stored_key, previous).await
+    }
+
     async fn set_stored(&self, key: StoredCacheKey, conv: CachedConversation) {
         {
             let mut map = self.inner.lock().await;
@@ -336,11 +401,14 @@ impl ConversationCache {
         key: &ExplicitSessionKey,
         pending: PendingExplicitTurn,
     ) -> Result<(), ProtocolError> {
-        let updated = {
+        let _mutation = self.explicit_mutation_lock.lock().await;
+        let stored_key = StoredCacheKey::ExplicitSession(key.clone());
+        let previous = {
             let mut map = self.inner.lock().await;
             let conversation = map
-                .get_mut(&StoredCacheKey::ExplicitSession(key.clone()))
+                .get_mut(&stored_key)
                 .ok_or_else(|| explicit_missing("Session disappeared before completion"))?;
+            let previous = conversation.clone();
             let explicit = conversation
                 .explicit
                 .as_mut()
@@ -348,12 +416,10 @@ impl ConversationCache {
             explicit.state = ExplicitSessionState::InFlight;
             explicit.pending = Some(pending);
             conversation.last_used = Utc::now();
-            true
+            previous
         };
-        if updated {
-            self.persist().await;
-        }
-        Ok(())
+        self.persist_explicit_change(stored_key, Some(previous))
+            .await
     }
 
     pub async fn commit_explicit_turn(
@@ -361,11 +427,14 @@ impl ConversationCache {
         key: &ExplicitSessionKey,
         assistant_digest_after: Option<String>,
     ) -> Result<(), ProtocolError> {
-        {
+        let _mutation = self.explicit_mutation_lock.lock().await;
+        let stored_key = StoredCacheKey::ExplicitSession(key.clone());
+        let previous = {
             let mut map = self.inner.lock().await;
             let conversation = map
-                .get_mut(&StoredCacheKey::ExplicitSession(key.clone()))
+                .get_mut(&stored_key)
                 .ok_or_else(|| explicit_missing("Session disappeared before commit"))?;
+            let previous = conversation.clone();
             let explicit = conversation
                 .explicit
                 .as_mut()
@@ -390,56 +459,87 @@ impl ConversationCache {
             });
             explicit.state = ExplicitSessionState::Committed;
             conversation.last_used = Utc::now();
-        }
-        self.persist().await;
-        Ok(())
-    }
-
-    pub async fn mark_explicit_uncertain(&self, key: &ExplicitSessionKey) {
-        let updated = {
-            let mut map = self.inner.lock().await;
-            map.get_mut(&StoredCacheKey::ExplicitSession(key.clone()))
-                .and_then(|conversation| conversation.explicit.as_mut())
-                .map(|explicit| {
-                    explicit.state = ExplicitSessionState::Uncertain;
-                })
-                .is_some()
+            previous
         };
-        if updated {
-            self.persist().await;
-        }
-    }
-
-    pub async fn tombstone_explicit(&self, key: &ExplicitSessionKey) {
-        let updated = {
-            let mut map = self.inner.lock().await;
-            if let Some(conversation) = map.get_mut(&StoredCacheKey::ExplicitSession(key.clone()))
-                && let Some(explicit) = conversation.explicit.as_mut()
-            {
-                explicit.state = ExplicitSessionState::Tombstoned;
-                explicit.pending = None;
-                conversation.last_used = Utc::now();
-                true
-            } else {
-                false
-            }
-        };
-        if updated {
-            self.persist().await;
-        }
-    }
-
-    pub async fn reset_explicit(&self, key: &ExplicitSessionKey) -> bool {
-        let removed = self
-            .inner
-            .lock()
+        self.persist_explicit_change(stored_key, Some(previous))
             .await
-            .remove(&StoredCacheKey::ExplicitSession(key.clone()))
-            .is_some();
-        if removed {
-            self.persist().await;
+    }
+
+    pub async fn mark_explicit_uncertain(
+        &self,
+        key: &ExplicitSessionKey,
+    ) -> Result<(), ProtocolError> {
+        let _mutation = self.explicit_mutation_lock.lock().await;
+        let stored_key = StoredCacheKey::ExplicitSession(key.clone());
+        let previous = {
+            let mut map = self.inner.lock().await;
+            let conversation = map
+                .get_mut(&stored_key)
+                .ok_or_else(|| explicit_missing("Session disappeared before uncertain state"))?;
+            let previous = conversation.clone();
+            let explicit = conversation
+                .explicit
+                .as_mut()
+                .ok_or_else(|| explicit_missing("Session metadata is unavailable"))?;
+            explicit.state = ExplicitSessionState::Uncertain;
+            previous
+        };
+        self.persist_explicit_change(stored_key, Some(previous))
+            .await
+    }
+
+    pub async fn tombstone_explicit(&self, key: &ExplicitSessionKey) -> Result<(), ProtocolError> {
+        let _mutation = self.explicit_mutation_lock.lock().await;
+        let stored_key = StoredCacheKey::ExplicitSession(key.clone());
+        let previous = {
+            let mut map = self.inner.lock().await;
+            let conversation = map
+                .get_mut(&stored_key)
+                .ok_or_else(|| explicit_missing("Session disappeared before tombstone"))?;
+            let previous = conversation.clone();
+            let explicit = conversation
+                .explicit
+                .as_mut()
+                .ok_or_else(|| explicit_missing("Session metadata is unavailable"))?;
+            explicit.state = ExplicitSessionState::Tombstoned;
+            explicit.pending = None;
+            conversation.last_used = Utc::now();
+            previous
+        };
+        self.persist_explicit_change(stored_key, Some(previous))
+            .await
+    }
+
+    pub async fn reset_explicit(&self, key: &ExplicitSessionKey) -> Result<bool, ProtocolError> {
+        let _mutation = self.explicit_mutation_lock.lock().await;
+        let stored_key = StoredCacheKey::ExplicitSession(key.clone());
+        let removed = self.inner.lock().await.remove(&stored_key);
+        let Some(removed) = removed else {
+            return Ok(false);
+        };
+        self.persist_explicit_change(stored_key, Some(removed))
+            .await?;
+        Ok(true)
+    }
+
+    async fn persist_explicit_change(
+        &self,
+        key: StoredCacheKey,
+        previous: Option<CachedConversation>,
+    ) -> Result<(), ProtocolError> {
+        if let Err(error) = self.persist_result().await {
+            let mut map = self.inner.lock().await;
+            match previous {
+                Some(previous) => {
+                    map.insert(key, previous);
+                }
+                None => {
+                    map.remove(&key);
+                }
+            }
+            return Err(storage_error(error));
         }
-        removed
+        Ok(())
     }
 
     /// Append a new turn to an existing cached conversation
@@ -539,6 +639,7 @@ impl ConversationCache {
 
     /// Remove expired entries (call periodically)
     pub async fn cleanup(&self) {
+        let _explicit_mutation = self.explicit_mutation_lock.lock().await;
         let removed = {
             let mut map = self.inner.lock().await;
             let old_len = map.len();
@@ -597,21 +698,28 @@ impl ConversationCache {
     }
 
     async fn persist(&self) {
-        let Some(path) = self.persist_path.as_deref() else {
-            return;
-        };
-        let _guard = self.persist_lock.lock().await;
-        let snapshot = {
-            let map = self.inner.lock().await;
-            PersistedConversationCache::from_map(&map)
-        };
-        if let Err(err) = write_json_atomically(path, &snapshot).await {
+        if let Err(err) = self.persist_result().await {
+            let Some(path) = self.persist_path.as_deref() else {
+                return;
+            };
             warn!(
                 "[CACHE] failed to persist conversation cache to {}: {}",
                 path.display(),
                 err
             );
         }
+    }
+
+    async fn persist_result(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(path) = self.persist_path.as_deref() else {
+            return Ok(());
+        };
+        let _guard = self.persist_lock.lock().await;
+        let snapshot = {
+            let map = self.inner.lock().await;
+            PersistedConversationCache::from_map(&map)
+        };
+        write_json_atomically(path, &snapshot).await
     }
 
     async fn load_from_path(
@@ -642,5 +750,203 @@ impl ConversationCache {
             }
         }
         Ok(map)
+    }
+}
+
+#[cfg(test)]
+mod explicit_tests {
+    use super::*;
+
+    fn conversation(state: ExplicitSessionState) -> CachedConversation {
+        CachedConversation {
+            conv_uuid: "conversation".into(),
+            org_uuid: "org".into(),
+            cookie_id: "cookie".into(),
+            model: "model".into(),
+            is_pro: false,
+            system_hash: 0,
+            turns: Vec::new(),
+            created_at: Utc::now(),
+            last_used: Utc::now(),
+            valid: true,
+            last_stream_healthy: Arc::new(AtomicBool::new(true)),
+            explicit: Some(ExplicitConversation {
+                state,
+                model_digest: "model".into(),
+                system_digest: "system".into(),
+                turns: Vec::new(),
+                pending: None,
+            }),
+        }
+    }
+
+    fn pending() -> PendingExplicitTurn {
+        PendingExplicitTurn {
+            parent_uuid_before: None,
+            user_digests: vec!["user".into()],
+            assistant_uuid_after: "assistant".into(),
+            replace_from_turn: 0,
+            parent_timeline: Vec::new(),
+            request_timeline: vec!["user:user".into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn enforces_live_and_record_capacity_per_principal() {
+        let cache = ConversationCache::new();
+        {
+            let mut map = cache.inner.lock().await;
+            for index in 0..MAX_LIVE_SESSIONS_PER_PRINCIPAL {
+                map.insert(
+                    StoredCacheKey::ExplicitSession(ExplicitSessionKey::new(
+                        "principal",
+                        index.to_string(),
+                    )),
+                    conversation(ExplicitSessionState::Committed),
+                );
+            }
+        }
+        let error = cache
+            .set_explicit_checked(
+                ExplicitSessionKey::new("principal", "overflow"),
+                conversation(ExplicitSessionState::InFlight),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "session_capacity_exceeded");
+
+        let cache = ConversationCache::new();
+        {
+            let mut map = cache.inner.lock().await;
+            for index in 0..MAX_SESSION_RECORDS_PER_PRINCIPAL {
+                map.insert(
+                    StoredCacheKey::ExplicitSession(ExplicitSessionKey::new(
+                        "principal",
+                        index.to_string(),
+                    )),
+                    conversation(ExplicitSessionState::Tombstoned),
+                );
+            }
+        }
+        let error = cache
+            .set_explicit_checked(
+                ExplicitSessionKey::new("principal", "overflow"),
+                conversation(ExplicitSessionState::InFlight),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "session_capacity_exceeded");
+    }
+
+    #[tokio::test]
+    async fn cleanup_expires_only_old_tombstones() {
+        let cache = ConversationCache::new();
+        let tombstone = ExplicitSessionKey::new("principal", "tombstone");
+        let uncertain = ExplicitSessionKey::new("principal", "uncertain");
+        let mut old_tombstone = conversation(ExplicitSessionState::Tombstoned);
+        old_tombstone.last_used = Utc::now() - Duration::days(26);
+        let mut old_uncertain = conversation(ExplicitSessionState::Uncertain);
+        old_uncertain.last_used = Utc::now() - Duration::days(26);
+        cache.set_explicit(tombstone.clone(), old_tombstone).await;
+        cache.set_explicit(uncertain.clone(), old_uncertain).await;
+        cache.cleanup().await;
+        assert!(cache.get_explicit(&tombstone).await.is_none());
+        assert!(cache.get_explicit(&uncertain).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn explicit_mutations_return_storage_errors_and_roll_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"block").unwrap();
+        let cache = ConversationCache::persistent(blocker.join("cache.json")).await;
+        let key = ExplicitSessionKey::new("principal", "session");
+        cache
+            .set_explicit(key.clone(), conversation(ExplicitSessionState::Committed))
+            .await;
+
+        let new_key = ExplicitSessionKey::new("principal", "new");
+        assert_eq!(
+            cache
+                .set_explicit_checked(
+                    new_key.clone(),
+                    conversation(ExplicitSessionState::InFlight)
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "session_storage_unavailable"
+        );
+        assert!(cache.get_explicit(&new_key).await.is_none());
+
+        assert_eq!(
+            cache
+                .stage_explicit_turn(&key, pending())
+                .await
+                .unwrap_err()
+                .code,
+            "session_storage_unavailable"
+        );
+        assert_eq!(
+            cache.mark_explicit_uncertain(&key).await.unwrap_err().code,
+            "session_storage_unavailable"
+        );
+        assert_eq!(
+            cache.tombstone_explicit(&key).await.unwrap_err().code,
+            "session_storage_unavailable"
+        );
+        assert_eq!(
+            cache.reset_explicit(&key).await.unwrap_err().code,
+            "session_storage_unavailable"
+        );
+        assert_eq!(
+            cache
+                .get_explicit(&key)
+                .await
+                .unwrap()
+                .explicit
+                .unwrap()
+                .state,
+            ExplicitSessionState::Committed
+        );
+
+        let mut in_flight = conversation(ExplicitSessionState::InFlight);
+        in_flight.explicit.as_mut().unwrap().pending = Some(pending());
+        cache.set_explicit(key.clone(), in_flight).await;
+        assert_eq!(
+            cache
+                .commit_explicit_turn(&key, Some("assistant".into()))
+                .await
+                .unwrap_err()
+                .code,
+            "session_storage_unavailable"
+        );
+        assert_eq!(
+            cache
+                .get_explicit(&key)
+                .await
+                .unwrap()
+                .explicit
+                .unwrap()
+                .state,
+            ExplicitSessionState::InFlight
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_is_durable_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation-cache.json");
+        let key = ExplicitSessionKey::new("principal", "session");
+        let cache = ConversationCache::persistent(&path).await;
+        cache
+            .set_explicit_checked(key.clone(), conversation(ExplicitSessionState::Uncertain))
+            .await
+            .unwrap();
+        let cache = ConversationCache::persistent(&path).await;
+        assert!(cache.get_explicit(&key).await.is_some());
+        assert!(cache.reset_explicit(&key).await.unwrap());
+        let cache = ConversationCache::persistent(&path).await;
+        assert!(cache.get_explicit(&key).await.is_none());
     }
 }

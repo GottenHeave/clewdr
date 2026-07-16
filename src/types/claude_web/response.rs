@@ -146,7 +146,7 @@ impl ClaudeWebState {
                 if let Some(lifecycle) = &lifecycle
                     && !explicit_finalized
                 {
-                    lifecycle.uncertain().await;
+                    lifecycle.uncertain().await.map_err(axum::Error::new)?;
                     Err(axum::Error::new(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "Claude Web stream ended without message_stop",
@@ -225,7 +225,7 @@ impl ClaudeWebState {
             Ok(result) => result,
             Err(error) => {
                 if let Some(lifecycle) = explicit_lifecycle {
-                    lifecycle.uncertain().await;
+                    lifecycle.uncertain().await?;
                 }
                 return Err(error);
             }
@@ -235,7 +235,7 @@ impl ClaudeWebState {
                 let digest = (!text.is_empty()).then(|| digest_assistant_output(&text));
                 lifecycle.commit(digest).await?;
             } else {
-                lifecycle.uncertain().await;
+                lifecycle.uncertain().await?;
                 return Err(crate::protocol::ProtocolError::new(
                     http::StatusCode::BAD_GATEWAY,
                     "conversation_state_uncertain",

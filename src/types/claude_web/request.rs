@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::types::claude::{ImageSource, OutputEffort, ThinkingMode};
+use crate::types::claude::{
+    ContentBlock, ImageSource, Message, MessageContent, OutputEffort, ThinkingMode,
+};
 
 /// Claude.ai attachment
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -35,6 +38,231 @@ impl Attachment {
             file_type,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct NormalizedExplicitMessage {
+    pub text_blocks: Vec<String>,
+    pub attachments: Vec<Attachment>,
+    pub images: Vec<ImageSource>,
+    pub identity: Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplicitContentErrorKind {
+    InvalidRequest,
+    StagedFilesUnavailable,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct ExplicitContentError {
+    pub kind: ExplicitContentErrorKind,
+    pub message: &'static str,
+}
+
+impl ExplicitContentError {
+    fn invalid(message: &'static str) -> Self {
+        Self {
+            kind: ExplicitContentErrorKind::InvalidRequest,
+            message,
+        }
+    }
+
+    fn staged() -> Self {
+        Self {
+            kind: ExplicitContentErrorKind::StagedFilesUnavailable,
+            message: "Staged file references require the staged-files extension",
+        }
+    }
+}
+
+pub fn normalize_explicit_message(
+    message: &Message,
+) -> Result<NormalizedExplicitMessage, ExplicitContentError> {
+    let mut text_blocks = Vec::new();
+    let mut attachments = Vec::new();
+    let mut images = Vec::new();
+    let mut identity = Vec::new();
+    match &message.content {
+        MessageContent::Text { content } => {
+            let text = content.trim();
+            if !text.is_empty() {
+                text_blocks.push(text.to_owned());
+                identity.push(serde_json::json!({ "type": "text", "text": text }));
+            }
+        }
+        MessageContent::Blocks { content } => {
+            for block in content {
+                normalize_explicit_block(
+                    block,
+                    &mut text_blocks,
+                    &mut attachments,
+                    &mut images,
+                    &mut identity,
+                )?;
+            }
+        }
+    }
+    if text_blocks.is_empty() && attachments.is_empty() && images.is_empty() {
+        return Err(ExplicitContentError::invalid(
+            "Explicit session message has no forwardable content",
+        ));
+    }
+    Ok(NormalizedExplicitMessage {
+        text_blocks,
+        attachments,
+        images,
+        identity: Value::Array(identity),
+    })
+}
+
+fn normalize_explicit_block(
+    block: &ContentBlock,
+    text_blocks: &mut Vec<String>,
+    attachments: &mut Vec<Attachment>,
+    images: &mut Vec<ImageSource>,
+    identity: &mut Vec<Value>,
+) -> Result<(), ExplicitContentError> {
+    match block {
+        ContentBlock::Text { text, .. } => {
+            let text = text.trim();
+            if !text.is_empty() {
+                text_blocks.push(text.to_owned());
+                identity.push(serde_json::json!({ "type": "text", "text": text }));
+            }
+        }
+        ContentBlock::Image { source, .. } => {
+            let source = normalize_image(source)?;
+            identity.push(serde_json::json!({ "type": "image", "source": source }));
+            images.push(source);
+        }
+        ContentBlock::ImageUrl { image_url } => {
+            let source = ImageSource::from_data_url(&image_url.url).ok_or_else(|| {
+                ExplicitContentError::invalid(
+                    "Explicit sessions do not support remote or invalid image URLs",
+                )
+            })?;
+            identity.push(serde_json::json!({ "type": "image", "source": source }));
+            images.push(source);
+        }
+        ContentBlock::Document { source, title, .. } => {
+            normalize_document(source, title.as_deref(), attachments, images, identity)?;
+        }
+        ContentBlock::ContainerUpload { file_id, .. } => {
+            let source = normalized_file_source(file_id)?;
+            identity.push(serde_json::json!({ "type": "image", "source": source }));
+            images.push(source);
+        }
+        _ => {
+            return Err(ExplicitContentError::invalid(
+                "Explicit session content block is not forwardable",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_image(source: &ImageSource) -> Result<ImageSource, ExplicitContentError> {
+    match source {
+        ImageSource::Base64 { .. } => Ok(source.clone()),
+        ImageSource::File { file_id } => normalized_file_source(file_id),
+        ImageSource::Url { url } => ImageSource::from_data_url(url).ok_or_else(|| {
+            ExplicitContentError::invalid(
+                "Explicit sessions do not support remote or invalid image URLs",
+            )
+        }),
+    }
+}
+
+fn normalized_file_source(file_id: &str) -> Result<ImageSource, ExplicitContentError> {
+    let file_id = file_id.trim();
+    if file_id.starts_with("file_clewdr_v1_") {
+        return Err(ExplicitContentError::staged());
+    }
+    if file_id.is_empty() {
+        return Err(ExplicitContentError::invalid("File ID must not be empty"));
+    }
+    Ok(ImageSource::File {
+        file_id: file_id.to_owned(),
+    })
+}
+
+fn normalize_document(
+    source: &Value,
+    title: Option<&str>,
+    attachments: &mut Vec<Attachment>,
+    images: &mut Vec<ImageSource>,
+    identity: &mut Vec<Value>,
+) -> Result<(), ExplicitContentError> {
+    let file_name = extract_document_file_name(source, title);
+    match source.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            let text = source
+                .get("data")
+                .or_else(|| source.get("text"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .ok_or_else(|| ExplicitContentError::invalid("Document text must not be empty"))?;
+            let attachment = match &file_name {
+                Some(file_name) => Attachment::new_with_file_name(text.to_owned(), file_name),
+                None => Attachment::new(text.to_owned()),
+            };
+            identity.push(serde_json::to_value(&attachment).expect("attachment serializes"));
+            attachments.push(attachment);
+        }
+        Some("file") => {
+            let file_id = source
+                .get("file_id")
+                .or_else(|| source.get("id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| ExplicitContentError::invalid("Document file ID is missing"))?;
+            let source = normalized_file_source(file_id)?;
+            identity.push(serde_json::json!({ "type": "image", "source": source }));
+            images.push(source);
+        }
+        Some("base64") => {
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| ExplicitContentError::invalid("Document media type is missing"))?;
+            let data = source
+                .get("data")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| ExplicitContentError::invalid("Document data is missing"))?;
+            let source = ImageSource::Base64 {
+                media_type: media_type.to_owned(),
+                data: data.to_owned(),
+                file_name,
+            };
+            identity.push(serde_json::json!({ "type": "image", "source": source }));
+            images.push(source);
+        }
+        _ => {
+            return Err(ExplicitContentError::invalid(
+                "Explicit session document source is not forwardable",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn extract_document_file_name(source: &Value, title: Option<&str>) -> Option<String> {
+    title.and_then(normalize_file_name).or_else(|| {
+        ["file_name", "filename", "name", "title"]
+            .into_iter()
+            .find_map(|key| {
+                source
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .and_then(normalize_file_name)
+            })
+    })
 }
 
 pub fn normalize_file_name(file_name: &str) -> Option<String> {
@@ -154,5 +382,72 @@ mod tests {
 
         assert_eq!(value["effort"], json!("max"));
         assert_eq!(value["thinking_mode"], json!("auto"));
+    }
+
+    #[test]
+    fn explicit_identity_ignores_unforwarded_metadata() {
+        let first: Message = serde_json::from_value(json!({
+            "role": "user",
+            "content": [{"type":"text", "text":"hello"}]
+        }))
+        .unwrap();
+        let second: Message = serde_json::from_value(json!({
+            "role": "user",
+            "content": [{
+                "type":"text",
+                "text":"hello",
+                "cache_control":{"type":"ephemeral", "ttl":"5m"},
+                "citations":[]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            normalize_explicit_message(&first).unwrap().identity,
+            normalize_explicit_message(&second).unwrap().identity
+        );
+    }
+
+    #[test]
+    fn image_and_image_url_share_forwarded_identity() {
+        let image: Message = serde_json::from_value(json!({
+            "role": "user",
+            "content": [{
+                "type":"image",
+                "source":{"type":"base64", "media_type":"image/png", "data":"aW1hZ2U="}
+            }]
+        }))
+        .unwrap();
+        let image_url: Message = serde_json::from_value(json!({
+            "role": "user",
+            "content": [{
+                "type":"image_url",
+                "image_url":{"url":"data:image/png;base64,aW1hZ2U="}
+            }]
+        }))
+        .unwrap();
+        let image = normalize_explicit_message(&image).unwrap();
+        let image_url = normalize_explicit_message(&image_url).unwrap();
+        assert_eq!(image.identity, image_url.identity);
+        assert_eq!(image.images, image_url.images);
+    }
+
+    #[test]
+    fn invalid_documents_and_remote_urls_are_rejected() {
+        let invalid = [
+            json!({"type":"document", "source":{"type":"url", "url":"https://example.com/a"}}),
+            json!({"type":"document", "source":{"type":"text", "data":"   "}}),
+            json!({"type":"document", "source":{"type":"base64", "media_type":"application/pdf", "data":""}}),
+            json!({"type":"image_url", "image_url":{"url":"https://example.com/a.png"}}),
+        ];
+        for block in invalid {
+            let message: Message = serde_json::from_value(json!({
+                "role":"user", "content":[block]
+            }))
+            .unwrap();
+            assert_eq!(
+                normalize_explicit_message(&message).unwrap_err().kind,
+                ExplicitContentErrorKind::InvalidRequest
+            );
+        }
     }
 }
