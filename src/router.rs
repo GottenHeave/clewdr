@@ -73,6 +73,17 @@ impl RouterBuilder {
                     .expect("Failed to initialize protocol session storage"),
             )
         };
+        sessions
+            .cleanup_tombstones()
+            .await
+            .expect("Failed to clean protocol session tombstones");
+        if let Some(files) = &files {
+            files
+                .reconcile_references(&sessions.staged_file_references().await)
+                .await
+                .expect("Failed to reconcile staged file references");
+            files.cleanup().await.expect("Failed to clean staged files");
+        }
         let claude_providers = crate::providers::claude::build_providers(
             cookie_handle.clone(),
             conv_cache,
@@ -85,10 +96,12 @@ impl RouterBuilder {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 interval.tick().await;
+                let _ = cleanup_sessions.cleanup_tombstones().await;
                 if let Some(files) = &cleanup_files {
+                    let references = cleanup_sessions.staged_file_references().await;
+                    let _ = files.reconcile_references(&references).await;
                     let _ = files.cleanup().await;
                 }
-                let _ = cleanup_sessions.cleanup_tombstones().await;
             }
         });
         RouterBuilder {

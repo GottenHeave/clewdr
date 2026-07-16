@@ -100,6 +100,27 @@ struct UploadOperation {
     registry: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
+pub(crate) struct StagedUpload {
+    response: FileResponse,
+    created: bool,
+    _operation: UploadOperation,
+}
+
+impl StagedUpload {
+    pub(crate) fn into_response(self) -> FileResponse {
+        self.response
+    }
+
+    pub(crate) async fn rollback(self, store: &StagedFileStore) -> Result<(), ProtocolError> {
+        if self.created {
+            store
+                .discard_created_unreferenced(&self.response.id)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 struct TempUploadGuard {
     path: PathBuf,
     active: bool,
@@ -185,7 +206,6 @@ impl StagedFileStore {
             upload_locks: Arc::new(Mutex::new(HashMap::new())),
         });
         let _ = store.hmac_key().await?;
-        store.cleanup().await?;
         Ok(store)
     }
 
@@ -202,7 +222,7 @@ impl StagedFileStore {
     {
         self.stage_stream_with_status(principal, filename, mime_type, stream)
             .await
-            .map(|(response, _)| response)
+            .map(StagedUpload::into_response)
     }
 
     pub(crate) async fn stage_stream_with_status<S, E>(
@@ -211,7 +231,7 @@ impl StagedFileStore {
         filename: &str,
         mime_type: &str,
         stream: S,
-    ) -> Result<(FileResponse, bool), ProtocolError>
+    ) -> Result<StagedUpload, ProtocolError>
     where
         S: Stream<Item = Result<Bytes, E>>,
         E: std::fmt::Display,
@@ -271,7 +291,7 @@ impl StagedFileStore {
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
-        let _operation = UploadOperation {
+        let operation = UploadOperation {
             id: id.clone(),
             _guard: lock.lock_owned().await,
             registry: self.upload_locks.clone(),
@@ -283,7 +303,11 @@ impl StagedFileStore {
         {
             let response = existing.response();
             drop(index);
-            return Ok((response, false));
+            return Ok(StagedUpload {
+                response,
+                created: false,
+                _operation: operation,
+            });
         }
         self.evict_unreferenced(&mut index, size_bytes).await?;
         if index.total_bytes.saturating_add(size_bytes) > self.max_staged_bytes {
@@ -316,10 +340,14 @@ impl StagedFileStore {
         index.total_bytes += size_bytes;
         index.files.insert(id, stored);
         self.persist_locked(&index).await?;
-        Ok((response, true))
+        Ok(StagedUpload {
+            response,
+            created: true,
+            _operation: operation,
+        })
     }
 
-    pub(crate) async fn discard_created_unreferenced(&self, id: &str) -> Result<(), ProtocolError> {
+    async fn discard_created_unreferenced(&self, id: &str) -> Result<(), ProtocolError> {
         let mut index = self.index.lock().await;
         if index
             .files
@@ -403,6 +431,17 @@ impl StagedFileStore {
         let mut index = self.index.lock().await;
         for file in index.files.values_mut() {
             file.references.remove(session_ref);
+        }
+        self.persist_locked(&index).await
+    }
+
+    pub async fn reconcile_references(
+        &self,
+        references: &HashMap<String, BTreeSet<String>>,
+    ) -> Result<(), ProtocolError> {
+        let mut index = self.index.lock().await;
+        for (id, file) in &mut index.files {
+            file.references = references.get(id).cloned().unwrap_or_default();
         }
         self.persist_locked(&index).await
     }
@@ -784,6 +823,47 @@ mod tests {
             .unwrap()
             .count();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn rolled_back_upload_retains_ownership_until_duplicate_can_create() {
+        let temp = tempfile::tempdir().unwrap();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let store = StagedFileStore::persistent(temp.path()).await.unwrap();
+        let first = store
+            .stage_stream_with_status(
+                &principal,
+                "a.txt",
+                "text/plain",
+                stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"same"))]),
+            )
+            .await
+            .unwrap();
+        assert!(first.created);
+
+        let duplicate_store = store.clone();
+        let duplicate_principal = principal.clone();
+        let mut duplicate = tokio::spawn(async move {
+            duplicate_store
+                .stage_stream_with_status(
+                    &duplicate_principal,
+                    "a.txt",
+                    "text/plain",
+                    stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"same"))]),
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut duplicate)
+                .await
+                .is_err()
+        );
+
+        first.rollback(&store).await.unwrap();
+        let duplicate = duplicate.await.unwrap().unwrap();
+        assert!(duplicate.created);
+        let response = duplicate.into_response();
+        store.resolve(&principal, &response.id).await.unwrap();
     }
 
     #[tokio::test]

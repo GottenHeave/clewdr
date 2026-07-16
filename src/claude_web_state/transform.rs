@@ -108,29 +108,13 @@ impl ClaudeWebState {
                             message: "Invalid uploaded file media type".to_string(),
                             source: Some(Box::new(error)),
                         })?;
-                    let form = Form::new().part("file", part);
-                    let response = self
-                        .build_request(http::Method::POST, endpoint)
-                        .multipart(form)
-                        .send()
-                        .await
-                        .map_err(|source| crate::error::ClewdrError::WreqError {
-                            msg: "Failed to upload file",
-                            source,
-                        })?
-                        .check_claude()
-                        .await?;
-                    #[derive(serde::Deserialize)]
-                    struct UploadResponse {
-                        file_uuid: String,
-                    }
-                    let upload = response.json::<UploadResponse>().await.map_err(|source| {
-                        crate::error::ClewdrError::WreqError {
-                            msg: "Failed to parse file upload response",
-                            source,
-                        }
-                    })?;
-                    Ok(upload.file_uuid)
+                    self.upload_file_part(
+                        endpoint,
+                        part,
+                        "Failed to upload file",
+                        "Failed to parse file upload response",
+                    )
+                    .await
                 }
             })
             .buffered(5)
@@ -192,38 +176,57 @@ impl ClaudeWebState {
                     message: "Invalid staged file media type".to_string(),
                     source: Some(Box::new(error)),
                 })?;
-            let response = self
-                .build_request(http::Method::POST, endpoint.clone())
-                .multipart(Form::new().part("file", part))
-                .send()
-                .await
-                .map_err(|source| crate::error::ClewdrError::WreqError {
-                    msg: "Failed to upload staged file",
-                    source,
-                })?
-                .check_claude()
+            let file_uuid = self
+                .upload_file_part(
+                    endpoint.clone(),
+                    part,
+                    "Failed to upload staged file",
+                    "Failed to parse staged file upload response",
+                )
                 .await?;
-            #[derive(serde::Deserialize)]
-            struct UploadResponse {
-                file_uuid: String,
-            }
-            let response = response.json::<UploadResponse>().await.map_err(|source| {
-                crate::error::ClewdrError::WreqError {
-                    msg: "Failed to parse staged file upload response",
-                    source,
-                }
-            })?;
             if let Some(session) = session_store.get(operation).await {
                 staged_store
                     .add_reference(&file_id, &session.session_ref())
                     .await?;
             }
             session_store
-                .put_file_mapping(operation, &file_id, &response.file_uuid)
+                .put_file_mapping(operation, &file_id, &file_uuid)
                 .await?;
-            uploaded.push(response.file_uuid);
+            uploaded.push(file_uuid);
         }
         Ok(uploaded)
+    }
+
+    async fn upload_file_part(
+        &self,
+        endpoint: Url,
+        part: Part,
+        upload_error: &'static str,
+        parse_error: &'static str,
+    ) -> Result<String, crate::error::ClewdrError> {
+        let response = self
+            .build_request(http::Method::POST, endpoint)
+            .multipart(Form::new().part("file", part))
+            .send()
+            .await
+            .map_err(|source| crate::error::ClewdrError::WreqError {
+                msg: upload_error,
+                source,
+            })?
+            .check_claude()
+            .await?;
+        #[derive(serde::Deserialize)]
+        struct UploadResponse {
+            file_uuid: String,
+        }
+        response
+            .json::<UploadResponse>()
+            .await
+            .map(|upload| upload.file_uuid)
+            .map_err(|source| crate::error::ClewdrError::WreqError {
+                msg: parse_error,
+                source,
+            })
     }
 }
 
@@ -675,6 +678,7 @@ conversation-id/wiggle/upload-file"
                     user_digests: vec!["user".into()],
                     assistant_uuid_after: "assistant".into(),
                     replace_from_turn: 0,
+                    assistant_digests_before: vec![],
                 },
             )
             .await
@@ -738,6 +742,7 @@ conversation-id/wiggle/upload-file"
                     user_digests: vec!["user".into()],
                     assistant_uuid_after: "assistant".into(),
                     replace_from_turn: 0,
+                    assistant_digests_before: vec![],
                 },
             )
             .await

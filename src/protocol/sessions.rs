@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
@@ -41,6 +41,10 @@ pub struct SessionTurn {
     pub parent_uuid_before: Option<String>,
     pub user_digests: Vec<String>,
     pub assistant_uuid_after: String,
+    #[serde(default)]
+    pub assistant_digests_before: Vec<String>,
+    #[serde(default)]
+    pub assistant_digest_after: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -49,6 +53,8 @@ pub struct PendingTurn {
     pub user_digests: Vec<String>,
     pub assistant_uuid_after: String,
     pub replace_from_turn: usize,
+    #[serde(default)]
+    pub assistant_digests_before: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,12 +157,18 @@ impl SessionLifecycle {
         }
     }
 
-    pub async fn commit(&self) -> Result<(), ProtocolError> {
+    pub async fn commit(
+        &self,
+        assistant_digest_after: Option<String>,
+    ) -> Result<(), ProtocolError> {
         let mut operation = self.inner.operation.lock().await;
         let Some(active) = operation.as_ref() else {
             return Ok(());
         };
-        self.inner.store.commit(active).await?;
+        self.inner
+            .store
+            .commit(active, assistant_digest_after)
+            .await?;
         operation.take();
         self.inner.finalized.store(true, Ordering::Release);
         Ok(())
@@ -202,8 +214,11 @@ impl StreamSessionGuard {
         }
     }
 
-    pub async fn commit(&mut self) -> Result<(), ProtocolError> {
-        self.lifecycle.commit().await?;
+    pub async fn commit(
+        &mut self,
+        assistant_digest_after: Option<String>,
+    ) -> Result<(), ProtocolError> {
+        self.lifecycle.commit(assistant_digest_after).await?;
         self.finalized = true;
         Ok(())
     }
@@ -294,6 +309,7 @@ impl ProtocolSessionStore {
         &self,
         operation: &SessionOperation,
         user_digests: &[String],
+        assistant_digests: &[String],
         model_digest: &str,
         system_digest: &str,
     ) -> Result<ReusePlan, ProtocolError> {
@@ -321,7 +337,9 @@ impl ProtocolSessionStore {
         if session.model_digest != model_digest || session.system_digest != system_digest {
             return Err(reuse_failed("Model or system prompt changed"));
         }
-        plan_committed_turns(&session.turns, user_digests)
+        let plan = plan_committed_turns(&session.turns, user_digests)?;
+        validate_assistant_context(&session.turns, assistant_digests, &plan)?;
+        Ok(plan)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -411,7 +429,11 @@ impl ProtocolSessionStore {
             .cloned()
     }
 
-    pub async fn commit(&self, operation: &SessionOperation) -> Result<(), ProtocolError> {
+    pub async fn commit(
+        &self,
+        operation: &SessionOperation,
+        assistant_digest_after: Option<String>,
+    ) -> Result<(), ProtocolError> {
         let mut index = self.index.lock().await;
         let session = index
             .sessions
@@ -426,6 +448,8 @@ impl ProtocolSessionStore {
             parent_uuid_before: pending.parent_uuid_before,
             user_digests: pending.user_digests,
             assistant_uuid_after: pending.assistant_uuid_after,
+            assistant_digests_before: pending.assistant_digests_before,
+            assistant_digest_after,
         });
         session.state = SessionState::Committed;
         session.last_used = Utc::now().timestamp();
@@ -511,12 +535,56 @@ impl ProtocolSessionStore {
     }
 
     pub async fn cleanup_tombstones(&self) -> Result<(), ProtocolError> {
-        let mut index = self.index.lock().await;
         let cutoff = Utc::now().timestamp() - TOMBSTONE_TTL_SECONDS;
-        index.sessions.retain(|_, session| {
-            session.state != SessionState::Tombstoned || session.last_used >= cutoff
-        });
+        let candidates = {
+            let index = self.index.lock().await;
+            index
+                .sessions
+                .iter()
+                .filter(|(_, session)| {
+                    session.state == SessionState::Tombstoned && session.last_used < cutoff
+                })
+                .map(|(key, session)| (key.clone(), session.session_digest.clone()))
+                .collect::<Vec<_>>()
+        };
+        for (key, session_digest) in candidates {
+            let lock = {
+                let mut locks = self.locks.lock().await;
+                locks
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone()
+            };
+            let operation = SessionOperation {
+                key: key.clone(),
+                session_digest,
+                _guard: lock.lock_owned().await,
+                lock_registry: self.locks.clone(),
+            };
+            let mut index = self.index.lock().await;
+            if index.sessions.get(&operation.key).is_some_and(|session| {
+                session.state == SessionState::Tombstoned && session.last_used < cutoff
+            }) {
+                index.sessions.remove(&operation.key);
+            }
+        }
+        let index = self.index.lock().await;
         self.persist_locked(&index).await
+    }
+
+    pub async fn staged_file_references(&self) -> HashMap<String, BTreeSet<String>> {
+        let index = self.index.lock().await;
+        let mut references = HashMap::<String, BTreeSet<String>>::new();
+        for session in index.sessions.values() {
+            let session_ref = session.session_ref();
+            for file_id in session.file_mappings.keys() {
+                references
+                    .entry(file_id.clone())
+                    .or_default()
+                    .insert(session_ref.clone());
+            }
+        }
+        references
     }
 
     async fn persist_locked(&self, index: &SessionIndex) -> Result<(), ProtocolError> {
@@ -619,6 +687,34 @@ pub fn digest_user_messages(messages: &[Message]) -> Vec<(usize, String)> {
         .collect()
 }
 
+pub fn digest_assistant_messages(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| message.role == Role::Assistant)
+        .filter_map(|message| {
+            let text = match &message.content {
+                MessageContent::Text { content } => content.clone(),
+                MessageContent::Blocks { content } => content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
+            (!text.is_empty()).then(|| digest_assistant_output(&text))
+        })
+        .collect()
+}
+
+pub fn digest_assistant_output(text: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"clewdr-assistant-text-v1\0");
+    digest.update(text.as_bytes());
+    hex::encode(digest.finalize())
+}
+
 pub fn session_ref(principal: &str, session_digest: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"clewdr-session-key-v1\0");
@@ -679,6 +775,38 @@ fn plan_committed_turns(
     Err(reuse_failed(
         "Request history is not aligned to committed turns",
     ))
+}
+
+fn validate_assistant_context(
+    turns: &[SessionTurn],
+    requested: &[String],
+    plan: &ReusePlan,
+) -> Result<(), ProtocolError> {
+    let expected = match plan {
+        ReusePlan::Create => return Ok(()),
+        ReusePlan::Append { .. } => {
+            let latest = turns.last().expect("append requires a committed turn");
+            let mut expected = latest.assistant_digests_before.clone();
+            expected.extend(latest.assistant_digest_after.iter().cloned());
+            expected
+        }
+        ReusePlan::Fork {
+            replace_from_turn, ..
+        }
+        | ReusePlan::Regenerate {
+            replace_from_turn, ..
+        } => turns
+            .get(*replace_from_turn)
+            .expect("reuse plan references a committed turn")
+            .assistant_digests_before
+            .clone(),
+    };
+    if requested != expected {
+        return Err(reuse_failed(
+            "Assistant history or prefill does not match the selected conversation parent",
+        ));
+    }
+    Ok(())
 }
 
 fn enforce_capacity(
@@ -758,13 +886,19 @@ async fn set_owner_only_session_file(_path: &Path) -> Result<(), ProtocolError> 
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use futures::stream;
+
     use super::*;
+    use crate::protocol::files::StagedFileStore;
 
     fn turn(parent: Option<&str>, users: &[&str], assistant: &str) -> SessionTurn {
         SessionTurn {
             parent_uuid_before: parent.map(str::to_owned),
             user_digests: users.iter().map(|value| (*value).to_owned()).collect(),
             assistant_uuid_after: assistant.to_owned(),
+            assistant_digests_before: vec![],
+            assistant_digest_after: None,
         }
     }
 
@@ -801,6 +935,19 @@ mod tests {
                 replace_from_turn: 1
             }
         );
+    }
+
+    #[test]
+    fn pending_turn_without_assistant_digests_loads_from_v1_metadata() {
+        let pending: PendingTurn = serde_json::from_value(serde_json::json!({
+            "parent_uuid_before": null,
+            "user_digests": ["u1"],
+            "assistant_uuid_after": "a1",
+            "replace_from_turn": 0
+        }))
+        .unwrap();
+
+        assert!(pending.assistant_digests_before.is_empty());
     }
 
     #[test]
@@ -842,6 +989,7 @@ mod tests {
                     user_digests: vec!["u1".into()],
                     assistant_uuid_after: "a1".into(),
                     replace_from_turn: 0,
+                    assistant_digests_before: vec![],
                 },
             )
             .await
@@ -854,7 +1002,7 @@ mod tests {
         let operation = store.try_begin(&principal, &"ab".repeat(32)).await.unwrap();
         assert_eq!(
             store
-                .plan(&operation, &["u1".into()], "model", "system")
+                .plan(&operation, &["u1".into()], &[], "model", "system")
                 .await
                 .unwrap_err()
                 .code,
@@ -958,6 +1106,7 @@ mod tests {
                     user_digests: vec!["u".into()],
                     assistant_uuid_after: "a".into(),
                     replace_from_turn: 0,
+                    assistant_digests_before: vec![],
                 },
             )
             .await
@@ -965,7 +1114,7 @@ mod tests {
         store.tombstone(&operation).await.unwrap();
         assert_eq!(
             store
-                .plan(&operation, &["u".into()], "model", "system")
+                .plan(&operation, &["u".into()], &[], "model", "system")
                 .await
                 .unwrap_err()
                 .code,
@@ -991,7 +1140,7 @@ mod tests {
         let operation = store.try_begin(&owner, &digest).await.unwrap();
         assert_eq!(
             store
-                .plan(&operation, &["u".into()], "model", "system")
+                .plan(&operation, &["u".into()], &[], "model", "system")
                 .await
                 .unwrap(),
             ReusePlan::Create
@@ -1019,11 +1168,12 @@ mod tests {
                     user_digests: vec!["u1".into()],
                     assistant_uuid_after: "a1".into(),
                     replace_from_turn: 0,
+                    assistant_digests_before: vec![],
                 },
             )
             .await
             .unwrap();
-        store.commit(&operation).await.unwrap();
+        store.commit(&operation, None).await.unwrap();
         store
             .start_existing(
                 &operation,
@@ -1032,6 +1182,7 @@ mod tests {
                     user_digests: vec!["u2".into()],
                     assistant_uuid_after: "a2".into(),
                     replace_from_turn: 1,
+                    assistant_digests_before: vec![],
                 },
             )
             .await
@@ -1042,13 +1193,247 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .plan(&operation, &["u1".into(), "u2".into()], "model", "system",)
+                .plan(
+                    &operation,
+                    &["u1".into(), "u2".into()],
+                    &[],
+                    "model",
+                    "system",
+                )
                 .await
                 .unwrap(),
             ReusePlan::Append {
                 parent_uuid: "a1".into(),
                 suffix_start: 1,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn assistant_history_and_prefill_must_match_the_selected_parent() {
+        let store = ProtocolSessionStore::memory();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let digest = "fb".repeat(32);
+        let prefill = digest_assistant_output("existing prefill");
+        let generated = digest_assistant_output("generated answer");
+        let operation = store.try_begin(&principal, &digest).await.unwrap();
+        store
+            .create_provisional(
+                &operation,
+                &principal,
+                &digest,
+                "cookie".into(),
+                "org".into(),
+                "conv".into(),
+                "model".into(),
+                "system".into(),
+                PendingTurn {
+                    parent_uuid_before: None,
+                    user_digests: vec!["u1".into()],
+                    assistant_uuid_after: "a1".into(),
+                    replace_from_turn: 0,
+                    assistant_digests_before: vec![prefill.clone()],
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .commit(&operation, Some(generated.clone()))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .plan(
+                    &operation,
+                    &["u1".into(), "u2".into()],
+                    &[prefill.clone(), generated.clone()],
+                    "model",
+                    "system",
+                )
+                .await
+                .unwrap(),
+            ReusePlan::Append { .. }
+        ));
+        assert_eq!(
+            store
+                .plan(
+                    &operation,
+                    &["u1".into(), "u2".into()],
+                    &[prefill.clone(), digest_assistant_output("changed answer")],
+                    "model",
+                    "system",
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "conversation_reuse_failed"
+        );
+        assert!(matches!(
+            store
+                .plan(
+                    &operation,
+                    &["u1".into()],
+                    std::slice::from_ref(&prefill),
+                    "model",
+                    "system",
+                )
+                .await
+                .unwrap(),
+            ReusePlan::Regenerate { .. }
+        ));
+        assert_eq!(
+            store
+                .plan(
+                    &operation,
+                    &["u1".into()],
+                    &[digest_assistant_output("changed prefill")],
+                    "model",
+                    "system",
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "conversation_reuse_failed"
+        );
+    }
+
+    #[test]
+    fn assistant_digest_preserves_text_block_boundaries() {
+        let messages = [Message::new_blocks(
+            Role::Assistant,
+            vec![ContentBlock::text("ab"), ContentBlock::text("c")],
+        )];
+        let regrouped = [Message::new_blocks(
+            Role::Assistant,
+            vec![ContentBlock::text("a"), ContentBlock::text("bc")],
+        )];
+
+        assert_ne!(
+            digest_assistant_messages(&messages),
+            digest_assistant_messages(&regrouped)
+        );
+    }
+
+    #[tokio::test]
+    async fn tombstone_cleanup_waits_for_the_active_session_operation() {
+        let store = ProtocolSessionStore::memory();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let digest = "fd".repeat(32);
+        let operation = store.try_begin(&principal, &digest).await.unwrap();
+        store
+            .create_provisional(
+                &operation,
+                &principal,
+                &digest,
+                "cookie".into(),
+                "org".into(),
+                "conv".into(),
+                "model".into(),
+                "system".into(),
+                PendingTurn {
+                    parent_uuid_before: None,
+                    user_digests: vec!["u".into()],
+                    assistant_uuid_after: "a".into(),
+                    replace_from_turn: 0,
+                    assistant_digests_before: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        store.tombstone(&operation).await.unwrap();
+        {
+            let mut index = store.index.lock().await;
+            index.sessions.get_mut(&operation.key).unwrap().last_used =
+                Utc::now().timestamp() - TOMBSTONE_TTL_SECONDS - 1;
+        }
+
+        let cleanup_store = store.clone();
+        let mut cleanup = tokio::spawn(async move { cleanup_store.cleanup_tombstones().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut cleanup)
+                .await
+                .is_err()
+        );
+        assert!(store.get(&operation).await.is_some());
+
+        drop(operation);
+        cleanup.await.unwrap().unwrap();
+        let operation = store.try_begin(&principal, &digest).await.unwrap();
+        assert!(store.get(&operation).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tombstone_ttl_cleanup_reconciles_file_refs_for_quota_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let files = StagedFileStore::persistent_with_limits(temp.path().join("files"), 4, 4)
+            .await
+            .unwrap();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let first = files
+            .stage_stream(
+                &principal,
+                "first.bin",
+                "application/octet-stream",
+                stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"1234"))]),
+            )
+            .await
+            .unwrap();
+        let sessions = ProtocolSessionStore::memory();
+        let digest = "fc".repeat(32);
+        let operation = sessions.try_begin(&principal, &digest).await.unwrap();
+        sessions
+            .create_provisional(
+                &operation,
+                &principal,
+                &digest,
+                "cookie".into(),
+                "org".into(),
+                "conv".into(),
+                "model".into(),
+                "system".into(),
+                PendingTurn {
+                    parent_uuid_before: None,
+                    user_digests: vec!["u".into()],
+                    assistant_uuid_after: "a".into(),
+                    replace_from_turn: 0,
+                    assistant_digests_before: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        sessions
+            .put_file_mapping(&operation, &first.id, "claude-file")
+            .await
+            .unwrap();
+        let session_ref = sessions.get(&operation).await.unwrap().session_ref();
+        files.add_reference(&first.id, &session_ref).await.unwrap();
+        sessions.tombstone(&operation).await.unwrap();
+        {
+            let mut index = sessions.index.lock().await;
+            index.sessions.get_mut(&operation.key).unwrap().last_used =
+                Utc::now().timestamp() - TOMBSTONE_TTL_SECONDS - 1;
+        }
+        drop(operation);
+
+        sessions.cleanup_tombstones().await.unwrap();
+        files
+            .reconcile_references(&sessions.staged_file_references().await)
+            .await
+            .unwrap();
+        let second = files
+            .stage_stream(
+                &principal,
+                "second.bin",
+                "application/octet-stream",
+                stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"5678"))]),
+            )
+            .await
+            .unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            files.resolve(&principal, &first.id).await.unwrap_err().code,
+            "file_not_found"
         );
     }
 }

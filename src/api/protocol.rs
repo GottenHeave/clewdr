@@ -73,23 +73,22 @@ pub(crate) async fn api_stage_file(
             Err(error) => Err(error),
         }
     });
-    let (response, created) = store
+    let upload = store
         .stage_stream_with_status(&principal, &filename, &mime_type, chunks)
         .await?;
-    if multipart
-        .next_field()
-        .await
-        .map_err(invalid_multipart)?
-        .is_some()
-    {
-        if created {
-            store.discard_created_unreferenced(&response.id).await?;
+    match multipart.next_field().await {
+        Ok(None) => Ok(Json(upload.into_response())),
+        Ok(Some(_)) => {
+            upload.rollback(&store).await?;
+            Err(invalid_multipart(
+                "Multipart body must contain exactly one field",
+            ))
         }
-        return Err(invalid_multipart(
-            "Multipart body must contain exactly one field",
-        ));
+        Err(error) => {
+            upload.rollback(&store).await?;
+            Err(invalid_multipart(error))
+        }
     }
-    Ok(Json(response))
 }
 
 #[derive(Deserialize)]

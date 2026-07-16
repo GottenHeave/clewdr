@@ -15,7 +15,7 @@ use crate::{
     claude_code_state::ClaudeCodeState,
     claude_web_state::ClaudeWebState,
     error::{CheckClaudeErr, ClewdrError},
-    protocol::sessions::StreamSessionGuard,
+    protocol::sessions::{StreamSessionGuard, digest_assistant_output},
     types::claude::{
         ContentBlock, CountMessageTokensResponse, CreateMessageParams, CreateMessageResponse,
         Message, Role,
@@ -132,7 +132,8 @@ impl ClaudeWebState {
                     if is_message_stop {
                         saw_message_stop = true;
                         if let Some(guard) = protocol_guard.as_mut() {
-                            guard.commit().await.map_err(axum::Error::new)?;
+                            let digest = (!acc.is_empty()).then(|| digest_assistant_output(&acc));
+                            guard.commit(digest).await.map_err(axum::Error::new)?;
                         }
                     }
                     if let Ok(d) = serde_json::from_str::<Data>(&event.data) {
@@ -231,7 +232,8 @@ impl ClaudeWebState {
         };
         if let Some(lifecycle) = protocol_lifecycle {
             if saw_message_stop {
-                lifecycle.commit().await?;
+                let digest = (!text.is_empty()).then(|| digest_assistant_output(&text));
+                lifecycle.commit(digest).await?;
             } else {
                 lifecycle.uncertain().await;
                 return Err(crate::protocol::ProtocolError::new(
@@ -422,6 +424,7 @@ mod protocol_tests {
                     user_digests: vec!["user".into()],
                     assistant_uuid_after: "assistant".into(),
                     replace_from_turn: 0,
+                    assistant_digests_before: vec![],
                 },
             )
             .await
@@ -488,7 +491,7 @@ mod protocol_tests {
 
         let operation = store.try_begin(&principal, &session_digest).await.unwrap();
         let error = store
-            .plan(&operation, &["user".into()], "model", "system")
+            .plan(&operation, &["user".into()], &[], "model", "system")
             .await
             .unwrap_err();
         assert_eq!(error.code, "conversation_state_uncertain");
@@ -511,7 +514,7 @@ mod protocol_tests {
 
         let operation = store.try_begin(&principal, &session_digest).await.unwrap();
         let error = store
-            .plan(&operation, &["user".into()], "model", "system")
+            .plan(&operation, &["user".into()], &[], "model", "system")
             .await
             .unwrap_err();
         assert_eq!(error.code, "conversation_state_uncertain");

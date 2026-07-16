@@ -22,8 +22,8 @@ use crate::{
     protocol::{
         ProtocolError, parse_session_id,
         sessions::{
-            PendingTurn, ReusePlan, SessionLifecycle, digest_model, digest_system,
-            digest_user_messages,
+            PendingTurn, ReusePlan, SessionLifecycle, digest_assistant_messages, digest_model,
+            digest_system, digest_user_messages,
         },
     },
     types::claude::{ContentBlock, CreateMessageParams, ImageSource, Message, MessageContent},
@@ -194,10 +194,17 @@ impl ClaudeWebState {
             .iter()
             .map(|(_, digest)| digest.clone())
             .collect::<Vec<_>>();
+        let assistant_digests = digest_assistant_messages(&p.messages);
         let model_digest = digest_model(&p.model);
         let system_digest = digest_system(&p.system);
         let plan = sessions
-            .plan(&operation, &user_digests, &model_digest, &system_digest)
+            .plan(
+                &operation,
+                &user_digests,
+                &assistant_digests,
+                &model_digest,
+                &system_digest,
+            )
             .await?;
         let existing = sessions.get(&operation).await;
 
@@ -275,6 +282,7 @@ impl ClaudeWebState {
             user_digests: user_digests[suffix_start..].to_vec(),
             assistant_uuid_after: assistant_uuid.clone(),
             replace_from_turn,
+            assistant_digests_before: assistant_digests,
         };
 
         let body = if is_new {
