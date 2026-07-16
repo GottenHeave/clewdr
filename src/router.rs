@@ -7,6 +7,7 @@ use axum::{
 };
 use tower::ServiceBuilder;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer};
+use tracing::warn;
 
 use crate::{
     api::*,
@@ -58,11 +59,16 @@ impl RouterBuilder {
             )
         };
         if let Some(files) = &staged_files {
-            files
-                .remove_orphaned_references(&conv_cache.existing_explicit_session_refs().await)
+            let _files = conv_cache.lock_explicit_files().await;
+            if let Err(error) = files
+                .reconcile_references(&conv_cache.explicit_file_references().await)
                 .await
-                .expect("Failed to remove orphaned staged file references");
-            files.cleanup().await.expect("Failed to clean staged files");
+            {
+                warn!("Failed to reconcile staged file references: {error}");
+            }
+            if let Err(error) = files.cleanup().await {
+                warn!("Failed to clean staged files: {error}");
+            }
         }
 
         let cleanup_cache = conv_cache.clone();
@@ -73,9 +79,14 @@ impl RouterBuilder {
                 interval.tick().await;
                 cleanup_cache.cleanup().await;
                 if let Some(files) = &cleanup_files {
-                    let session_refs = cleanup_cache.existing_explicit_session_refs().await;
-                    let _ = files.remove_orphaned_references(&session_refs).await;
-                    let _ = files.cleanup().await;
+                    let _files = cleanup_cache.lock_explicit_files().await;
+                    let references = cleanup_cache.explicit_file_references().await;
+                    if let Err(error) = files.reconcile_references(&references).await {
+                        warn!("Failed to reconcile staged file references: {error}");
+                    }
+                    if let Err(error) = files.cleanup().await {
+                        warn!("Failed to clean staged files: {error}");
+                    }
                 }
             }
         });

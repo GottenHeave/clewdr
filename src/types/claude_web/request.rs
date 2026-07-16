@@ -51,7 +51,6 @@ pub struct NormalizedExplicitMessage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExplicitContentErrorKind {
     InvalidRequest,
-    StagedFilesUnavailable,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -66,13 +65,6 @@ impl ExplicitContentError {
         Self {
             kind: ExplicitContentErrorKind::InvalidRequest,
             message,
-        }
-    }
-
-    fn staged() -> Self {
-        Self {
-            kind: ExplicitContentErrorKind::StagedFilesUnavailable,
-            message: "Staged file references require the staged-files extension",
         }
     }
 }
@@ -177,9 +169,6 @@ fn normalize_image(source: &ImageSource) -> Result<ImageSource, ExplicitContentE
 
 fn normalized_file_source(file_id: &str) -> Result<ImageSource, ExplicitContentError> {
     let file_id = file_id.trim();
-    if file_id.starts_with("file_clewdr_v1_") {
-        return Err(ExplicitContentError::staged());
-    }
     if file_id.is_empty() {
         return Err(ExplicitContentError::invalid("File ID must not be empty"));
     }

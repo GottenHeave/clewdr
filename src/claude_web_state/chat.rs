@@ -197,6 +197,7 @@ impl ClaudeWebState {
         let principal = self.principal.clone().ok_or(ClewdrError::InvalidAuth)?;
         let key = ExplicitSessionKey::new(principal.as_str(), &session_digest);
         self.explicit_file_key = Some(key.clone());
+        self.explicit_completion_started = false;
         let operation = self.conv_cache.try_lock_explicit_operation(&key).await?;
         let digested = digest_messages(&p.messages)?;
         let user_digests = digested
@@ -325,7 +326,9 @@ impl ClaudeWebState {
             )
             .await;
         self.pending_cache_write.take();
-        let response = self.finish_explicit_send(&key, send_result).await?;
+        let response = self
+            .finish_explicit_send(&key, existing.is_some(), send_result)
+            .await?;
         self.explicit_lifecycle = Some(ExplicitLifecycle::new(
             self.conv_cache.clone(),
             key,
@@ -337,6 +340,7 @@ impl ClaudeWebState {
     async fn finish_explicit_send(
         &self,
         key: &ExplicitSessionKey,
+        existing_session: bool,
         result: Result<Response, ClewdrError>,
     ) -> Result<Response, ClewdrError> {
         match result {
@@ -353,7 +357,11 @@ impl ClaudeWebState {
                 .into())
             }
             Err(error) => {
-                self.conv_cache.mark_explicit_uncertain(key).await?;
+                if existing_session && !self.explicit_completion_started {
+                    self.conv_cache.restore_explicit_committed(key).await?;
+                } else {
+                    self.conv_cache.mark_explicit_uncertain(key).await?;
+                }
                 Err(error)
             }
         }
@@ -753,6 +761,7 @@ impl ClaudeWebState {
             ))
             .expect("Url parse error");
 
+        self.explicit_completion_started = true;
         let response = self
             .build_request(Method::POST, endpoint)
             .json(&body)
@@ -841,6 +850,7 @@ impl ClaudeWebState {
             ))
             .expect("Url parse error");
 
+        self.explicit_completion_started = true;
         let response = self
             .build_request(Method::POST, endpoint)
             .json(&body)
@@ -931,6 +941,7 @@ impl ClaudeWebState {
             ))
             .expect("Url parse error");
 
+        self.explicit_completion_started = true;
         let response = self
             .build_request(Method::POST, endpoint)
             .json(&body)
@@ -1336,6 +1347,9 @@ mod tests {
                 )))
                 .unwrap();
         }
+        if path.contains("/upload-file") {
+            return json_response(json!({"file_uuid":"uploaded-file"}));
+        }
         json_response(json!({}))
     }
 
@@ -1501,6 +1515,99 @@ mod tests {
             panic!("expected protocol error");
         };
         assert_eq!(source.code, "staged_files_unavailable");
+    }
+
+    #[tokio::test]
+    async fn staged_upload_compensates_partial_mapping_and_reference_failures() {
+        let principal = crate::protocol::AuthPrincipal::for_authenticated_user();
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let blocker = cache_dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"block").unwrap();
+        let cache = ConversationCache::persistent(blocker.join("cache.json")).await;
+        let key = ExplicitSessionKey::new(principal.as_str(), "mapping-failure");
+        cache.set_explicit(key.clone(), file_session()).await;
+        let store_dir = tempfile::tempdir().unwrap();
+        let files =
+            crate::protocol_files::StagedFileStore::persistent_with_limits(store_dir.path(), 1, 1)
+                .await
+                .unwrap();
+        let staged = files
+            .stage_stream(
+                &principal,
+                "first.txt",
+                "text/plain",
+                futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"a"))]),
+            )
+            .await
+            .unwrap();
+        let (endpoint, _) = mock_endpoint().await;
+        let mut state = test_state(endpoint, cache.clone()).await;
+        state.principal = Some(principal.clone());
+        state.staged_files = Some(files.clone());
+        state.explicit_file_key = Some(key.clone());
+        let error = upload_test_file(&mut state, file_source(staged.id.clone()))
+            .await
+            .unwrap_err();
+        let ClewdrError::Protocol { source } = error else {
+            panic!("expected mapping persistence error");
+        };
+        assert_eq!(source.code, "session_storage_unavailable");
+        assert!(
+            cache
+                .explicit_file_mapping(&key, &staged.id)
+                .await
+                .is_none()
+        );
+        files
+            .stage_stream(
+                &principal,
+                "second.txt",
+                "text/plain",
+                futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"b"))]),
+            )
+            .await
+            .unwrap();
+
+        let cache = ConversationCache::new();
+        let key = ExplicitSessionKey::new(principal.as_str(), "reference-failure");
+        cache
+            .set_explicit_checked(key.clone(), file_session())
+            .await
+            .unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let files = crate::protocol_files::StagedFileStore::persistent(store_dir.path())
+            .await
+            .unwrap();
+        let staged = files
+            .stage_stream(
+                &principal,
+                "file.txt",
+                "text/plain",
+                futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                    b"file",
+                ))]),
+            )
+            .await
+            .unwrap();
+        std::fs::remove_file(store_dir.path().join("files.json")).unwrap();
+        std::fs::create_dir(store_dir.path().join("files.json")).unwrap();
+        let (endpoint, _) = mock_endpoint().await;
+        let mut state = test_state(endpoint, cache.clone()).await;
+        state.principal = Some(principal);
+        state.staged_files = Some(files);
+        state.explicit_file_key = Some(key.clone());
+        assert!(
+            upload_test_file(&mut state, file_source(staged.id.clone()))
+                .await
+                .is_err()
+        );
+        assert!(
+            cache
+                .explicit_file_mapping(&key, &staged.id)
+                .await
+                .is_none()
+        );
     }
 
     async fn send_and_stage_create(
@@ -1714,6 +1821,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_chat_accepts_staged_image_document_and_container_references() {
+        let _config_guard = CONFIG_TEST_LOCK.lock().await;
+        let (endpoint, requests) = black_box_endpoint().await;
+        let original = crate::config::CLEWDR_CONFIG.load().as_ref().clone();
+        let _restore = ConfigRestore(original.clone());
+        crate::config::CLEWDR_CONFIG.rcu(|_| {
+            let mut config = original.clone();
+            config.rproxy = Some(endpoint.clone());
+            config.no_fs = true;
+            config.skip_non_pro = false;
+            config.skip_normal_pro = false;
+            config
+        });
+        let handle = crate::services::cookie_actor::CookieActorHandle::start()
+            .await
+            .unwrap();
+        let cookie =
+            crate::config::CookieStatus::new(&format!("{}-bbbbbbAA", "a".repeat(86)), None)
+                .unwrap();
+        handle.submit(cookie).await.unwrap();
+        tokio::task::yield_now().await;
+        let principal = crate::protocol::AuthPrincipal::for_authenticated_user();
+        let temp = tempfile::tempdir().unwrap();
+        let files = crate::protocol_files::StagedFileStore::persistent(temp.path())
+            .await
+            .unwrap();
+        let staged = files
+            .stage_stream(
+                &principal,
+                "asset.png",
+                "image/png",
+                futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                    b"image",
+                ))]),
+            )
+            .await
+            .unwrap();
+        let blocks = [
+            json!({"type":"image", "source":{"type":"file", "file_id":staged.id}}),
+            json!({"type":"document", "source":{"type":"file", "file_id":staged.id}}),
+            json!({"type":"container_upload", "file_id":staged.id}),
+        ];
+        let cache = ConversationCache::new();
+        for (index, block) in blocks.into_iter().enumerate() {
+            let message = serde_json::from_value(json!({
+                "role":"user",
+                "content":[block]
+            }))
+            .unwrap();
+            let mut state = ClaudeWebState::new(handle.clone(), cache.clone());
+            state.principal = Some(principal.clone());
+            state.staged_files = Some(files.clone());
+            state
+                .try_chat(CreateMessageParams {
+                    model: "claude-sonnet-4-6".into(),
+                    messages: vec![message],
+                    metadata: Some(Metadata {
+                        fields: [(
+                            "user_id".into(),
+                            format!("cherry_topic_v1_{:064x}", index + 1),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    }),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.path.contains("/upload-file"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.path.contains("/completion"))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
     async fn consecutive_user_messages_match_create_and_incremental_prompts() {
         let requests = create_append_requests(
             vec![
@@ -1804,7 +1998,7 @@ mod tests {
             vec![image(), image()],
         )]);
         let send = send_and_stage_create(&mut state, &key, &request).await;
-        assert!(state.finish_explicit_send(&key, send).await.is_err());
+        assert!(state.finish_explicit_send(&key, false, send).await.is_err());
         drop(operation);
         let explicit = cache.get_explicit(&key).await.unwrap().explicit.unwrap();
         assert_eq!(explicit.state, ExplicitSessionState::Uncertain);
@@ -1832,6 +2026,73 @@ mod tests {
             .unwrap(),
             ExplicitReusePlan::Create
         );
+    }
+
+    #[tokio::test]
+    async fn existing_reuse_upload_failures_restore_committed_state() {
+        let principal = crate::protocol::AuthPrincipal::for_authenticated_user();
+        let request = params(vec![
+            serde_json::from_value(json!({
+                "role":"user",
+                "content":[{
+                    "type":"image",
+                    "source":{"type":"file", "file_id":"file_clewdr_v1_missing"}
+                }]
+            }))
+            .unwrap(),
+        ]);
+        for (index, reuse) in [
+            ExplicitReusePlan::Append {
+                parent_uuid: "parent".into(),
+                suffix_start: 0,
+            },
+            ExplicitReusePlan::Fork {
+                parent_uuid: Some("parent".into()),
+                suffix_start: 0,
+                replace_from_turn: 0,
+            },
+            ExplicitReusePlan::Regenerate {
+                parent_uuid: Some("parent".into()),
+                suffix_start: 0,
+                replace_from_turn: 0,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let cache = ConversationCache::new();
+            let key = ExplicitSessionKey::new(principal.as_str(), index.to_string());
+            let mut cached = file_session();
+            cached.explicit.as_mut().unwrap().state = ExplicitSessionState::InFlight;
+            cache.set_explicit(key.clone(), cached.clone()).await;
+            let (endpoint, requests) = mock_endpoint().await;
+            let mut state = test_state(endpoint, cache.clone()).await;
+            state.principal = Some(principal.clone());
+            state.explicit_file_key = Some(key.clone());
+            let send = state
+                .send_explicit_plan(
+                    &reuse,
+                    Some(&cached),
+                    Some("parent"),
+                    0,
+                    &[0],
+                    &[1],
+                    &request,
+                )
+                .await;
+            assert!(state.finish_explicit_send(&key, true, send).await.is_err());
+            let explicit = cache.get_explicit(&key).await.unwrap().explicit.unwrap();
+            assert_eq!(explicit.state, ExplicitSessionState::Committed);
+            assert!(explicit.pending.is_none());
+            assert!(!state.explicit_completion_started);
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|request| !request.path.contains("/completion"))
+            );
+        }
     }
 
     #[tokio::test]
@@ -1962,6 +2223,7 @@ mod tests {
             let error = state
                 .finish_explicit_send(
                     &key,
+                    true,
                     Err(ClewdrError::ClaudeHttpError {
                         code: status,
                         inner: crate::error::ClaudeErrorBody {

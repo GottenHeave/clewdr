@@ -85,6 +85,7 @@ pub struct ClaudeWebState {
     pub explicit_lifecycle: Option<ExplicitLifecycle>,
     pub staged_files: Option<Arc<StagedFileStore>>,
     pub explicit_file_key: Option<conversation_cache::ExplicitSessionKey>,
+    pub explicit_completion_started: bool,
 }
 
 impl ClaudeWebState {
@@ -112,6 +113,7 @@ impl ClaudeWebState {
             explicit_lifecycle: None,
             staged_files: None,
             explicit_file_key: None,
+            explicit_completion_started: false,
         }
     }
 

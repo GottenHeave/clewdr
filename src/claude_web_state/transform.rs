@@ -181,12 +181,22 @@ impl ClaudeWebState {
                 return Err(error);
             }
         };
-        self.conv_cache
-            .put_explicit_file_mapping(&key, staged_file_id, &upstream_file_id)
-            .await?;
-        store
+        let _files = self.conv_cache.lock_explicit_files().await;
+        let reference_added = store
             .add_reference(staged_file_id, &key.session_ref())
             .await?;
+        if let Err(error) = self
+            .conv_cache
+            .put_explicit_file_mapping(&key, staged_file_id, &upstream_file_id)
+            .await
+        {
+            if reference_added {
+                store
+                    .remove_reference(staged_file_id, &key.session_ref())
+                    .await?;
+            }
+            return Err(error.into());
+        }
         drop(resolved);
         Ok(upstream_file_id)
     }

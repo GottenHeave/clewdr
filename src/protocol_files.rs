@@ -4,6 +4,9 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use axum::http::StatusCode;
 use bytes::Bytes;
 use chrono::Utc;
@@ -17,6 +20,7 @@ use tokio::{
     io::AsyncWriteExt,
     sync::{Mutex, OnceCell, OwnedMutexGuard},
 };
+use tracing::warn;
 
 use crate::{
     protocol::{AuthPrincipal, ProtocolError},
@@ -97,7 +101,7 @@ struct PersistedFiles {
     files: Vec<StoredFile>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct FileIndex {
     files: HashMap<String, StoredFile>,
     total_bytes: u64,
@@ -113,6 +117,16 @@ pub struct StagedFileStore {
     hmac_key: OnceCell<[u8; 32]>,
     index: Arc<Mutex<FileIndex>>,
     upload_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    #[cfg(test)]
+    faults: TestFaults,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestFaults {
+    persist: AtomicUsize,
+    rename: AtomicUsize,
+    delete: AtomicUsize,
 }
 
 struct UploadOperation {
@@ -225,8 +239,11 @@ impl StagedFileStore {
             hmac_key: OnceCell::new(),
             index: Arc::new(Mutex::new(FileIndex { files, total_bytes })),
             upload_locks: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            faults: TestFaults::default(),
         });
         let _ = store.hmac_key().await?;
+        store.reconcile_objects().await?;
         Ok(store)
     }
 
@@ -323,8 +340,9 @@ impl StagedFileStore {
                 _operation: operation,
             });
         }
-        self.evict_unreferenced(&mut index, size_bytes).await?;
-        if index.total_bytes.saturating_add(size_bytes) > self.max_staged_bytes {
+        let mut after = index.clone();
+        let evicted = self.evict_unreferenced(&mut after, size_bytes);
+        if after.total_bytes.saturating_add(size_bytes) > self.max_staged_bytes {
             return Err(file_error(
                 StatusCode::INSUFFICIENT_STORAGE,
                 "staged_storage_full",
@@ -332,11 +350,22 @@ impl StagedFileStore {
             ));
         }
         let object_path = self.object_path(&id);
-        fs::rename(&temp_path, &object_path)
+        let created_object = if fs::try_exists(&object_path)
             .await
-            .map_err(storage_io_error)?;
-        temp_guard.disarm();
-        set_owner_only(&object_path, 0o600).await?;
+            .map_err(storage_io_error)?
+        {
+            false
+        } else {
+            self.rename_file(&temp_path, &object_path).await?;
+            temp_guard.disarm();
+            true
+        };
+        if let Err(error) = set_owner_only(&object_path, 0o600).await {
+            if created_object {
+                let _ = fs::remove_file(&object_path).await;
+            }
+            return Err(error);
+        }
         let now = Utc::now().timestamp();
         let stored = StoredFile {
             id: id.clone(),
@@ -350,9 +379,21 @@ impl StagedFileStore {
             active_leases: 0,
         };
         let response = stored.response();
-        index.total_bytes += size_bytes;
-        index.files.insert(id, stored);
-        self.persist_locked(&index).await?;
+        after.total_bytes += size_bytes;
+        after.files.insert(id, stored);
+        if let Err(error) = self.persist_locked(&after).await {
+            if created_object {
+                let _ = fs::remove_file(&object_path).await;
+            }
+            return Err(error);
+        }
+        *index = after;
+        drop(index);
+        for id in evicted {
+            if let Err(error) = self.remove_object(&self.object_path(&id)).await {
+                warn!("Failed to remove evicted staged file {id}: {error:?}");
+            }
+        }
         Ok(StagedUpload {
             response,
             created: true,
@@ -362,15 +403,22 @@ impl StagedFileStore {
 
     async fn discard_created_unreferenced(&self, id: &str) -> Result<(), ProtocolError> {
         let mut index = self.index.lock().await;
-        if index
+        if !index
             .files
             .get(id)
             .is_some_and(|file| file.references.is_empty() && file.active_leases == 0)
-            && let Some(file) = index.files.remove(id)
         {
-            index.total_bytes = index.total_bytes.saturating_sub(file.size_bytes);
-            let _ = fs::remove_file(self.object_path(id)).await;
-            self.persist_locked(&index).await?;
+            return Ok(());
+        }
+        let mut after = index.clone();
+        if let Some(file) = after.files.remove(id) {
+            after.total_bytes = after.total_bytes.saturating_sub(file.size_bytes);
+        }
+        self.persist_locked(&after).await?;
+        *index = after;
+        drop(index);
+        if let Err(error) = self.remove_object(&self.object_path(id)).await {
+            warn!("Failed to remove rolled back staged file {id}: {error:?}");
         }
         Ok(())
     }
@@ -381,7 +429,7 @@ impl StagedFileStore {
         id: &str,
     ) -> Result<ResolvedFile, ProtocolError> {
         let mut index = self.index.lock().await;
-        let Some(file) = index.files.get_mut(id) else {
+        let Some(file) = index.files.get(id) else {
             return Err(file_not_found("Staged file does not exist"));
         };
         if file.principal != principal.as_str() {
@@ -402,6 +450,11 @@ impl StagedFileStore {
         if !self.object_path(id).exists() {
             return Err(file_not_found("Staged file data is missing"));
         }
+        let mut after = index.clone();
+        let file = after
+            .files
+            .get_mut(id)
+            .expect("staged file remains present while index lock is held");
         file.last_used = Utc::now().timestamp();
         file.active_leases += 1;
         let resolved = ResolvedFile {
@@ -413,16 +466,33 @@ impl StagedFileStore {
                 index: self.index.clone(),
             },
         };
-        self.persist_locked(&index).await?;
+        self.persist_locked(&after).await?;
+        *index = after;
         Ok(resolved)
     }
 
-    pub async fn add_reference(&self, id: &str, session_ref: &str) -> Result<(), ProtocolError> {
+    pub async fn add_reference(&self, id: &str, session_ref: &str) -> Result<bool, ProtocolError> {
         self.update_index(|index| {
             if let Some(file) = index.files.get_mut(id) {
-                file.references.insert(session_ref.to_owned());
+                let inserted = file.references.insert(session_ref.to_owned());
                 file.last_used = Utc::now().timestamp();
+                return inserted;
             }
+            false
+        })
+        .await
+    }
+
+    pub async fn remove_reference(
+        &self,
+        id: &str,
+        session_ref: &str,
+    ) -> Result<bool, ProtocolError> {
+        self.update_index(|index| {
+            index
+                .files
+                .get_mut(id)
+                .is_some_and(|file| file.references.remove(session_ref))
         })
         .await
     }
@@ -436,17 +506,25 @@ impl StagedFileStore {
         .await
     }
 
-    pub async fn remove_orphaned_references(
+    pub async fn reconcile_references(
         &self,
-        existing_session_refs: &BTreeSet<String>,
+        expected: &BTreeSet<(String, String)>,
     ) -> Result<(), ProtocolError> {
         self.update_index(|index| {
-            index.files.values_mut().for_each(|file| {
+            for (id, file) in &mut index.files {
                 file.references
-                    .retain(|reference| existing_session_refs.contains(reference));
-            });
+                    .retain(|reference| expected.contains(&(reference.clone(), id.clone())));
+            }
+            for (reference, id) in expected {
+                if let Some(file) = index.files.get_mut(id)
+                    && !file.expired
+                {
+                    file.references.insert(reference.clone());
+                }
+            }
         })
-        .await
+        .await?;
+        self.reconcile_objects().await
     }
 
     pub async fn cleanup(&self) -> Result<(), ProtocolError> {
@@ -460,28 +538,44 @@ impl StagedFileStore {
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
+        let mut moved = Vec::new();
+        for id in &expired {
+            let object = self.object_path(id);
+            let trash = self
+                .objects
+                .join(format!(".cleanup-{}-{id}", uuid::Uuid::new_v4()));
+            if let Err(error) = self.prepare_object_removal(&object, &trash).await {
+                self.restore_moved_objects(&moved).await;
+                return Err(error);
+            }
+            moved.push((trash, object));
+        }
+        let mut after = index.clone();
         for id in expired {
-            let size_bytes = index
-                .files
-                .get(&id)
-                .map(|file| file.size_bytes)
-                .unwrap_or_default();
-            index.total_bytes = index.total_bytes.saturating_sub(size_bytes);
-            if let Some(file) = index.files.get_mut(&id) {
-                let _ = fs::remove_file(self.object_path(&id)).await;
+            if let Some(file) = after.files.get_mut(&id) {
+                after.total_bytes = after.total_bytes.saturating_sub(file.size_bytes);
                 file.expired = true;
             }
         }
-        self.persist_locked(&index).await
+        if let Err(error) = self.persist_locked(&after).await {
+            self.restore_moved_objects(&moved).await;
+            return Err(error);
+        }
+        *index = after;
+        drop(index);
+        for (trash, _) in moved {
+            if let Err(error) = fs::remove_file(&trash).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!("Failed to remove staged file cleanup artifact {trash:?}: {error}");
+            }
+        }
+        Ok(())
     }
 
-    async fn evict_unreferenced(
-        &self,
-        index: &mut FileIndex,
-        incoming: u64,
-    ) -> Result<(), ProtocolError> {
+    fn evict_unreferenced(&self, index: &mut FileIndex, incoming: u64) -> Vec<String> {
         if index.total_bytes.saturating_add(incoming) <= self.max_staged_bytes {
-            return Ok(());
+            return Vec::new();
         }
         let mut candidates = index
             .files
@@ -490,20 +584,17 @@ impl StagedFileStore {
             .map(|file| (file.last_used, file.id.clone()))
             .collect::<Vec<_>>();
         candidates.sort();
+        let mut evicted = Vec::new();
         for (_, id) in candidates {
             if index.total_bytes.saturating_add(incoming) <= self.max_staged_bytes {
                 break;
             }
             if let Some(file) = index.files.remove(&id) {
                 index.total_bytes = index.total_bytes.saturating_sub(file.size_bytes);
-                match fs::remove_file(self.object_path(&id)).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(storage_io_error(error)),
-                }
+                evicted.push(id);
             }
         }
-        Ok(())
+        evicted
     }
 
     async fn hmac_key(&self) -> Result<&[u8; 32], ProtocolError> {
@@ -539,13 +630,21 @@ impl StagedFileStore {
         self.objects.join(id)
     }
 
-    async fn update_index(&self, update: impl FnOnce(&mut FileIndex)) -> Result<(), ProtocolError> {
+    async fn update_index<R>(
+        &self,
+        update: impl FnOnce(&mut FileIndex) -> R,
+    ) -> Result<R, ProtocolError> {
         let mut index = self.index.lock().await;
-        update(&mut index);
-        self.persist_locked(&index).await
+        let mut after = index.clone();
+        let result = update(&mut after);
+        self.persist_locked(&after).await?;
+        *index = after;
+        Ok(result)
     }
 
     async fn persist_locked(&self, index: &FileIndex) -> Result<(), ProtocolError> {
+        #[cfg(test)]
+        self.fail_if_requested(&self.faults.persist, "injected metadata write failure")?;
         let snapshot = PersistedFiles {
             version: METADATA_VERSION,
             files: index.files.values().cloned().collect(),
@@ -556,6 +655,108 @@ impl StagedFileStore {
                 files_unavailable(format!("Failed to persist staged file metadata: {error}"))
             })
     }
+
+    async fn rename_file(&self, from: &Path, to: &Path) -> Result<(), ProtocolError> {
+        #[cfg(test)]
+        self.fail_if_requested(&self.faults.rename, "injected object rename failure")?;
+        fs::rename(from, to).await.map_err(storage_io_error)
+    }
+
+    async fn remove_object(&self, path: &Path) -> Result<(), ProtocolError> {
+        #[cfg(test)]
+        self.fail_if_requested(&self.faults.delete, "injected object delete failure")?;
+        match fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(storage_io_error(error)),
+        }
+    }
+
+    async fn prepare_object_removal(
+        &self,
+        object: &Path,
+        trash: &Path,
+    ) -> Result<(), ProtocolError> {
+        #[cfg(test)]
+        self.fail_if_requested(&self.faults.delete, "injected object delete failure")?;
+        match self.rename_file(object, trash).await {
+            Ok(()) => Ok(()),
+            Err(_error) if !object.exists() => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn restore_moved_objects(&self, moved: &[(PathBuf, PathBuf)]) {
+        for (trash, object) in moved.iter().rev() {
+            if let Err(error) = fs::rename(trash, object).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!("Failed to restore staged file after cleanup rollback: {error}");
+            }
+        }
+    }
+
+    async fn reconcile_objects(&self) -> Result<(), ProtocolError> {
+        let live = self
+            .index
+            .lock()
+            .await
+            .files
+            .iter()
+            .filter(|(_, file)| !file.expired)
+            .map(|(id, _)| id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut entries = fs::read_dir(&self.objects)
+            .await
+            .map_err(storage_io_error)?;
+        while let Some(entry) = entries.next_entry().await.map_err(storage_io_error)? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if live.contains(&name) {
+                continue;
+            }
+            if let Some(id) = cleanup_artifact_id(&name)
+                && live.contains(id)
+                && !self.object_path(id).exists()
+            {
+                if let Err(error) = self.rename_file(&entry.path(), &self.object_path(id)).await {
+                    warn!("Failed to restore staged file cleanup artifact {name}: {error:?}");
+                }
+                continue;
+            }
+            if let Err(error) = self.remove_object(&entry.path()).await {
+                warn!("Failed to remove orphaned staged file object {name}: {error:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_if_requested(
+        &self,
+        counter: &AtomicUsize,
+        message: &'static str,
+    ) -> Result<(), ProtocolError> {
+        let mut remaining = counter.load(Ordering::SeqCst);
+        while remaining > 0 {
+            match counter.compare_exchange(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Err(files_unavailable(message)),
+                Err(actual) => remaining = actual,
+            }
+        }
+        Ok(())
+    }
+}
+
+fn cleanup_artifact_id(name: &str) -> Option<&str> {
+    let artifact = name.strip_prefix(".cleanup-")?;
+    artifact
+        .find("file_clewdr_v1_")
+        .map(|offset| &artifact[offset..])
 }
 
 fn update_identity_field(mac: &mut Hmac<Sha256>, field: &[u8]) {
@@ -851,10 +1052,248 @@ mod tests {
             .add_reference(&first.id, "expired-session")
             .await
             .unwrap();
-        store
-            .remove_orphaned_references(&BTreeSet::new())
+        store.reconcile_references(&BTreeSet::new()).await.unwrap();
+        stage(&store, &principal, "second.txt", b"b").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reference_reconciliation_matches_session_file_mappings() {
+        let temp = tempfile::tempdir().unwrap();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let store = StagedFileStore::persistent_with_limits(temp.path(), 1, 1)
             .await
             .unwrap();
-        stage(&store, &principal, "second.txt", b"b").await.unwrap();
+        let file = stage(&store, &principal, "first.txt", b"a").await.unwrap();
+        store.add_reference(&file.id, "stale").await.unwrap();
+        store
+            .reconcile_references(&BTreeSet::from([("expected".into(), file.id.clone())]))
+            .await
+            .unwrap();
+        let references = store.index.lock().await.files[&file.id].references.clone();
+        assert_eq!(references, BTreeSet::from(["expected".into()]));
+        assert_eq!(
+            code(stage(&store, &principal, "second.txt", b"b").await),
+            "staged_storage_full"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_restores_live_cleanup_artifact_after_crash_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let store = StagedFileStore::persistent(temp.path()).await.unwrap();
+        let file = stage(&store, &principal, "file.txt", b"file")
+            .await
+            .unwrap();
+        let artifact = store
+            .objects
+            .join(format!(".cleanup-{}-{}", uuid::Uuid::new_v4(), file.id));
+        fs::rename(store.object_path(&file.id), &artifact)
+            .await
+            .unwrap();
+        drop(store);
+
+        let store = StagedFileStore::persistent(temp.path()).await.unwrap();
+        assert!(!artifact.exists());
+        store.resolve(&principal, &file.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn orphan_reconciliation_retries_individual_delete_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StagedFileStore::persistent(temp.path()).await.unwrap();
+        let orphan = store.objects.join("orphan");
+        fs::write(&orphan, b"orphan").await.unwrap();
+        store.faults.delete.store(1, Ordering::SeqCst);
+        store.reconcile_objects().await.unwrap();
+        assert!(orphan.exists());
+        store.reconcile_objects().await.unwrap();
+        assert!(!orphan.exists());
+    }
+
+    #[tokio::test]
+    async fn stage_metadata_failure_removes_new_object_and_survives_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let store = StagedFileStore::persistent(temp.path()).await.unwrap();
+        store.faults.persist.store(1, Ordering::SeqCst);
+
+        assert_eq!(
+            code(stage(&store, &principal, "failed.txt", b"failed").await),
+            "staged_files_unavailable"
+        );
+        assert!(store.index.lock().await.files.is_empty());
+        assert_eq!(std::fs::read_dir(&store.objects).unwrap().count(), 0);
+        drop(store);
+
+        let store = StagedFileStore::persistent(temp.path()).await.unwrap();
+        let file = stage(&store, &principal, "failed.txt", b"failed")
+            .await
+            .unwrap();
+        store.resolve(&principal, &file.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn object_rename_failure_leaves_index_and_objects_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let store = StagedFileStore::persistent(temp.path()).await.unwrap();
+        store.faults.rename.store(1, Ordering::SeqCst);
+
+        assert_eq!(
+            code(stage(&store, &principal, "failed.txt", b"failed").await),
+            "staged_files_unavailable"
+        );
+        assert!(store.index.lock().await.files.is_empty());
+        assert_eq!(std::fs::read_dir(&store.objects).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn eviction_metadata_failure_keeps_previous_file_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let store = StagedFileStore::persistent_with_limits(temp.path(), 1, 1)
+            .await
+            .unwrap();
+        let previous = stage(&store, &principal, "previous.txt", b"a")
+            .await
+            .unwrap();
+        store.faults.persist.store(1, Ordering::SeqCst);
+
+        assert_eq!(
+            code(stage(&store, &principal, "incoming.txt", b"b").await),
+            "staged_files_unavailable"
+        );
+        store.resolve(&principal, &previous.id).await.unwrap();
+        assert_eq!(std::fs::read_dir(&store.objects).unwrap().count(), 1);
+        drop(store);
+
+        let store = StagedFileStore::persistent_with_limits(temp.path(), 1, 1)
+            .await
+            .unwrap();
+        store.resolve(&principal, &previous.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_eviction_delete_is_reconciled_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let store = StagedFileStore::persistent_with_limits(temp.path(), 1, 1)
+            .await
+            .unwrap();
+        let previous = stage(&store, &principal, "previous.txt", b"a")
+            .await
+            .unwrap();
+        store.faults.delete.store(1, Ordering::SeqCst);
+        let incoming = stage(&store, &principal, "incoming.txt", b"b")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&store.objects).unwrap().count(), 2);
+        assert_eq!(
+            code(store.resolve(&principal, &previous.id).await),
+            "file_not_found"
+        );
+        drop(store);
+
+        let store = StagedFileStore::persistent_with_limits(temp.path(), 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&store.objects).unwrap().count(), 1);
+        assert_eq!(
+            code(store.resolve(&principal, &previous.id).await),
+            "file_not_found"
+        );
+        store.resolve(&principal, &incoming.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn existing_deterministic_object_is_reused() {
+        let temp = tempfile::tempdir().unwrap();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let store = StagedFileStore::persistent(temp.path()).await.unwrap();
+        let first = stage(&store, &principal, "same.txt", b"same")
+            .await
+            .unwrap();
+        store
+            .update_index(|index| {
+                let file = index.files.remove(&first.id).unwrap();
+                index.total_bytes -= file.size_bytes;
+            })
+            .await
+            .unwrap();
+
+        let second = stage(&store, &principal, "same.txt", b"same")
+            .await
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(std::fs::read_dir(&store.objects).unwrap().count(), 1);
+        store.resolve(&principal, &second.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_failures_leave_file_resolvable_and_not_expired() {
+        let temp = tempfile::tempdir().unwrap();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let store = StagedFileStore::persistent(temp.path()).await.unwrap();
+        let file = stage(&store, &principal, "old.txt", b"old").await.unwrap();
+        store
+            .update_index(|index| {
+                index.files.get_mut(&file.id).unwrap().last_used =
+                    Utc::now().timestamp() - FILE_TTL_SECONDS - 1;
+            })
+            .await
+            .unwrap();
+
+        store.faults.delete.store(1, Ordering::SeqCst);
+        assert_eq!(code(store.cleanup().await), "staged_files_unavailable");
+        assert!(!store.index.lock().await.files[&file.id].expired);
+        assert!(store.object_path(&file.id).exists());
+
+        store
+            .update_index(|index| {
+                index.files.get_mut(&file.id).unwrap().last_used =
+                    Utc::now().timestamp() - FILE_TTL_SECONDS - 1;
+            })
+            .await
+            .unwrap();
+        store.faults.persist.store(1, Ordering::SeqCst);
+        assert_eq!(code(store.cleanup().await), "staged_files_unavailable");
+        assert!(!store.index.lock().await.files[&file.id].expired);
+        assert!(store.object_path(&file.id).exists());
+        store
+            .update_index(|index| {
+                index.files.get_mut(&file.id).unwrap().last_used = Utc::now().timestamp();
+            })
+            .await
+            .unwrap();
+        drop(store);
+
+        let store = StagedFileStore::persistent(temp.path()).await.unwrap();
+        store.resolve(&principal, &file.id).await.unwrap();
+        assert_eq!(
+            code(store.resolve(&principal, "file_clewdr_v1_missing").await),
+            "file_not_found"
+        );
+    }
+
+    #[tokio::test]
+    async fn reference_metadata_failure_rolls_back_live_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let principal = AuthPrincipal::for_authenticated_user();
+        let store = StagedFileStore::persistent(temp.path()).await.unwrap();
+        let file = stage(&store, &principal, "file.txt", b"file")
+            .await
+            .unwrap();
+        store.faults.persist.store(1, Ordering::SeqCst);
+
+        assert_eq!(
+            code(store.add_reference(&file.id, "session").await),
+            "staged_files_unavailable"
+        );
+        assert!(
+            store.index.lock().await.files[&file.id]
+                .references
+                .is_empty()
+        );
     }
 }

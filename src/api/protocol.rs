@@ -131,20 +131,50 @@ pub(crate) async fn api_reset_session(
         })?;
     let key = ExplicitSessionKey::new(principal.as_str(), digest);
     let _operation = state.cache.try_lock_explicit_operation(&key).await?;
-    if !state.cache.reset_explicit(&key).await? {
+    let _files = state.cache.lock_explicit_files().await;
+    let staged_file_ids = state.cache.explicit_staged_file_ids(&key).await;
+    if state.cache.get_explicit(&key).await.is_none() {
         return Err(ProtocolError::new(
             StatusCode::NOT_FOUND,
             "session_not_found",
             "Session does not exist",
         ));
     }
-    if let Some(files) = state.files {
+    if let Some(files) = &state.files {
         files.remove_session_references(&key.session_ref()).await?;
+    }
+    match state.cache.reset_explicit(&key).await {
+        Ok(true) => {}
+        Ok(false) => {
+            restore_file_references(state.files.as_ref(), &key, &staged_file_ids).await?;
+            return Err(ProtocolError::new(
+                StatusCode::NOT_FOUND,
+                "session_not_found",
+                "Session does not exist",
+            ));
+        }
+        Err(error) => {
+            restore_file_references(state.files.as_ref(), &key, &staged_file_ids).await?;
+            return Err(error);
+        }
     }
     Ok(Json(ResetSessionResponse {
         r#type: "session_reset",
         session_id: request.session_id,
     }))
+}
+
+async fn restore_file_references(
+    files: Option<&Arc<StagedFileStore>>,
+    key: &ExplicitSessionKey,
+    staged_file_ids: &[String],
+) -> Result<(), ProtocolError> {
+    if let Some(files) = files {
+        for id in staged_file_ids {
+            files.add_reference(id, &key.session_ref()).await?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -338,6 +368,182 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(cache.get_explicit(&key).await.is_none());
+        files
+            .stage_stream(
+                &principal,
+                "second.txt",
+                "text/plain",
+                stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"b"))]),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_reset_restores_file_references_and_remains_retryable() {
+        let principal = AuthPrincipal::for_authenticated_user();
+        let digest = "ef".repeat(32);
+        let key = ExplicitSessionKey::new(principal.as_str(), &digest);
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache_parent = cache_dir.path().join("cache");
+        let cache_path = cache_parent.join("sessions.json");
+        let cache = ConversationCache::persistent(&cache_path).await;
+        cache
+            .set_explicit_checked(key.clone(), cached_session(ExplicitSessionState::Committed))
+            .await
+            .unwrap();
+        let file_dir = tempfile::tempdir().unwrap();
+        let files = StagedFileStore::persistent_with_limits(file_dir.path(), 1, 1)
+            .await
+            .unwrap();
+        let staged = files
+            .stage_stream(
+                &principal,
+                "first.txt",
+                "text/plain",
+                stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"a"))]),
+            )
+            .await
+            .unwrap();
+        files
+            .add_reference(&staged.id, &key.session_ref())
+            .await
+            .unwrap();
+        cache
+            .put_explicit_file_mapping(&key, &staged.id, "upstream")
+            .await
+            .unwrap();
+        std::fs::remove_file(&cache_path).unwrap();
+        std::fs::remove_dir(&cache_parent).unwrap();
+        std::fs::write(&cache_parent, b"block").unwrap();
+
+        let app = Router::new()
+            .route("/v1/sessions/reset", post(api_reset_session))
+            .layer(Extension(principal.clone()))
+            .with_state(ResetApiState {
+                cache: cache.clone(),
+                files: Some(files.clone()),
+            });
+        let request = || {
+            Request::post("/v1/sessions/reset")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    "{{\"session_id\":\"cherry_topic_v1_{digest}\"}}"
+                )))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(request()).await.unwrap().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(cache.get_explicit(&key).await.is_some());
+        assert_eq!(
+            files
+                .stage_stream(
+                    &principal,
+                    "second.txt",
+                    "text/plain",
+                    stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"b"))]),
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "staged_storage_full"
+        );
+
+        std::fs::remove_file(&cache_parent).unwrap();
+        std::fs::create_dir(&cache_parent).unwrap();
+        assert_eq!(
+            app.oneshot(request()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        files
+            .stage_stream(
+                &principal,
+                "second.txt",
+                "text/plain",
+                stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"b"))]),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_reconciliation_serializes_with_upload_and_reset() {
+        let principal = AuthPrincipal::for_authenticated_user();
+        let key = ExplicitSessionKey::new(principal.as_str(), "coordinated");
+        let cache = ConversationCache::new();
+        cache
+            .set_explicit_checked(key.clone(), cached_session(ExplicitSessionState::Committed))
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let files = StagedFileStore::persistent_with_limits(temp.path(), 1, 1)
+            .await
+            .unwrap();
+        let staged = files
+            .stage_stream(
+                &principal,
+                "first.txt",
+                "text/plain",
+                stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"a"))]),
+            )
+            .await
+            .unwrap();
+
+        let coordination = cache.lock_explicit_files().await;
+        let reconcile_cache = cache.clone();
+        let reconcile_files = files.clone();
+        let reconcile = tokio::spawn(async move {
+            let _files = reconcile_cache.lock_explicit_files().await;
+            reconcile_files
+                .reconcile_references(&reconcile_cache.explicit_file_references().await)
+                .await
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+        files
+            .add_reference(&staged.id, &key.session_ref())
+            .await
+            .unwrap();
+        cache
+            .put_explicit_file_mapping(&key, &staged.id, "upstream")
+            .await
+            .unwrap();
+        drop(coordination);
+        reconcile.await.unwrap();
+        assert_eq!(
+            files
+                .stage_stream(
+                    &principal,
+                    "second.txt",
+                    "text/plain",
+                    stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"b"))]),
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "staged_storage_full"
+        );
+
+        let coordination = cache.lock_explicit_files().await;
+        let reconcile_cache = cache.clone();
+        let reconcile_files = files.clone();
+        let reconcile = tokio::spawn(async move {
+            let _files = reconcile_cache.lock_explicit_files().await;
+            reconcile_files
+                .reconcile_references(&reconcile_cache.explicit_file_references().await)
+                .await
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+        files
+            .remove_session_references(&key.session_ref())
+            .await
+            .unwrap();
+        assert!(cache.reset_explicit(&key).await.unwrap());
+        drop(coordination);
+        reconcile.await.unwrap();
         files
             .stage_stream(
                 &principal,
