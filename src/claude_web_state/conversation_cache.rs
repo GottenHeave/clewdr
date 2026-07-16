@@ -10,6 +10,10 @@ use tracing::warn;
 
 const CACHE_FILE_VERSION: u32 = 1;
 
+fn legacy_stream_health_default() -> bool {
+    true
+}
+
 /// Represents one round-trip (ClewdR request → Claude response) in a cached conversation
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CachedTurn {
@@ -90,6 +94,11 @@ struct PersistedConversation {
     #[serde_as(as = "TimestampSecondsWithFrac")]
     last_used: DateTime<Utc>,
     valid: bool,
+    #[serde(
+        rename = "last_stream_healthy",
+        default = "legacy_stream_health_default"
+    )]
+    _last_stream_healthy: bool,
 }
 
 impl From<&CachedConversation> for PersistedConversation {
@@ -105,6 +114,7 @@ impl From<&CachedConversation> for PersistedConversation {
             created_at: conv.created_at,
             last_used: conv.last_used,
             valid: conv.valid,
+            _last_stream_healthy: true,
         }
     }
 }

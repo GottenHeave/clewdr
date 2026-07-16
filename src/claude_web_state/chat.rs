@@ -731,14 +731,72 @@ impl ClaudeWebState {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::{Router, body::Body, extract::State};
     use serde_json::json;
+    use tokio::sync::Mutex;
     use url::Url;
 
     use super::*;
     use crate::claude_web_state::ConversationCache;
-    use crate::config::CookieStatus;
+    use crate::config::{CLEWDR_CONFIG, ClewdrConfig, CookieStatus};
     use crate::services::cookie_actor::CookieActorHandle;
     use crate::types::claude::{OutputConfig, OutputEffort, Role, Thinking, ThinkingMode};
+
+    #[derive(Clone, Default)]
+    struct MockClaudeWeb {
+        completion_paths: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct ConfigRestore(Arc<ClewdrConfig>);
+
+    impl Drop for ConfigRestore {
+        fn drop(&mut self) {
+            CLEWDR_CONFIG.store(self.0.clone());
+        }
+    }
+
+    async fn mock_claude_web(
+        State(mock): State<MockClaudeWeb>,
+        request: axum::extract::Request,
+    ) -> axum::response::Response {
+        let path = request.uri().path().to_string();
+        let body = match path.as_str() {
+            "/api/bootstrap" => json!({
+                "account": {
+                    "email_address": "test@example.com",
+                    "memberships": [{
+                        "organization": {
+                            "uuid": "org",
+                            "capabilities": ["chat", "pro"]
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+            "/api/organizations" => json!([{
+                "uuid": "org",
+                "capabilities": ["chat", "pro"],
+                "active_flags": []
+            }])
+            .to_string(),
+            _ if path.ends_with("/completion") => {
+                mock.completion_paths.lock().await.push(path);
+                "event: completion\ndata: {\"completion\":\"ok\"}\n\n".to_string()
+            }
+            _ => "{}".to_string(),
+        };
+        let content_type = if request.uri().path().ends_with("/completion") {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, content_type)
+            .body(Body::from(body))
+            .unwrap()
+    }
 
     #[test]
     fn model_selector_state_body_uses_effort_and_mode_shape() {
@@ -816,51 +874,69 @@ mod tests {
 
     #[tokio::test]
     async fn incomplete_downstream_stream_does_not_invalidate_reusable_conversation() {
+        let mock = MockClaudeWeb::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new()
+                    .fallback(mock_claude_web)
+                    .with_state(mock.clone()),
+            )
+            .into_future(),
+        );
+        let _config_restore = ConfigRestore(CLEWDR_CONFIG.load_full());
+        CLEWDR_CONFIG.rcu(|config| {
+            let mut config = ClewdrConfig::clone(config);
+            config.rproxy = Some(endpoint.clone());
+            config.skip_non_pro = false;
+            config.skip_normal_pro = false;
+            config
+        });
+
         let cache = ConversationCache::new();
         let handle = CookieActorHandle::start().await.unwrap();
-        let mut state = ClaudeWebState::new(handle, cache.clone());
-        state.cookie = Some(CookieStatus::default());
-        state.org_uuid = Some("org".to_string());
-        state.endpoint = Url::parse("http://127.0.0.1:9/").unwrap();
+        let cookie_body = format!("{}{}", uuid::Uuid::new_v4().simple(), "A".repeat(54));
+        let cookie =
+            CookieStatus::new(&format!("sk-ant-sid01-{cookie_body}-ABCDEFAA"), None).unwrap();
+        handle.submit(cookie.clone()).await.unwrap();
+        assert_eq!(handle.get_status().await.unwrap().valid.len(), 1);
+        let mut state = ClaudeWebState::new(handle.clone(), cache);
+        state.stream = true;
 
-        let first_message = Message::new_text(Role::User, "first");
-        let params = CreateMessageParams {
+        let params = |messages| CreateMessageParams {
             model: "model".to_string(),
-            messages: vec![
-                first_message.clone(),
-                Message::new_text(Role::User, "second"),
-            ],
-            ..Default::default()
+            messages,
+            stream: Some(true),
+            ..CreateMessageParams::default()
         };
-        let key = state.cache_key_for(&params);
-        // Cache reuse must not depend on whether the downstream response body was consumed.
-        cache
-            .set(
-                key.clone(),
-                CachedConversation {
-                    conv_uuid: "conversation".to_string(),
-                    org_uuid: "org".to_string(),
-                    cookie_id: state.cookie_id(),
-                    model: params.model.clone(),
-                    is_pro: false,
-                    system_hash: hash_system(&params.system),
-                    turns: vec![CachedTurn {
-                        user_hashes: vec![diff::hash_user_message(&first_message)],
-                        assistant_uuid: "assistant".to_string(),
-                    }],
-                    created_at: chrono::Utc::now(),
-                    last_used: chrono::Utc::now(),
-                    valid: true,
-                },
-            )
-            .await;
+        let first = Message::new_text(Role::User, "first");
+        let second = Message::new_text(Role::User, "second");
+        let third = Message::new_text(Role::User, "third");
 
-        let reuse_attempt = state.try_reuse_conversation(&params).await;
+        let first_response = state.try_chat(params(vec![first.clone()])).await.unwrap();
+        axum::body::to_bytes(first_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
 
-        assert!(
-            reuse_attempt.is_some(),
-            "an incomplete downstream stream must not turn a reusable cache entry into a miss"
-        );
-        assert!(cache.get(&key).await.is_some());
+        let dropped_response = state
+            .try_chat(params(vec![first.clone(), second.clone()]))
+            .await
+            .unwrap();
+        drop(dropped_response);
+
+        let third_response = state
+            .try_chat(params(vec![first, second, third]))
+            .await
+            .unwrap();
+        drop(third_response);
+
+        let completion_paths = mock.completion_paths.lock().await;
+        assert_eq!(completion_paths.len(), 3);
+        assert_eq!(completion_paths[0], completion_paths[1]);
+        assert_eq!(completion_paths[1], completion_paths[2]);
+        handle.delete_cookie(cookie).await.unwrap();
+        server.abort();
     }
 }

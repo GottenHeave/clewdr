@@ -531,9 +531,25 @@ async fn test_persistent_cache_skips_expired_and_invalid_entries() {
     );
 }
 
-/// Test: cache files written before stream health removal still load.
+/// Test: cache files remain compatible across stream health removal.
 #[tokio::test]
-async fn test_persistent_cache_ignores_legacy_stream_health() {
+async fn test_persistent_cache_preserves_legacy_stream_health_shape() {
+    #[derive(serde::Deserialize)]
+    struct LegacyCache {
+        conversations: Vec<LegacyEntry>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct LegacyEntry {
+        conversation: LegacyConversation,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct LegacyConversation {
+        conv_uuid: String,
+        last_stream_healthy: bool,
+    }
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("conversation_cache.json");
     let key = CacheKey {
@@ -548,11 +564,29 @@ async fn test_persistent_cache_ignores_legacy_stream_health() {
         )
         .await;
 
-    let mut persisted: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let serialized = std::fs::read_to_string(&path).unwrap();
+    let legacy: LegacyCache = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(
+        legacy.conversations[0].conversation.conv_uuid,
+        "conv_legacy"
+    );
+    assert!(legacy.conversations[0].conversation.last_stream_healthy);
+
+    let mut persisted: serde_json::Value = serde_json::from_str(&serialized).unwrap();
     persisted["conversations"][0]["conversation"]["last_stream_healthy"] = serde_json::json!(false);
     std::fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
 
     let reloaded = ConversationCache::persistent(&path).await;
     assert_eq!(reloaded.get(&key).await.unwrap().conv_uuid, "conv_legacy");
+
+    persisted["conversations"][0]["conversation"]
+        .as_object_mut()
+        .unwrap()
+        .remove("last_stream_healthy");
+    std::fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+    let reloaded_without_field = ConversationCache::persistent(&path).await;
+    assert_eq!(
+        reloaded_without_field.get(&key).await.unwrap().conv_uuid,
+        "conv_legacy"
+    );
 }
