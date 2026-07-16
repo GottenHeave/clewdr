@@ -54,8 +54,6 @@ pub(crate) async fn api_reset_session(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicBool};
-
     use axum::{Extension, Router, body::Body, http::Request, routing::post};
     use tower::ServiceExt;
 
@@ -77,7 +75,6 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_used: chrono::Utc::now(),
             valid: true,
-            last_stream_healthy: Arc::new(AtomicBool::new(true)),
             explicit: Some(ExplicitConversation {
                 state,
                 model_digest: "model".into(),

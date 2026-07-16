@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-
 use clewdr::claude_web_state::conversation_cache::{
     CacheKey, CachedConversation, CachedTurn, ConversationCache, ExplicitSessionKey,
 };
@@ -20,7 +17,6 @@ fn cached_conversation(id: &str) -> CachedConversation {
         created_at: chrono::Utc::now(),
         last_used: chrono::Utc::now(),
         valid: true,
-        last_stream_healthy: Arc::new(AtomicBool::new(true)),
         explicit: None,
     }
 }

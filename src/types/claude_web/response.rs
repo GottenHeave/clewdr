@@ -7,7 +7,6 @@ use bytes::Bytes;
 use eventsource_stream::{EventStream, Eventsource};
 use futures::{Stream, TryStreamExt};
 use serde::Deserialize;
-use std::sync::atomic::Ordering;
 use url::Url;
 use wreq::Proxy;
 
@@ -95,10 +94,7 @@ impl ClaudeWebState {
         &mut self,
         wreq_res: wreq::Response,
     ) -> Result<axum::response::Response, ClewdrError> {
-        // Take the stream health flag so it can be moved into the stream wrapper
-        let stream_health_flag = self.stream_health_flag.take();
         let explicit_lifecycle = self.explicit_lifecycle.take();
-
         if self.stream {
             // Stream through while accumulating completion text; persist usage at end
             let mut input_tokens = self.usage.input_tokens as u64;
@@ -109,7 +105,6 @@ impl ClaudeWebState {
             let endpoint = self.endpoint.clone();
             let proxy = self.proxy.clone();
             let client = self.client.clone();
-            let conv_cache = self.conv_cache.clone();
             // try to get precise input tokens via Claude Code count_tokens if enabled
             if crate::config::CLEWDR_CONFIG.load().enable_web_count_tokens
                 && let Some(tokens) = self.try_code_count_tokens().await
@@ -151,11 +146,6 @@ impl ClaudeWebState {
                         std::io::ErrorKind::UnexpectedEof,
                         "Claude Web stream ended without message_stop",
                     )))?;
-                }
-                // Stream completed successfully — mark as healthy
-                if let Some(flag) = stream_health_flag.as_ref() {
-                    flag.store(true, Ordering::Relaxed);
-                    conv_cache.flush().await;
                 }
                 // on end of stream, compute output tokens and persist totals
                 if !acc.is_empty() {
@@ -243,11 +233,6 @@ impl ClaudeWebState {
                 )
                 .into());
             }
-        }
-
-        // Non-streaming: full response received successfully — mark as healthy
-        if let Some(flag) = stream_health_flag.as_ref() {
-            flag.store(true, Ordering::Relaxed);
         }
 
         print_out_text(text.to_owned(), "claude_web_non_stream.txt");
@@ -370,8 +355,6 @@ async fn count_code_output_tokens_for_text(
 
 #[cfg(test)]
 mod explicit_session_tests {
-    use std::sync::{Arc, atomic::AtomicBool};
-
     use axum::{
         Router, body, body::Body, http::header::CONTENT_TYPE, response::Response, routing::get,
     };
@@ -421,7 +404,6 @@ mod explicit_session_tests {
                     created_at: chrono::Utc::now(),
                     last_used: chrono::Utc::now(),
                     valid: true,
-                    last_stream_healthy: Arc::new(AtomicBool::new(true)),
                     explicit: Some(ExplicitConversation {
                         state: ExplicitSessionState::InFlight,
                         model_digest: "model".into(),

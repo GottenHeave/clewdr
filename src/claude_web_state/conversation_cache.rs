@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use chrono::{DateTime, Duration, Utc};
@@ -52,6 +51,10 @@ fn restore_record(
     }
 }
 
+fn legacy_stream_health_default() -> bool {
+    true
+}
+
 /// Represents one round-trip (ClewdR request → Claude response) in a cached conversation
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CachedTurn {
@@ -87,9 +90,6 @@ pub struct CachedConversation {
     pub last_used: DateTime<Utc>,
     /// Whether cache is currently valid (set to false on stream errors)
     pub valid: bool,
-    /// Shared flag set to true when the SSE stream completes with a stop signal.
-    /// Checked on next reuse; if still false, the previous stream was incomplete.
-    pub last_stream_healthy: Arc<AtomicBool>,
     /// Strict client-managed session state. Legacy cache entries leave this unset.
     pub explicit: Option<ExplicitConversation>,
 }
@@ -165,7 +165,11 @@ struct PersistedConversation {
     #[serde_as(as = "TimestampSecondsWithFrac")]
     last_used: DateTime<Utc>,
     valid: bool,
-    last_stream_healthy: bool,
+    #[serde(
+        rename = "last_stream_healthy",
+        default = "legacy_stream_health_default"
+    )]
+    _last_stream_healthy: bool,
     #[serde(default)]
     explicit: Option<ExplicitConversation>,
 }
@@ -183,7 +187,7 @@ impl From<&CachedConversation> for PersistedConversation {
             created_at: conv.created_at,
             last_used: conv.last_used,
             valid: conv.valid,
-            last_stream_healthy: conv.last_stream_healthy.load(Ordering::Relaxed),
+            _last_stream_healthy: true,
             explicit: conv.explicit.clone(),
         }
     }
@@ -202,7 +206,6 @@ impl From<PersistedConversation> for CachedConversation {
             created_at: conv.created_at,
             last_used: conv.last_used,
             valid: conv.valid,
-            last_stream_healthy: Arc::new(AtomicBool::new(conv.last_stream_healthy)),
             explicit: conv.explicit,
         }
     }
@@ -689,30 +692,6 @@ impl ConversationCache {
         }
     }
 
-    /// Update the stream health flag on an existing cached conversation
-    pub async fn update_stream_health(&self, key: &CacheKey, flag: Arc<AtomicBool>) {
-        let updated = {
-            let mut map = self.inner.lock().await;
-            if let Some(conv) = map.get_mut(&StoredCacheKey::Legacy(key.clone())) {
-                conv.last_stream_healthy = flag;
-                true
-            } else {
-                false
-            }
-        };
-        if updated {
-            self.persist().await;
-        }
-    }
-
-    /// Check if the last stream completed healthily for a given cache key
-    pub async fn is_last_stream_healthy(&self, key: &CacheKey) -> bool {
-        let map = self.inner.lock().await;
-        map.get(&StoredCacheKey::Legacy(key.clone()))
-            .map(|c| c.last_stream_healthy.load(Ordering::Relaxed))
-            .unwrap_or(true)
-    }
-
     pub async fn flush(&self) {
         self.persist().await;
     }
@@ -805,7 +784,6 @@ mod explicit_tests {
             created_at: Utc::now(),
             last_used: Utc::now(),
             valid: true,
-            last_stream_healthy: Arc::new(AtomicBool::new(true)),
             explicit: Some(ExplicitConversation {
                 state,
                 model_digest: "model".into(),
