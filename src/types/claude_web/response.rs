@@ -435,6 +435,7 @@ mod explicit_session_tests {
                             parent_timeline: Vec::new(),
                             request_timeline: vec!["user:user".into()],
                         }),
+                        file_mappings: Default::default(),
                     }),
                 },
             )

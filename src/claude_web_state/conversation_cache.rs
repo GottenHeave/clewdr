@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -140,6 +140,10 @@ impl ExplicitSessionKey {
             session_principal: session_principal.into(),
             session_digest: session_digest.into(),
         }
+    }
+
+    pub fn session_ref(&self) -> String {
+        format!("{}:{}", self.session_principal, self.session_digest)
     }
 }
 
@@ -531,6 +535,49 @@ impl ConversationCache {
             .await
     }
 
+    pub async fn explicit_file_mapping(
+        &self,
+        key: &ExplicitSessionKey,
+        staged_file_id: &str,
+    ) -> Option<String> {
+        self.get_explicit(key)
+            .await
+            .and_then(|conversation| conversation.explicit)
+            .and_then(|explicit| explicit.file_mappings.get(staged_file_id).cloned())
+    }
+
+    pub async fn put_explicit_file_mapping(
+        &self,
+        key: &ExplicitSessionKey,
+        staged_file_id: &str,
+        upstream_file_id: &str,
+    ) -> Result<(), ProtocolError> {
+        self.mutate_explicit(key, |map, stored_key| {
+            let explicit = map
+                .get_mut(stored_key)
+                .and_then(|conversation| conversation.explicit.as_mut())
+                .ok_or_else(|| explicit_missing("Session disappeared while uploading a file"))?;
+            explicit
+                .file_mappings
+                .insert(staged_file_id.to_owned(), upstream_file_id.to_owned());
+            Ok(true)
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub async fn existing_explicit_session_refs(&self) -> BTreeSet<String> {
+        self.inner
+            .lock()
+            .await
+            .keys()
+            .filter_map(|key| match key {
+                StoredCacheKey::ExplicitSession(key) => Some(key.session_ref()),
+                StoredCacheKey::Legacy(_) => None,
+            })
+            .collect()
+    }
+
     async fn mutate_explicit(
         &self,
         key: &ExplicitSessionKey,
@@ -812,6 +859,7 @@ mod explicit_tests {
                 system_digest: "system".into(),
                 turns: Vec::new(),
                 pending: None,
+                file_mappings: Default::default(),
             }),
         }
     }

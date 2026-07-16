@@ -1,9 +1,12 @@
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
@@ -54,6 +57,8 @@ pub struct ExplicitConversation {
     pub system_digest: String,
     pub turns: Vec<ExplicitTurn>,
     pub pending: Option<PendingExplicitTurn>,
+    #[serde(default)]
+    pub file_mappings: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -427,6 +432,7 @@ mod tests {
             system_digest: "system".into(),
             turns: vec![first],
             pending: None,
+            file_mappings: Default::default(),
         };
         let error = plan(
             Some(&explicit),
@@ -452,6 +458,7 @@ mod tests {
             system_digest: "system".into(),
             turns: vec![first],
             pending: None,
+            file_mappings: Default::default(),
         };
         assert_eq!(
             plan(

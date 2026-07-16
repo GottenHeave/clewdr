@@ -196,6 +196,7 @@ impl ClaudeWebState {
     ) -> Result<axum::response::Response, ClewdrError> {
         let principal = self.principal.clone().ok_or(ClewdrError::InvalidAuth)?;
         let key = ExplicitSessionKey::new(principal.as_str(), &session_digest);
+        self.explicit_file_key = Some(key.clone());
         let operation = self.conv_cache.try_lock_explicit_operation(&key).await?;
         let digested = digest_messages(&p.messages)?;
         let user_digests = digested
@@ -500,7 +501,7 @@ impl ClaudeWebState {
 
     #[allow(clippy::too_many_arguments)]
     async fn stage_explicit_write(
-        &self,
+        &mut self,
         key: ExplicitSessionKey,
         write: PendingCacheWrite,
         model_digest: String,
@@ -540,6 +541,7 @@ impl ClaudeWebState {
                 system_digest,
                 turns: Vec::new(),
                 pending: Some(pending),
+                file_mappings: Default::default(),
             });
             self.conv_cache
                 .set_explicit_checked(key, *conversation)
@@ -999,7 +1001,7 @@ impl ClaudeWebState {
 
     /// Build the completion request body for incremental sends
     async fn build_incremental_body(
-        &self,
+        &mut self,
         bundled: &BundledMessages,
         turn: IncrementalTurn<'_>,
         p: &CreateMessageParams,
@@ -1411,6 +1413,96 @@ mod tests {
         requests.lock().unwrap().clone()
     }
 
+    fn file_session() -> CachedConversation {
+        let mut conversation = cached_conversation();
+        conversation.explicit = Some(ExplicitConversation {
+            state: ExplicitSessionState::InFlight,
+            model_digest: "model".into(),
+            system_digest: "system".into(),
+            turns: Vec::new(),
+            pending: None,
+            file_mappings: Default::default(),
+        });
+        conversation
+    }
+
+    fn file_source(id: impl Into<String>) -> Vec<ImageSource> {
+        vec![ImageSource::File { file_id: id.into() }]
+    }
+
+    async fn upload_test_file(
+        state: &mut ClaudeWebState,
+        source: Vec<ImageSource>,
+    ) -> Result<Vec<String>, ClewdrError> {
+        state.upload_files(source, "org", "conversation").await
+    }
+
+    #[tokio::test]
+    async fn staged_upload_mapping_is_reused_only_within_its_session() {
+        let (endpoint, requests) = mock_endpoint().await;
+        let cache = ConversationCache::new();
+        let principal = crate::protocol::AuthPrincipal::for_authenticated_user();
+        let first = ExplicitSessionKey::new(principal.as_str(), "first");
+        let second = ExplicitSessionKey::new(principal.as_str(), "second");
+        for key in [&first, &second] {
+            cache
+                .set_explicit_checked(key.clone(), file_session())
+                .await
+                .unwrap();
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let files = crate::protocol_files::StagedFileStore::persistent(temp.path())
+            .await
+            .unwrap();
+        let staged = files
+            .stage_stream(
+                &principal,
+                "report.txt",
+                "text/plain",
+                futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                    b"report",
+                ))]),
+            )
+            .await
+            .unwrap();
+        let mut state = test_state(endpoint, cache).await;
+        state.principal = Some(principal);
+        state.staged_files = Some(files);
+        let source = file_source(staged.id);
+        state.explicit_file_key = Some(first);
+        assert_eq!(
+            upload_test_file(&mut state, source.clone()).await.unwrap(),
+            vec!["uploaded-file"]
+        );
+        upload_test_file(&mut state, source.clone()).await.unwrap();
+        state.explicit_file_key = Some(second);
+        upload_test_file(&mut state, source).await.unwrap();
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.path.contains("/upload-file"))
+                .count(),
+            2
+        );
+        state.staged_files = None;
+        state.explicit_file_key = Some(ExplicitSessionKey::new("principal", "no-fs"));
+        assert_eq!(
+            upload_test_file(&mut state, file_source("upstream-file"))
+                .await
+                .unwrap(),
+            vec!["upstream-file"]
+        );
+        let error = upload_test_file(&mut state, file_source("file_clewdr_v1_missing"))
+            .await
+            .unwrap_err();
+        let ClewdrError::Protocol { source } = error else {
+            panic!("expected protocol error");
+        };
+        assert_eq!(source.code, "staged_files_unavailable");
+    }
+
     async fn send_and_stage_create(
         state: &mut ClaudeWebState,
         key: &ExplicitSessionKey,
@@ -1806,6 +1898,7 @@ mod tests {
                 ),
             }],
             pending: None,
+            file_mappings: Default::default(),
         });
         cache.set_explicit(key.clone(), conversation).await;
         let mut state = ClaudeWebState::new(handle, cache.clone());
@@ -1862,6 +1955,7 @@ mod tests {
                 system_digest: "system".into(),
                 turns: Vec::new(),
                 pending: None,
+                file_mappings: Default::default(),
             });
             cache.set_explicit(key.clone(), conversation).await;
             let state = ClaudeWebState::new(handle, cache.clone());

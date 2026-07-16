@@ -11,11 +11,12 @@ use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 use crate::{
     api::*,
     claude_web_state::conversation_cache::ConversationCache,
-    config::{CLEWDR_CONFIG, CONVERSATION_CACHE_PATH},
+    config::{CLEWDR_CONFIG, CONVERSATION_CACHE_PATH, STAGED_FILES_PATH},
     middleware::{
         RequireAdminAuth, RequireBearerAuth, RequireFlexibleAuth,
         claude::{add_usage_info, apply_stop_sequences, check_overloaded, to_oai},
     },
+    protocol_files::{DEFAULT_MAX_FILE_BYTES, StagedFileStore},
     providers::claude::ClaudeProviders,
     services::cookie_actor::CookieActorHandle,
 };
@@ -26,6 +27,7 @@ pub struct RouterBuilder {
     cookie_actor_handle: CookieActorHandle,
     inner: Router,
     protocol_cache: ConversationCache,
+    staged_files: Option<std::sync::Arc<StagedFileStore>>,
 }
 
 impl RouterBuilder {
@@ -46,23 +48,49 @@ impl RouterBuilder {
             ConversationCache::persistent(CONVERSATION_CACHE_PATH.as_path()).await
         };
 
-        // Spawn periodic cleanup task (every hour)
-        let cache_clone = conv_cache.clone();
+        let staged_files = if CLEWDR_CONFIG.load().no_fs {
+            None
+        } else {
+            Some(
+                StagedFileStore::persistent(STAGED_FILES_PATH.as_path())
+                    .await
+                    .expect("Failed to initialize staged file storage"),
+            )
+        };
+        if let Some(files) = &staged_files {
+            files
+                .remove_orphaned_references(&conv_cache.existing_explicit_session_refs().await)
+                .await
+                .expect("Failed to remove orphaned staged file references");
+            files.cleanup().await.expect("Failed to clean staged files");
+        }
+
+        let cleanup_cache = conv_cache.clone();
+        let cleanup_files = staged_files.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 interval.tick().await;
-                cache_clone.cleanup().await;
+                cleanup_cache.cleanup().await;
+                if let Some(files) = &cleanup_files {
+                    let session_refs = cleanup_cache.existing_explicit_session_refs().await;
+                    let _ = files.remove_orphaned_references(&session_refs).await;
+                    let _ = files.cleanup().await;
+                }
             }
         });
 
-        let claude_providers =
-            crate::providers::claude::build_providers(cookie_handle.clone(), conv_cache.clone());
+        let claude_providers = crate::providers::claude::build_providers(
+            cookie_handle.clone(),
+            conv_cache.clone(),
+            staged_files.clone(),
+        );
         RouterBuilder {
             claude_providers,
             cookie_actor_handle: cookie_handle,
             inner: Router::new(),
             protocol_cache: conv_cache,
+            staged_files,
         }
     }
 
@@ -81,11 +109,21 @@ impl RouterBuilder {
     }
 
     fn route_protocol_endpoints(mut self) -> Self {
-        let router = Router::new()
+        let reset = Router::new()
             .route("/v1/sessions/reset", post(api_reset_session))
             .layer(from_extractor::<RequireFlexibleAuth>())
-            .with_state(self.protocol_cache.clone());
-        self.inner = self.inner.merge(router);
+            .with_state(ResetApiState {
+                cache: self.protocol_cache.clone(),
+                files: self.staged_files.clone(),
+            });
+        let files = Router::new()
+            .route("/v1/files", post(api_stage_file))
+            .layer(DefaultBodyLimit::max(
+                DEFAULT_MAX_FILE_BYTES as usize + 1024 * 1024,
+            ))
+            .layer(from_extractor::<RequireFlexibleAuth>())
+            .with_state(self.staged_files.clone());
+        self.inner = self.inner.merge(reset).merge(files);
         self
     }
 

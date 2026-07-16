@@ -18,6 +18,7 @@ use crate::{
     config::{CLAUDE_ENDPOINT, CLEWDR_CONFIG, CookieStatus, Reason},
     error::{ClewdrError, WreqSnafu},
     middleware::claude::ClaudeApiFormat,
+    protocol_files::StagedFileStore,
     services::cookie_actor::CookieActorHandle,
     types::claude::{CreateMessageParams, Usage},
     utils::build_http_client,
@@ -82,6 +83,8 @@ pub struct ClaudeWebState {
     pub stream_health_flag: Option<Arc<AtomicBool>>,
     pub principal: Option<AuthPrincipal>,
     pub explicit_lifecycle: Option<ExplicitLifecycle>,
+    pub staged_files: Option<Arc<StagedFileStore>>,
+    pub explicit_file_key: Option<conversation_cache::ExplicitSessionKey>,
 }
 
 impl ClaudeWebState {
@@ -107,6 +110,8 @@ impl ClaudeWebState {
             stream_health_flag: None,
             principal: None,
             explicit_lifecycle: None,
+            staged_files: None,
+            explicit_file_key: None,
         }
     }
 
