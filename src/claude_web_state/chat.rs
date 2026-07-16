@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-
 use colored::Colorize;
 use futures::TryFutureExt;
 use serde_json::json;
@@ -101,15 +98,6 @@ impl ClaudeWebState {
             let mut state = self.to_owned();
             let p = p.to_owned();
 
-            // Create shared stream health flag for monitoring SSE completion
-            let can_reuse =
-                CLEWDR_CONFIG.load().reuse_conversation && !CLEWDR_CONFIG.load().preserve_chats;
-            if can_reuse {
-                let flag = Arc::new(AtomicBool::new(false));
-                state.stream_health_flag = Some(flag.clone());
-                self.stream_health_flag = Some(flag);
-            }
-
             let cookie = state.request_cookie().await?;
             // check if request is successful
             let web_res = async {
@@ -196,13 +184,6 @@ impl ClaudeWebState {
     ) -> Option<Result<Response, ClewdrError>> {
         let key = self.cache_key_for(p);
         let cached = self.conv_cache.get(&key).await?;
-
-        // Check stream health from previous request
-        if !self.conv_cache.is_last_stream_healthy(&key).await {
-            info!("[CACHE] last stream was unhealthy, invalidating");
-            self.conv_cache.invalidate(&key).await;
-            return None;
-        }
 
         // Validate: cookie must match
         if cached.cookie_id != self.cookie_id() {
@@ -354,11 +335,6 @@ impl ClaudeWebState {
                 .map(|(_, h)| *h)
                 .collect();
             let sys_hash = hash_system(&p.system);
-            let stream_flag = self
-                .stream_health_flag
-                .clone()
-                .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
-
             self.pending_cache_write = Some(PendingCacheWrite::Init {
                 key: self.cache_key_for(&p),
                 conv: CachedConversation {
@@ -375,7 +351,6 @@ impl ClaudeWebState {
                     created_at: chrono::Utc::now(),
                     last_used: chrono::Utc::now(),
                     valid: true,
-                    last_stream_healthy: stream_flag,
                 },
             });
         }
@@ -736,12 +711,6 @@ impl ClaudeWebState {
             PendingCacheWrite::AppendTurn { key, turn } => {
                 info!("[CACHE] appended turn (assistant={})", turn.assistant_uuid);
                 self.conv_cache.append_turn(&key, turn).await;
-                // Update stream health flag for the new request
-                if let Some(flag) = self.stream_health_flag.as_ref() {
-                    self.conv_cache
-                        .update_stream_health(&key, flag.clone())
-                        .await;
-                }
             }
             PendingCacheWrite::ForkAndAppend {
                 key,
@@ -755,12 +724,6 @@ impl ClaudeWebState {
                 self.conv_cache
                     .fork_and_append(&key, fork_turn_index, turn)
                     .await;
-                // Update stream health flag for the new request
-                if let Some(flag) = self.stream_health_flag.as_ref() {
-                    self.conv_cache
-                        .update_stream_health(&key, flag.clone())
-                        .await;
-                }
             }
         }
     }
@@ -768,10 +731,72 @@ impl ClaudeWebState {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::{Router, body::Body, extract::State};
     use serde_json::json;
+    use tokio::sync::Mutex;
+    use url::Url;
 
     use super::*;
+    use crate::claude_web_state::ConversationCache;
+    use crate::config::{CLEWDR_CONFIG, ClewdrConfig, CookieStatus};
+    use crate::services::cookie_actor::CookieActorHandle;
     use crate::types::claude::{OutputConfig, OutputEffort, Role, Thinking, ThinkingMode};
+
+    #[derive(Clone, Default)]
+    struct MockClaudeWeb {
+        completion_paths: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct ConfigRestore(Arc<ClewdrConfig>);
+
+    impl Drop for ConfigRestore {
+        fn drop(&mut self) {
+            CLEWDR_CONFIG.store(self.0.clone());
+        }
+    }
+
+    async fn mock_claude_web(
+        State(mock): State<MockClaudeWeb>,
+        request: axum::extract::Request,
+    ) -> axum::response::Response {
+        let path = request.uri().path().to_string();
+        let body = match path.as_str() {
+            "/api/bootstrap" => json!({
+                "account": {
+                    "email_address": "test@example.com",
+                    "memberships": [{
+                        "organization": {
+                            "uuid": "org",
+                            "capabilities": ["chat", "pro"]
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+            "/api/organizations" => json!([{
+                "uuid": "org",
+                "capabilities": ["chat", "pro"],
+                "active_flags": []
+            }])
+            .to_string(),
+            _ if path.ends_with("/completion") => {
+                mock.completion_paths.lock().await.push(path);
+                "event: completion\ndata: {\"completion\":\"ok\"}\n\n".to_string()
+            }
+            _ => "{}".to_string(),
+        };
+        let content_type = if request.uri().path().ends_with("/completion") {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, content_type)
+            .body(Body::from(body))
+            .unwrap()
+    }
 
     #[test]
     fn model_selector_state_body_uses_effort_and_mode_shape() {
@@ -845,5 +870,73 @@ mod tests {
                 "enabled_imagine": true
             })
         );
+    }
+
+    #[tokio::test]
+    async fn incomplete_downstream_stream_does_not_invalidate_reusable_conversation() {
+        let mock = MockClaudeWeb::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new()
+                    .fallback(mock_claude_web)
+                    .with_state(mock.clone()),
+            )
+            .into_future(),
+        );
+        let _config_restore = ConfigRestore(CLEWDR_CONFIG.load_full());
+        CLEWDR_CONFIG.rcu(|config| {
+            let mut config = ClewdrConfig::clone(config);
+            config.rproxy = Some(endpoint.clone());
+            config.skip_non_pro = false;
+            config.skip_normal_pro = false;
+            config
+        });
+
+        let cache = ConversationCache::new();
+        let handle = CookieActorHandle::start().await.unwrap();
+        let cookie_body = format!("{}{}", uuid::Uuid::new_v4().simple(), "A".repeat(54));
+        let cookie =
+            CookieStatus::new(&format!("sk-ant-sid01-{cookie_body}-ABCDEFAA"), None).unwrap();
+        handle.submit(cookie.clone()).await.unwrap();
+        assert_eq!(handle.get_status().await.unwrap().valid.len(), 1);
+        let mut state = ClaudeWebState::new(handle.clone(), cache);
+        state.stream = true;
+
+        let params = |messages| CreateMessageParams {
+            model: "model".to_string(),
+            messages,
+            stream: Some(true),
+            ..CreateMessageParams::default()
+        };
+        let first = Message::new_text(Role::User, "first");
+        let second = Message::new_text(Role::User, "second");
+        let third = Message::new_text(Role::User, "third");
+
+        let first_response = state.try_chat(params(vec![first.clone()])).await.unwrap();
+        axum::body::to_bytes(first_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let dropped_response = state
+            .try_chat(params(vec![first.clone(), second.clone()]))
+            .await
+            .unwrap();
+        drop(dropped_response);
+
+        let third_response = state
+            .try_chat(params(vec![first, second, third]))
+            .await
+            .unwrap();
+        drop(third_response);
+
+        let completion_paths = mock.completion_paths.lock().await;
+        assert_eq!(completion_paths.len(), 3);
+        assert_eq!(completion_paths[0], completion_paths[1]);
+        assert_eq!(completion_paths[1], completion_paths[2]);
+        handle.delete_cookie(cookie).await.unwrap();
+        server.abort();
     }
 }
