@@ -31,6 +31,19 @@ pub struct RouterBuilder {
     staged_files: Option<std::sync::Arc<StagedFileStore>>,
 }
 
+async fn maintain_staged_files(cache: &ConversationCache, files: &StagedFileStore) {
+    let _guard = cache.lock_explicit_files().await;
+    if let Err(error) = files
+        .reconcile_references(&cache.explicit_file_references().await)
+        .await
+    {
+        warn!("Failed to reconcile staged file references: {error}");
+    }
+    if let Err(error) = files.cleanup().await {
+        warn!("Failed to clean staged files: {error}");
+    }
+}
+
 impl RouterBuilder {
     /// Creates a blank RouterBuilder instance
     /// Initializes the router with the provided application state
@@ -59,16 +72,7 @@ impl RouterBuilder {
             )
         };
         if let Some(files) = &staged_files {
-            let _files = conv_cache.lock_explicit_files().await;
-            if let Err(error) = files
-                .reconcile_references(&conv_cache.explicit_file_references().await)
-                .await
-            {
-                warn!("Failed to reconcile staged file references: {error}");
-            }
-            if let Err(error) = files.cleanup().await {
-                warn!("Failed to clean staged files: {error}");
-            }
+            maintain_staged_files(&conv_cache, files).await;
         }
 
         let cleanup_cache = conv_cache.clone();
@@ -79,14 +83,7 @@ impl RouterBuilder {
                 interval.tick().await;
                 cleanup_cache.cleanup().await;
                 if let Some(files) = &cleanup_files {
-                    let _files = cleanup_cache.lock_explicit_files().await;
-                    let references = cleanup_cache.explicit_file_references().await;
-                    if let Err(error) = files.reconcile_references(&references).await {
-                        warn!("Failed to reconcile staged file references: {error}");
-                    }
-                    if let Err(error) = files.cleanup().await {
-                        warn!("Failed to clean staged files: {error}");
-                    }
+                    maintain_staged_files(&cleanup_cache, files).await;
                 }
             }
         });

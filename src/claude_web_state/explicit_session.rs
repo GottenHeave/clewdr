@@ -1,12 +1,10 @@
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
@@ -418,86 +416,49 @@ mod tests {
     }
 
     #[test]
-    fn full_timeline_rejects_changed_assistant_content() {
-        let mut first = turn(None, &["u1"], "a1");
-        first.request_timeline = vec!["user:u1".into()];
+    fn timeline_model_system_and_prefill_mismatches_are_rejected() {
         let explicit = ExplicitConversation {
             state: ExplicitSessionState::Committed,
             model_digest: "model".into(),
             system_digest: "system".into(),
-            turns: vec![first],
+            turns: vec![turn(None, &["u1"], "a1")],
             pending: None,
             file_mappings: Default::default(),
         };
-        let error = plan(
-            Some(&explicit),
-            &["u1".into(), "u2".into()],
-            &[
-                "user:u1".into(),
-                "assistant:changed".into(),
-                "user:u2".into(),
-            ],
+        let reject = |users: &[&str], timeline: &[&str], model, system| {
+            assert_eq!(
+                plan(
+                    Some(&explicit),
+                    &users
+                        .iter()
+                        .map(|value| (*value).into())
+                        .collect::<Vec<_>>(),
+                    &timeline
+                        .iter()
+                        .map(|value| (*value).into())
+                        .collect::<Vec<_>>(),
+                    model,
+                    system,
+                )
+                .unwrap_err()
+                .code,
+                "conversation_reuse_failed"
+            );
+        };
+        let valid = ["user:u1", "assistant:answer-a1", "user:u2"];
+        reject(
+            &["u1", "u2"],
+            &["user:u1", "assistant:changed", "user:u2"],
             "model",
             "system",
-        )
-        .unwrap_err();
-        assert_eq!(error.code, "conversation_reuse_failed");
-    }
-
-    #[test]
-    fn model_system_and_assistant_prefill_mismatches_are_rejected() {
-        let first = turn(None, &["u1"], "a1");
-        let explicit = ExplicitConversation {
-            state: ExplicitSessionState::Committed,
-            model_digest: "model".into(),
-            system_digest: "system".into(),
-            turns: vec![first],
-            pending: None,
-            file_mappings: Default::default(),
-        };
-        assert_eq!(
-            plan(
-                Some(&explicit),
-                &["u1".into(), "u2".into()],
-                &[
-                    "user:u1".into(),
-                    "assistant:answer-a1".into(),
-                    "user:u2".into()
-                ],
-                "changed-model",
-                "system",
-            )
-            .unwrap_err()
-            .code,
-            "conversation_reuse_failed"
         );
-        assert_eq!(
-            plan(
-                Some(&explicit),
-                &["u1".into(), "u2".into()],
-                &[
-                    "user:u1".into(),
-                    "assistant:answer-a1".into(),
-                    "user:u2".into()
-                ],
-                "model",
-                "changed-system",
-            )
-            .unwrap_err()
-            .code,
-            "conversation_reuse_failed"
-        );
-        assert_eq!(
-            plan(
-                Some(&explicit),
-                &["u1".into()],
-                &["user:u1".into(), "assistant:prefill".into()],
-                "model",
-                "system",
-            )
-            .unwrap_err()
-            .code,
-            "conversation_reuse_failed"
+        reject(&["u1", "u2"], &valid, "changed-model", "system");
+        reject(&["u1", "u2"], &valid, "model", "changed-system");
+        reject(
+            &["u1"],
+            &["user:u1", "assistant:prefill"],
+            "model",
+            "system",
         );
     }
 

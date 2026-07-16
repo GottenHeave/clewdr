@@ -183,8 +183,6 @@ mod tests {
     use crate::claude_web_state::conversation_cache::{CachedConversation, CachedTurn};
     use crate::types::claude::Message;
     use chrono::Utc;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     fn make_cached(
         conv_uuid: &str,
@@ -202,7 +200,6 @@ mod tests {
             created_at: Utc::now(),
             last_used: Utc::now(),
             valid: true,
-            last_stream_healthy: Arc::new(AtomicBool::new(true)),
             explicit: None,
         }
     }

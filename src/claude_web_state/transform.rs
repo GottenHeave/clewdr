@@ -166,21 +166,14 @@ impl ClaudeWebState {
                 message: "Invalid staged file media type".to_string(),
                 source: Some(Box::new(error)),
             })?;
-        let result = self
+        let upstream_file_id = self
             .upload_file_part(
                 endpoint,
                 part,
                 "Failed to upload staged file",
                 "Failed to parse staged file upload response",
             )
-            .await;
-        let upstream_file_id = match result {
-            Ok(file_id) => file_id,
-            Err(error) => {
-                drop(resolved);
-                return Err(error);
-            }
-        };
+            .await?;
         let _files = self.conv_cache.lock_explicit_files().await;
         let reference_added = store
             .add_reference(staged_file_id, &key.session_ref())
@@ -197,7 +190,6 @@ impl ClaudeWebState {
             }
             return Err(error.into());
         }
-        drop(resolved);
         Ok(upstream_file_id)
     }
 

@@ -7,7 +7,6 @@ use bytes::Bytes;
 use eventsource_stream::{EventStream, Eventsource};
 use futures::{Stream, TryStreamExt};
 use serde::Deserialize;
-use std::sync::atomic::Ordering;
 use url::Url;
 use wreq::Proxy;
 
@@ -23,14 +22,6 @@ use crate::{
     utils::print_out_text,
 };
 
-/// Merges server-sent events (SSE) from a stream into a single string
-/// Extracts and concatenates completion data from events
-///
-/// # Arguments
-/// * `stream` - Event stream to process
-///
-/// # Returns
-/// Combined completion text from all events
 pub async fn merge_sse(
     stream: EventStream<impl Stream<Item = Result<Bytes, wreq::Error>>>,
 ) -> Result<(String, bool), ClewdrError> {
@@ -67,40 +58,18 @@ impl<S> From<S> for Message
 where
     S: Into<String>,
 {
-    /// Converts a string into a Message with assistant role
-    ///
-    /// # Arguments
-    /// * `str` - The text content for the message
-    ///
-    /// # Returns
-    /// * `Message` - A message with assistant role and text content
     fn from(str: S) -> Self {
         Message::new_blocks(Role::Assistant, vec![ContentBlock::text(str.into())])
     }
 }
 
 impl ClaudeWebState {
-    /// Converts the response from the Claude Web into Claude API or OpenAI API format
-    ///
-    /// This method transforms streams of bytes from Claude's web response into the appropriate
-    /// format based on the client's requested API format (Claude or OpenAI). It handles both
-    /// streaming and non-streaming responses, and manages caching for responses.
-    ///
-    /// # Arguments
-    /// * `input` - The response stream from the Claude Web API
-    ///
-    /// # Returns
-    /// * `axum::response::Response` - Transformed response in the requested format
     pub async fn transform_response(
         &mut self,
         wreq_res: wreq::Response,
     ) -> Result<axum::response::Response, ClewdrError> {
-        // Take the stream health flag so it can be moved into the stream wrapper
-        let stream_health_flag = self.stream_health_flag.take();
         let explicit_lifecycle = self.explicit_lifecycle.take();
-
         if self.stream {
-            // Stream through while accumulating completion text; persist usage at end
             let mut input_tokens = self.usage.input_tokens as u64;
             let handle = self.cookie_actor_handle.clone();
             let cookie = self.cookie.clone();
@@ -109,8 +78,6 @@ impl ClaudeWebState {
             let endpoint = self.endpoint.clone();
             let proxy = self.proxy.clone();
             let client = self.client.clone();
-            let conv_cache = self.conv_cache.clone();
-            // try to get precise input tokens via Claude Code count_tokens if enabled
             if crate::config::CLEWDR_CONFIG.load().enable_web_count_tokens
                 && let Some(tokens) = self.try_code_count_tokens().await
             {
@@ -152,14 +119,7 @@ impl ClaudeWebState {
                         "Claude Web stream ended without message_stop",
                     )))?;
                 }
-                // Stream completed successfully — mark as healthy
-                if let Some(flag) = stream_health_flag.as_ref() {
-                    flag.store(true, Ordering::Relaxed);
-                    conv_cache.flush().await;
-                }
-                // on end of stream, compute output tokens and persist totals
                 if !acc.is_empty() {
-                    // Prefer official count_tokens if enabled and possible; else estimate locally
                     let mut out = None;
                     if enable_precise
                         && let Some(model) = last_params.as_ref().map(|p| p.model.clone())
@@ -193,7 +153,6 @@ impl ClaudeWebState {
                         let _ = handle.return_cookie(c, None).await;
                     }
                 } else if let Some(mut c) = cookie.clone() {
-                    // still persist input tokens to maintain parity
                     let family = last_params
                         .as_ref()
                         .map(|p| p.model.as_str())
@@ -212,7 +171,6 @@ impl ClaudeWebState {
                     let _ = handle.return_cookie(c, None).await;
                 }
             };
-            // normalize error type for axum SSE
             let stream = stream.map_err(|e: axum::Error| -> BoxError { e.into() });
             return Ok(Sse::new(stream)
                 .keep_alive(Default::default())
@@ -245,16 +203,10 @@ impl ClaudeWebState {
             }
         }
 
-        // Non-streaming: full response received successfully — mark as healthy
-        if let Some(flag) = stream_health_flag.as_ref() {
-            flag.store(true, Ordering::Relaxed);
-        }
-
         print_out_text(text.to_owned(), "claude_web_non_stream.txt");
         let mut response =
             CreateMessageResponse::text(text.clone(), Default::default(), self.usage.to_owned());
 
-        // Prefer official counting if enabled
         let enable_precise = crate::config::CLEWDR_CONFIG.load().enable_web_count_tokens;
         let mut usage = self.usage.to_owned();
         if enable_precise && let Some(inp) = self.try_code_count_tokens().await {
@@ -313,24 +265,20 @@ impl ClaudeWebState {
         code.endpoint = self.endpoint.clone();
         code.proxy = self.proxy.clone();
         code.client = self.client.clone();
-        // populate cookie header for Claude code API requests
         if let Some(ref c) = self.cookie
             && let Ok(val) = http::HeaderValue::from_str(&c.cookie.to_string())
         {
             code.set_cookie_header_value(val);
         }
 
-        // OAuth exchange to get access token
         let org = code.get_organization().await.ok()?;
         let exch = code.exchange_code(&org).await.ok()?;
         code.exchange_token(exch).await.ok()?;
         let access = code.cookie.as_ref()?.token.as_ref()?.access_token.clone();
 
-        // prepare body
         let mut body = params.clone();
         body.stream = Some(false);
 
-        // do count_tokens
         bearer_count_tokens(&code, &access, &body).await
     }
 }
@@ -370,8 +318,6 @@ async fn count_code_output_tokens_for_text(
 
 #[cfg(test)]
 mod explicit_session_tests {
-    use std::sync::{Arc, atomic::AtomicBool};
-
     use axum::{
         Router, body, body::Body, http::header::CONTENT_TYPE, response::Response, routing::get,
     };
@@ -421,7 +367,6 @@ mod explicit_session_tests {
                     created_at: chrono::Utc::now(),
                     last_used: chrono::Utc::now(),
                     valid: true,
-                    last_stream_healthy: Arc::new(AtomicBool::new(true)),
                     explicit: Some(ExplicitConversation {
                         state: ExplicitSessionState::InFlight,
                         model_digest: "model".into(),
@@ -472,36 +417,26 @@ mod explicit_session_tests {
     }
 
     #[tokio::test]
-    async fn message_stop_commits_after_body_consumption() {
-        let (cache, key, lifecycle) = setup_lifecycle().await;
-        let response = transform(lifecycle, "healthy").await;
-        body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let explicit = cache.get_explicit(&key).await.unwrap().explicit.unwrap();
-        assert_eq!(explicit.state, ExplicitSessionState::Committed);
-        assert_eq!(explicit.turns[0].assistant_uuid_after, "assistant");
-    }
-
-    #[tokio::test]
-    async fn eof_without_message_stop_marks_uncertain() {
-        let (cache, key, lifecycle) = setup_lifecycle().await;
-        let response = transform(lifecycle, "incomplete").await;
-        assert!(
-            body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .is_err()
-        );
-        let explicit = cache.get_explicit(&key).await.unwrap().explicit.unwrap();
-        assert_eq!(explicit.state, ExplicitSessionState::Uncertain);
-    }
-
-    #[tokio::test]
-    async fn unpolled_body_marks_uncertain() {
-        let (cache, key, lifecycle) = setup_lifecycle().await;
-        drop(transform(lifecycle, "healthy").await);
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let explicit = cache.get_explicit(&key).await.unwrap().explicit.unwrap();
-        assert_eq!(explicit.state, ExplicitSessionState::Uncertain);
+    async fn response_consumption_controls_explicit_lifecycle() {
+        for (path, consume, expected) in [
+            ("healthy", true, ExplicitSessionState::Committed),
+            ("incomplete", true, ExplicitSessionState::Uncertain),
+            ("healthy", false, ExplicitSessionState::Uncertain),
+        ] {
+            let (cache, key, lifecycle) = setup_lifecycle().await;
+            let response = transform(lifecycle, path).await;
+            if consume {
+                let result = body::to_bytes(response.into_body(), usize::MAX).await;
+                assert_eq!(result.is_ok(), path == "healthy");
+            } else {
+                drop(response);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let explicit = cache.get_explicit(&key).await.unwrap().explicit.unwrap();
+            assert_eq!(explicit.state, expected);
+            if expected == ExplicitSessionState::Committed {
+                assert_eq!(explicit.turns[0].assistant_uuid_after, "assistant");
+            }
+        }
     }
 }

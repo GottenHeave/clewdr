@@ -1,8 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use chrono::{DateTime, Duration, Utc};
@@ -52,50 +51,33 @@ fn restore_record(
     }
 }
 
-/// Represents one round-trip (ClewdR request → Claude response) in a cached conversation
+fn legacy_stream_health_default() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CachedTurn {
-    /// Hash of each Role::User message's text content sent in this turn.
-    /// Turn 0 (full paste) may contain multiple user hashes.
-    /// Subsequent turns typically contain 1+ user hashes (bundled).
     pub user_hashes: Vec<u64>,
-    /// The assistant_message_uuid from turn_message_uuids.
-    /// Used as `parent_message_uuid` for the next turn.
     pub assistant_uuid: String,
 }
 
-/// A cached conversation that can be reused across requests
 #[derive(Clone, Debug)]
 pub struct CachedConversation {
-    /// Claude.ai conversation UUID
     pub conv_uuid: String,
-    /// Organization UUID (must match)
     pub org_uuid: String,
-    /// Cookie identifier string (must match — different cookie = different account)
     pub cookie_id: String,
-    /// Model used (must match)
     pub model: String,
-    /// Whether the account was pro when conversation was created
     pub is_pro: bool,
-    /// Hash of the system prompt (system change → full rebuild)
     pub system_hash: u64,
-    /// Ordered list of completed turns
     pub turns: Vec<CachedTurn>,
-    /// When this conversation was first created
     pub created_at: DateTime<Utc>,
-    /// Last time this conversation was successfully used
     pub last_used: DateTime<Utc>,
-    /// Whether cache is currently valid (set to false on stream errors)
     pub valid: bool,
-    /// Shared flag set to true when the SSE stream completes with a stop signal.
-    /// Checked on next reuse; if still false, the previous stream was incomplete.
-    pub last_stream_healthy: Arc<AtomicBool>,
     /// Strict client-managed session state. Legacy cache entries leave this unset.
     pub explicit: Option<ExplicitConversation>,
 }
 
 impl CachedConversation {
-    /// Check if this cached conversation has expired (conservative 25-day TTL)
     pub fn is_expired(&self) -> bool {
         Utc::now() - self.created_at > Duration::days(25)
     }
@@ -110,18 +92,15 @@ impl CachedConversation {
         }
     }
 
-    /// Get the last assistant UUID (parent for next turn)
     pub fn last_parent_uuid(&self) -> Option<&str> {
         self.turns.last().map(|t| t.assistant_uuid.as_str())
     }
 
-    /// Truncate turns from `from_index` onward (for fork scenarios)
     pub fn truncate_turns(&mut self, from_index: usize) {
         self.turns.truncate(from_index);
     }
 }
 
-/// Cache key for an implicit request family.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheKey {
     pub key_index: usize,
@@ -169,7 +148,11 @@ struct PersistedConversation {
     #[serde_as(as = "TimestampSecondsWithFrac")]
     last_used: DateTime<Utc>,
     valid: bool,
-    last_stream_healthy: bool,
+    #[serde(
+        rename = "last_stream_healthy",
+        default = "legacy_stream_health_default"
+    )]
+    _last_stream_healthy: bool,
     #[serde(default)]
     explicit: Option<ExplicitConversation>,
 }
@@ -187,7 +170,7 @@ impl From<&CachedConversation> for PersistedConversation {
             created_at: conv.created_at,
             last_used: conv.last_used,
             valid: conv.valid,
-            last_stream_healthy: conv.last_stream_healthy.load(Ordering::Relaxed),
+            _last_stream_healthy: true,
             explicit: conv.explicit.clone(),
         }
     }
@@ -206,7 +189,6 @@ impl From<PersistedConversation> for CachedConversation {
             created_at: conv.created_at,
             last_used: conv.last_used,
             valid: conv.valid,
-            last_stream_healthy: Arc::new(AtomicBool::new(conv.last_stream_healthy)),
             explicit: conv.explicit,
         }
     }
@@ -274,7 +256,6 @@ fn enforce_explicit_capacity(
     Ok(())
 }
 
-/// Thread-safe conversation cache
 #[derive(Clone)]
 pub struct ConversationCache {
     inner: Arc<Mutex<HashMap<StoredCacheKey, CachedConversation>>>,
@@ -649,7 +630,6 @@ impl ConversationCache {
         Ok(true)
     }
 
-    /// Append a new turn to an existing cached conversation
     pub async fn append_turn(&self, key: &CacheKey, turn: CachedTurn) {
         self.append_stored_turn(&StoredCacheKey::Legacy(key.clone()), turn)
             .await;
@@ -676,7 +656,6 @@ impl ConversationCache {
         }
     }
 
-    /// Truncate turns and append a new one (fork scenario)
     pub async fn fork_and_append(&self, key: &CacheKey, from_index: usize, turn: CachedTurn) {
         self.fork_and_append_stored(&StoredCacheKey::Legacy(key.clone()), from_index, turn)
             .await;
@@ -718,7 +697,6 @@ impl ConversationCache {
         }
     }
 
-    /// Mark a cached conversation as invalid
     pub async fn invalidate(&self, key: &CacheKey) {
         self.invalidate_stored(&StoredCacheKey::Legacy(key.clone()))
             .await;
@@ -744,7 +722,6 @@ impl ConversationCache {
         }
     }
 
-    /// Remove expired entries (call periodically)
     pub async fn cleanup(&self) {
         let _explicit_mutation = self.explicit_mutation_lock.lock().await;
         let removed = {
@@ -774,30 +751,6 @@ impl ConversationCache {
         if updated {
             self.persist().await;
         }
-    }
-
-    /// Update the stream health flag on an existing cached conversation
-    pub async fn update_stream_health(&self, key: &CacheKey, flag: Arc<AtomicBool>) {
-        let updated = {
-            let mut map = self.inner.lock().await;
-            if let Some(conv) = map.get_mut(&StoredCacheKey::Legacy(key.clone())) {
-                conv.last_stream_healthy = flag;
-                true
-            } else {
-                false
-            }
-        };
-        if updated {
-            self.persist().await;
-        }
-    }
-
-    /// Check if the last stream completed healthily for a given cache key
-    pub async fn is_last_stream_healthy(&self, key: &CacheKey) -> bool {
-        let map = self.inner.lock().await;
-        map.get(&StoredCacheKey::Legacy(key.clone()))
-            .map(|c| c.last_stream_healthy.load(Ordering::Relaxed))
-            .unwrap_or(true)
     }
 
     pub async fn flush(&self) {
@@ -892,7 +845,6 @@ mod explicit_tests {
             created_at: Utc::now(),
             last_used: Utc::now(),
             valid: true,
-            last_stream_healthy: Arc::new(AtomicBool::new(true)),
             explicit: Some(ExplicitConversation {
                 state,
                 model_digest: "model".into(),
@@ -930,37 +882,27 @@ mod explicit_tests {
 
     #[tokio::test]
     async fn enforces_live_and_record_capacity_per_principal() {
-        let cache = ConversationCache::new();
-        fill_sessions(
-            &cache,
-            MAX_LIVE_SESSIONS_PER_PRINCIPAL,
-            ExplicitSessionState::Committed,
-        )
-        .await;
-        let error = cache
-            .set_explicit_checked(
-                ExplicitSessionKey::new("principal", "overflow"),
-                conversation(ExplicitSessionState::InFlight),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "session_capacity_exceeded");
-
-        let cache = ConversationCache::new();
-        fill_sessions(
-            &cache,
-            MAX_SESSION_RECORDS_PER_PRINCIPAL,
-            ExplicitSessionState::Tombstoned,
-        )
-        .await;
-        let error = cache
-            .set_explicit_checked(
-                ExplicitSessionKey::new("principal", "overflow"),
-                conversation(ExplicitSessionState::InFlight),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "session_capacity_exceeded");
+        for (count, state) in [
+            (
+                MAX_LIVE_SESSIONS_PER_PRINCIPAL,
+                ExplicitSessionState::Committed,
+            ),
+            (
+                MAX_SESSION_RECORDS_PER_PRINCIPAL,
+                ExplicitSessionState::Tombstoned,
+            ),
+        ] {
+            let cache = ConversationCache::new();
+            fill_sessions(&cache, count, state).await;
+            let error = cache
+                .set_explicit_checked(
+                    ExplicitSessionKey::new("principal", "overflow"),
+                    conversation(ExplicitSessionState::InFlight),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "session_capacity_exceeded");
+        }
     }
 
     #[tokio::test]
@@ -981,6 +923,14 @@ mod explicit_tests {
 
     #[tokio::test]
     async fn explicit_mutations_return_storage_errors_and_roll_back() {
+        macro_rules! assert_storage_error {
+            ($future:expr) => {
+                assert_eq!(
+                    $future.await.unwrap_err().code,
+                    "session_storage_unavailable"
+                )
+            };
+        }
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("not-a-directory");
         std::fs::write(&blocker, b"block").unwrap();
@@ -991,39 +941,16 @@ mod explicit_tests {
             .await;
 
         let new_key = ExplicitSessionKey::new("principal", "new");
-        assert_eq!(
-            cache
-                .set_explicit_checked(
-                    new_key.clone(),
-                    conversation(ExplicitSessionState::InFlight)
-                )
-                .await
-                .unwrap_err()
-                .code,
-            "session_storage_unavailable"
-        );
+        assert_storage_error!(cache.set_explicit_checked(
+            new_key.clone(),
+            conversation(ExplicitSessionState::InFlight)
+        ));
         assert!(cache.get_explicit(&new_key).await.is_none());
 
-        assert_eq!(
-            cache
-                .stage_explicit_turn(&key, pending())
-                .await
-                .unwrap_err()
-                .code,
-            "session_storage_unavailable"
-        );
-        assert_eq!(
-            cache.mark_explicit_uncertain(&key).await.unwrap_err().code,
-            "session_storage_unavailable"
-        );
-        assert_eq!(
-            cache.tombstone_explicit(&key).await.unwrap_err().code,
-            "session_storage_unavailable"
-        );
-        assert_eq!(
-            cache.reset_explicit(&key).await.unwrap_err().code,
-            "session_storage_unavailable"
-        );
+        assert_storage_error!(cache.stage_explicit_turn(&key, pending()));
+        assert_storage_error!(cache.mark_explicit_uncertain(&key));
+        assert_storage_error!(cache.tombstone_explicit(&key));
+        assert_storage_error!(cache.reset_explicit(&key));
         assert_eq!(
             cache
                 .get_explicit(&key)
@@ -1038,14 +965,7 @@ mod explicit_tests {
         let mut in_flight = conversation(ExplicitSessionState::InFlight);
         in_flight.explicit.as_mut().unwrap().pending = Some(pending());
         cache.set_explicit(key.clone(), in_flight).await;
-        assert_eq!(
-            cache
-                .commit_explicit_turn(&key, Some("assistant".into()))
-                .await
-                .unwrap_err()
-                .code,
-            "session_storage_unavailable"
-        );
+        assert_storage_error!(cache.commit_explicit_turn(&key, Some("assistant".into())));
         assert_eq!(
             cache
                 .get_explicit(&key)
