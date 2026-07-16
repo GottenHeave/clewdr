@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-
 use colored::Colorize;
 use futures::TryFutureExt;
 use serde_json::json;
@@ -101,15 +98,6 @@ impl ClaudeWebState {
             let mut state = self.to_owned();
             let p = p.to_owned();
 
-            // Create shared stream health flag for monitoring SSE completion
-            let can_reuse =
-                CLEWDR_CONFIG.load().reuse_conversation && !CLEWDR_CONFIG.load().preserve_chats;
-            if can_reuse {
-                let flag = Arc::new(AtomicBool::new(false));
-                state.stream_health_flag = Some(flag.clone());
-                self.stream_health_flag = Some(flag);
-            }
-
             let cookie = state.request_cookie().await?;
             // check if request is successful
             let web_res = async {
@@ -196,13 +184,6 @@ impl ClaudeWebState {
     ) -> Option<Result<Response, ClewdrError>> {
         let key = self.cache_key_for(p);
         let cached = self.conv_cache.get(&key).await?;
-
-        // Check stream health from previous request
-        if !self.conv_cache.is_last_stream_healthy(&key).await {
-            info!("[CACHE] last stream was unhealthy, invalidating");
-            self.conv_cache.invalidate(&key).await;
-            return None;
-        }
 
         // Validate: cookie must match
         if cached.cookie_id != self.cookie_id() {
@@ -354,11 +335,6 @@ impl ClaudeWebState {
                 .map(|(_, h)| *h)
                 .collect();
             let sys_hash = hash_system(&p.system);
-            let stream_flag = self
-                .stream_health_flag
-                .clone()
-                .unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
-
             self.pending_cache_write = Some(PendingCacheWrite::Init {
                 key: self.cache_key_for(&p),
                 conv: CachedConversation {
@@ -375,7 +351,6 @@ impl ClaudeWebState {
                     created_at: chrono::Utc::now(),
                     last_used: chrono::Utc::now(),
                     valid: true,
-                    last_stream_healthy: stream_flag,
                 },
             });
         }
@@ -736,12 +711,6 @@ impl ClaudeWebState {
             PendingCacheWrite::AppendTurn { key, turn } => {
                 info!("[CACHE] appended turn (assistant={})", turn.assistant_uuid);
                 self.conv_cache.append_turn(&key, turn).await;
-                // Update stream health flag for the new request
-                if let Some(flag) = self.stream_health_flag.as_ref() {
-                    self.conv_cache
-                        .update_stream_health(&key, flag.clone())
-                        .await;
-                }
             }
             PendingCacheWrite::ForkAndAppend {
                 key,
@@ -755,12 +724,6 @@ impl ClaudeWebState {
                 self.conv_cache
                     .fork_and_append(&key, fork_turn_index, turn)
                     .await;
-                // Update stream health flag for the new request
-                if let Some(flag) = self.stream_health_flag.as_ref() {
-                    self.conv_cache
-                        .update_stream_health(&key, flag.clone())
-                        .await;
-                }
             }
         }
     }
@@ -769,8 +732,12 @@ impl ClaudeWebState {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use url::Url;
 
     use super::*;
+    use crate::claude_web_state::ConversationCache;
+    use crate::config::CookieStatus;
+    use crate::services::cookie_actor::CookieActorHandle;
     use crate::types::claude::{OutputConfig, OutputEffort, Role, Thinking, ThinkingMode};
 
     #[test]
@@ -845,5 +812,55 @@ mod tests {
                 "enabled_imagine": true
             })
         );
+    }
+
+    #[tokio::test]
+    async fn incomplete_downstream_stream_does_not_invalidate_reusable_conversation() {
+        let cache = ConversationCache::new();
+        let handle = CookieActorHandle::start().await.unwrap();
+        let mut state = ClaudeWebState::new(handle, cache.clone());
+        state.cookie = Some(CookieStatus::default());
+        state.org_uuid = Some("org".to_string());
+        state.endpoint = Url::parse("http://127.0.0.1:9/").unwrap();
+
+        let first_message = Message::new_text(Role::User, "first");
+        let params = CreateMessageParams {
+            model: "model".to_string(),
+            messages: vec![
+                first_message.clone(),
+                Message::new_text(Role::User, "second"),
+            ],
+            ..Default::default()
+        };
+        let key = state.cache_key_for(&params);
+        // Cache reuse must not depend on whether the downstream response body was consumed.
+        cache
+            .set(
+                key.clone(),
+                CachedConversation {
+                    conv_uuid: "conversation".to_string(),
+                    org_uuid: "org".to_string(),
+                    cookie_id: state.cookie_id(),
+                    model: params.model.clone(),
+                    is_pro: false,
+                    system_hash: hash_system(&params.system),
+                    turns: vec![CachedTurn {
+                        user_hashes: vec![diff::hash_user_message(&first_message)],
+                        assistant_uuid: "assistant".to_string(),
+                    }],
+                    created_at: chrono::Utc::now(),
+                    last_used: chrono::Utc::now(),
+                    valid: true,
+                },
+            )
+            .await;
+
+        let reuse_attempt = state.try_reuse_conversation(&params).await;
+
+        assert!(
+            reuse_attempt.is_some(),
+            "an incomplete downstream stream must not turn a reusable cache entry into a miss"
+        );
+        assert!(cache.get(&key).await.is_some());
     }
 }

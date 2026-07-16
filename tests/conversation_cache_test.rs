@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-
 use clewdr::claude_web_state::conversation_cache::{
     CacheKey, CachedConversation, CachedTurn, ConversationCache,
 };
@@ -25,7 +22,6 @@ fn make_cached(conv_uuid: &str, turns: Vec<CachedTurn>, system_hash: u64) -> Cac
         created_at: chrono::Utc::now(),
         last_used: chrono::Utc::now(),
         valid: true,
-        last_stream_healthy: Arc::new(AtomicBool::new(true)),
     }
 }
 
@@ -383,86 +379,6 @@ async fn test_cache_cleanup() {
     cache.cleanup().await;
 }
 
-/// Test: stream health flag is shared between cache and stream
-#[tokio::test]
-async fn test_stream_health_flag() {
-    let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
-    let sys_hash = hash_system(&None);
-
-    let flag = Arc::new(AtomicBool::new(false));
-    let conv = CachedConversation {
-        conv_uuid: "conv1".to_string(),
-        org_uuid: "org".to_string(),
-        cookie_id: "cookie".to_string(),
-        model: "model".to_string(),
-        is_pro: false,
-        system_hash: sys_hash,
-        turns: vec![CachedTurn {
-            user_hashes: vec![hash_user_message(&make_user_msg("u1"))],
-            assistant_uuid: "asst0".to_string(),
-        }],
-        created_at: chrono::Utc::now(),
-        last_used: chrono::Utc::now(),
-        valid: true,
-        last_stream_healthy: flag.clone(),
-    };
-    cache.set(key.clone(), conv).await;
-
-    // Initially unhealthy
-    assert!(!cache.is_last_stream_healthy(&key).await);
-
-    // Simulate stream completion
-    flag.store(true, std::sync::atomic::Ordering::Relaxed);
-
-    // Now healthy
-    assert!(cache.is_last_stream_healthy(&key).await);
-}
-
-/// Test: stream health flag update on append
-#[tokio::test]
-async fn test_stream_health_update_on_append() {
-    let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
-    let sys_hash = hash_system(&None);
-
-    let flag = Arc::new(AtomicBool::new(true)); // initially healthy (stream completed)
-    let conv = CachedConversation {
-        conv_uuid: "conv1".to_string(),
-        org_uuid: "org".to_string(),
-        cookie_id: "cookie".to_string(),
-        model: "model".to_string(),
-        is_pro: false,
-        system_hash: sys_hash,
-        turns: vec![CachedTurn {
-            user_hashes: vec![hash_user_message(&make_user_msg("u1"))],
-            assistant_uuid: "asst0".to_string(),
-        }],
-        created_at: chrono::Utc::now(),
-        last_used: chrono::Utc::now(),
-        valid: true,
-        last_stream_healthy: flag,
-    };
-    cache.set(key.clone(), conv).await;
-
-    // New request with new flag
-    let new_flag = Arc::new(AtomicBool::new(false));
-    cache.update_stream_health(&key, new_flag.clone()).await;
-
-    // Not yet healthy
-    assert!(!cache.is_last_stream_healthy(&key).await);
-
-    // Stream completes
-    new_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-    assert!(cache.is_last_stream_healthy(&key).await);
-}
-
 /// Test: cache key isolation
 #[tokio::test]
 async fn test_cache_key_isolation() {
@@ -568,7 +484,6 @@ async fn test_persistent_cache_reloads_valid_entries() {
     assert_eq!(cached.conv_uuid, "conv_persisted");
     assert_eq!(cached.cookie_id, cookie_id);
     assert_eq!(cached.turns.len(), 1);
-    assert!(reloaded.is_last_stream_healthy(&key).await);
 }
 
 /// Test: persistent cache skips expired and invalid entries after restart.
@@ -616,23 +531,28 @@ async fn test_persistent_cache_skips_expired_and_invalid_entries() {
     );
 }
 
-/// Test: stream health is stored as a bool and restored after restart.
+/// Test: cache files written before stream health removal still load.
 #[tokio::test]
-async fn test_persistent_cache_restores_stream_health() {
+async fn test_persistent_cache_ignores_legacy_stream_health() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("conversation_cache.json");
     let key = CacheKey {
         key_index: 0,
         request_fingerprint: 0,
     };
-    let sys_hash = hash_system(&None);
-
     let cache = ConversationCache::persistent(&path).await;
-    let flag = Arc::new(AtomicBool::new(false));
-    let mut conv = make_cached("conv_unhealthy", vec![], sys_hash);
-    conv.last_stream_healthy = flag;
-    cache.set(key.clone(), conv).await;
+    cache
+        .set(
+            key.clone(),
+            make_cached("conv_legacy", vec![], hash_system(&None)),
+        )
+        .await;
+
+    let mut persisted: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    persisted["conversations"][0]["conversation"]["last_stream_healthy"] = serde_json::json!(false);
+    std::fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
 
     let reloaded = ConversationCache::persistent(&path).await;
-    assert!(!reloaded.is_last_stream_healthy(&key).await);
+    assert_eq!(reloaded.get(&key).await.unwrap().conv_uuid, "conv_legacy");
 }

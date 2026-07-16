@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -46,9 +45,6 @@ pub struct CachedConversation {
     pub last_used: DateTime<Utc>,
     /// Whether cache is currently valid (set to false on stream errors)
     pub valid: bool,
-    /// Shared flag set to true when the SSE stream completes with a stop signal.
-    /// Checked on next reuse; if still false, the previous stream was incomplete.
-    pub last_stream_healthy: Arc<AtomicBool>,
 }
 
 impl CachedConversation {
@@ -94,7 +90,6 @@ struct PersistedConversation {
     #[serde_as(as = "TimestampSecondsWithFrac")]
     last_used: DateTime<Utc>,
     valid: bool,
-    last_stream_healthy: bool,
 }
 
 impl From<&CachedConversation> for PersistedConversation {
@@ -110,7 +105,6 @@ impl From<&CachedConversation> for PersistedConversation {
             created_at: conv.created_at,
             last_used: conv.last_used,
             valid: conv.valid,
-            last_stream_healthy: conv.last_stream_healthy.load(Ordering::Relaxed),
         }
     }
 }
@@ -128,7 +122,6 @@ impl From<PersistedConversation> for CachedConversation {
             created_at: conv.created_at,
             last_used: conv.last_used,
             valid: conv.valid,
-            last_stream_healthy: Arc::new(AtomicBool::new(conv.last_stream_healthy)),
         }
     }
 }
@@ -298,30 +291,6 @@ impl ConversationCache {
         if updated {
             self.persist().await;
         }
-    }
-
-    /// Update the stream health flag on an existing cached conversation
-    pub async fn update_stream_health(&self, key: &CacheKey, flag: Arc<AtomicBool>) {
-        let updated = {
-            let mut map = self.inner.lock().await;
-            if let Some(conv) = map.get_mut(key) {
-                conv.last_stream_healthy = flag;
-                true
-            } else {
-                false
-            }
-        };
-        if updated {
-            self.persist().await;
-        }
-    }
-
-    /// Check if the last stream completed healthily for a given cache key
-    pub async fn is_last_stream_healthy(&self, key: &CacheKey) -> bool {
-        let map = self.inner.lock().await;
-        map.get(key)
-            .map(|c| c.last_stream_healthy.load(Ordering::Relaxed))
-            .unwrap_or(true)
     }
 
     pub async fn flush(&self) {
