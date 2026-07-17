@@ -10,6 +10,20 @@ fn make_user_msg(text: &str) -> Message {
     Message::new_text(Role::User, text)
 }
 
+fn cache_key(key_index: usize, request_fingerprint: u64) -> CacheKey {
+    CacheKey {
+        key_index,
+        request_fingerprint,
+    }
+}
+
+fn turn(user_hashes: Vec<u64>, assistant_uuid: &str) -> CachedTurn {
+    CachedTurn {
+        user_hashes,
+        assistant_uuid: assistant_uuid.to_owned(),
+    }
+}
+
 fn make_cached(conv_uuid: &str, turns: Vec<CachedTurn>, system_hash: u64) -> CachedConversation {
     CachedConversation {
         conv_uuid: conv_uuid.to_string(),
@@ -25,14 +39,10 @@ fn make_cached(conv_uuid: &str, turns: Vec<CachedTurn>, system_hash: u64) -> Cac
     }
 }
 
-/// Test: 3 sequential requests, verify 2nd and 3rd use cache
 #[tokio::test]
 async fn test_sequential_requests_use_cache() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = cache_key(0, 0);
     let sys_hash = hash_system(&None);
 
     // Request 1: full messages [u1, u2, u3]
@@ -44,10 +54,7 @@ async fn test_sequential_requests_use_cache() {
     let hashes1 = extract_user_hashes(&msgs1);
     let conv = make_cached(
         "conv1",
-        vec![CachedTurn {
-            user_hashes: hashes1.iter().map(|(_, h)| *h).collect(),
-            assistant_uuid: "asst0".to_string(),
-        }],
+        vec![turn(hashes1.iter().map(|(_, h)| *h).collect(), "asst0")],
         sys_hash,
     );
     cache.set(key.clone(), conv).await;
@@ -77,13 +84,7 @@ async fn test_sequential_requests_use_cache() {
 
     // Simulate successful append: update cache
     cache
-        .append_turn(
-            &key,
-            CachedTurn {
-                user_hashes: vec![hashes2[3].1],
-                assistant_uuid: "asst1".to_string(),
-            },
-        )
+        .append_turn(&key, turn(vec![hashes2[3].1], "asst1"))
         .await;
 
     // Request 3: same prefix + another new message [u1, u2, u3, u4, u5]
@@ -111,14 +112,10 @@ async fn test_sequential_requests_use_cache() {
     }
 }
 
-/// Test: edit scenario (message modification → fork)
 #[tokio::test]
 async fn test_edit_scenario_fork() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = cache_key(0, 0);
     let sys_hash = hash_system(&None);
 
     // Initial: [u1, u2, u3]
@@ -130,10 +127,7 @@ async fn test_edit_scenario_fork() {
     let hashes1 = extract_user_hashes(&msgs1);
     let conv = make_cached(
         "conv1",
-        vec![CachedTurn {
-            user_hashes: hashes1.iter().map(|(_, h)| *h).collect(),
-            assistant_uuid: "asst0".to_string(),
-        }],
+        vec![turn(hashes1.iter().map(|(_, h)| *h).collect(), "asst0")],
         sys_hash,
     );
     cache.set(key.clone(), conv).await;
@@ -152,14 +146,10 @@ async fn test_edit_scenario_fork() {
     assert!(matches!(result, DiffResult::FullRebuild));
 }
 
-/// Test: edit scenario with multi-turn fork
 #[tokio::test]
 async fn test_edit_scenario_fork_multi_turn() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = cache_key(0, 0);
     let sys_hash = hash_system(&None);
 
     // Turn 0: [u1, u2, u3], Turn 1: [u4]
@@ -173,14 +163,8 @@ async fn test_edit_scenario_fork_multi_turn() {
     let conv = make_cached(
         "conv1",
         vec![
-            CachedTurn {
-                user_hashes: hashes1.iter().map(|(_, h)| *h).collect(),
-                assistant_uuid: "asst0".to_string(),
-            },
-            CachedTurn {
-                user_hashes: vec![u4_hash],
-                assistant_uuid: "asst1".to_string(),
-            },
+            turn(hashes1.iter().map(|(_, h)| *h).collect(), "asst0"),
+            turn(vec![u4_hash], "asst1"),
         ],
         sys_hash,
     );
@@ -214,14 +198,10 @@ async fn test_edit_scenario_fork_multi_turn() {
     }
 }
 
-/// Test: system prompt change → full rebuild
 #[tokio::test]
 async fn test_system_prompt_change_full_rebuild() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = cache_key(0, 0);
     let sys_hash1 = hash_system(&Some(serde_json::json!("system v1")));
     let sys_hash2 = hash_system(&Some(serde_json::json!("system v2")));
 
@@ -229,10 +209,7 @@ async fn test_system_prompt_change_full_rebuild() {
     let hashes = extract_user_hashes(&msgs);
     let conv = make_cached(
         "conv1",
-        vec![CachedTurn {
-            user_hashes: hashes.iter().map(|(_, h)| *h).collect(),
-            assistant_uuid: "asst0".to_string(),
-        }],
+        vec![turn(hashes.iter().map(|(_, h)| *h).collect(), "asst0")],
         sys_hash1,
     );
     cache.set(key.clone(), conv).await;
@@ -243,22 +220,15 @@ async fn test_system_prompt_change_full_rebuild() {
     assert!(matches!(result, DiffResult::FullRebuild));
 }
 
-/// Test: model switch → cache invalidated
 #[tokio::test]
 async fn test_model_switch_invalidation() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = cache_key(0, 0);
     let sys_hash = hash_system(&None);
 
     let conv = make_cached(
         "conv1",
-        vec![CachedTurn {
-            user_hashes: vec![hash_user_message(&make_user_msg("u1"))],
-            assistant_uuid: "asst0".to_string(),
-        }],
+        vec![turn(vec![hash_user_message(&make_user_msg("u1"))], "asst0")],
         sys_hash,
     );
     cache.set(key.clone(), conv).await;
@@ -272,14 +242,10 @@ async fn test_model_switch_invalidation() {
     assert!(cache.get(&key).await.is_none());
 }
 
-/// Test: incremental failure → fallback to full rebuild
 #[tokio::test]
 async fn test_incremental_failure_fallback() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = cache_key(0, 0);
     let sys_hash = hash_system(&None);
 
     // Set up cache
@@ -287,10 +253,7 @@ async fn test_incremental_failure_fallback() {
     let hashes = extract_user_hashes(&msgs);
     let conv = make_cached(
         "conv1",
-        vec![CachedTurn {
-            user_hashes: hashes.iter().map(|(_, h)| *h).collect(),
-            assistant_uuid: "asst0".to_string(),
-        }],
+        vec![turn(hashes.iter().map(|(_, h)| *h).collect(), "asst0")],
         sys_hash,
     );
     cache.set(key.clone(), conv).await;
@@ -310,10 +273,10 @@ async fn test_incremental_failure_fallback() {
     let new_hashes = extract_user_hashes(&new_msgs);
     let new_conv = make_cached(
         "conv2",
-        vec![CachedTurn {
-            user_hashes: new_hashes.iter().map(|(_, h)| *h).collect(),
-            assistant_uuid: "asst_new".to_string(),
-        }],
+        vec![turn(
+            new_hashes.iter().map(|(_, h)| *h).collect(),
+            "asst_new",
+        )],
         sys_hash,
     );
     cache.set(key.clone(), new_conv).await;
@@ -323,22 +286,15 @@ async fn test_incremental_failure_fallback() {
     assert_eq!(cached.conv_uuid, "conv2");
 }
 
-/// Test: cookie rotation → cache invalidation
 #[tokio::test]
 async fn test_cookie_rotation_invalidation() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = cache_key(0, 0);
     let sys_hash = hash_system(&None);
 
     let conv = make_cached(
         "conv1",
-        vec![CachedTurn {
-            user_hashes: vec![hash_user_message(&make_user_msg("u1"))],
-            assistant_uuid: "asst0".to_string(),
-        }],
+        vec![turn(vec![hash_user_message(&make_user_msg("u1"))], "asst0")],
         sys_hash,
     );
     cache.set(key.clone(), conv).await;
@@ -349,23 +305,16 @@ async fn test_cookie_rotation_invalidation() {
     assert!(cached.is_none());
 }
 
-/// Test: cache cleanup removes expired entries
 #[tokio::test]
 async fn test_cache_cleanup() {
     let cache = ConversationCache::new();
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = cache_key(0, 0);
     let sys_hash = hash_system(&None);
 
     // Create a conversation that's already expired (created 26 days ago)
     let mut conv = make_cached(
         "conv_expired",
-        vec![CachedTurn {
-            user_hashes: vec![hash_user_message(&make_user_msg("u1"))],
-            assistant_uuid: "asst0".to_string(),
-        }],
+        vec![turn(vec![hash_user_message(&make_user_msg("u1"))], "asst0")],
         sys_hash,
     );
     conv.created_at = chrono::Utc::now() - chrono::Duration::days(26);
@@ -379,34 +328,21 @@ async fn test_cache_cleanup() {
     cache.cleanup().await;
 }
 
-/// Test: cache key isolation
 #[tokio::test]
 async fn test_cache_key_isolation() {
     let cache = ConversationCache::new();
-    let key0 = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
-    let key1 = CacheKey {
-        key_index: 1,
-        request_fingerprint: 0,
-    };
+    let key0 = cache_key(0, 0);
+    let key1 = cache_key(1, 0);
     let sys_hash = hash_system(&None);
 
     let conv0 = make_cached(
         "conv_key0",
-        vec![CachedTurn {
-            user_hashes: vec![hash_user_message(&make_user_msg("u1"))],
-            assistant_uuid: "asst0".to_string(),
-        }],
+        vec![turn(vec![hash_user_message(&make_user_msg("u1"))], "asst0")],
         sys_hash,
     );
     let conv1 = make_cached(
         "conv_key1",
-        vec![CachedTurn {
-            user_hashes: vec![hash_user_message(&make_user_msg("u1"))],
-            assistant_uuid: "asst1".to_string(),
-        }],
+        vec![turn(vec![hash_user_message(&make_user_msg("u1"))], "asst1")],
         sys_hash,
     );
 
@@ -424,18 +360,11 @@ async fn test_cache_key_isolation() {
     assert!(cache.get(&key1).await.is_some());
 }
 
-/// Test: request fingerprint isolation under the same API key.
 #[tokio::test]
 async fn test_cache_key_request_fingerprint_isolation() {
     let cache = ConversationCache::new();
-    let chat_key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 1,
-    };
-    let diagnostic_key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 2,
-    };
+    let chat_key = cache_key(0, 1);
+    let diagnostic_key = cache_key(0, 2);
     let sys_hash = hash_system(&None);
 
     let chat_conv = make_cached("chat_conv", vec![], sys_hash);
@@ -451,25 +380,18 @@ async fn test_cache_key_request_fingerprint_isolation() {
     );
 }
 
-/// Test: persistent cache reloads valid entries from disk.
 #[tokio::test]
 async fn test_persistent_cache_reloads_valid_entries() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("conversation_cache.json");
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = cache_key(0, 0);
     let sys_hash = hash_system(&None);
     let cookie_id = "hashed-cookie-id";
 
     let cache = ConversationCache::persistent(&path).await;
     let mut conv = make_cached(
         "conv_persisted",
-        vec![CachedTurn {
-            user_hashes: vec![hash_user_message(&make_user_msg("u1"))],
-            assistant_uuid: "asst0".to_string(),
-        }],
+        vec![turn(vec![hash_user_message(&make_user_msg("u1"))], "asst0")],
         sys_hash,
     );
     conv.cookie_id = cookie_id.to_string();
@@ -486,25 +408,15 @@ async fn test_persistent_cache_reloads_valid_entries() {
     assert_eq!(cached.turns.len(), 1);
 }
 
-/// Test: persistent cache skips expired and invalid entries after restart.
 #[tokio::test]
 async fn test_persistent_cache_skips_expired_and_invalid_entries() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("conversation_cache.json");
     let sys_hash = hash_system(&None);
 
-    let expired_key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
-    let invalid_key = CacheKey {
-        key_index: 1,
-        request_fingerprint: 0,
-    };
-    let valid_key = CacheKey {
-        key_index: 2,
-        request_fingerprint: 0,
-    };
+    let expired_key = cache_key(0, 0);
+    let invalid_key = cache_key(1, 0);
+    let valid_key = cache_key(2, 0);
     let cache = ConversationCache::persistent(&path).await;
 
     let mut expired = make_cached("conv_expired", vec![], sys_hash);
@@ -531,7 +443,6 @@ async fn test_persistent_cache_skips_expired_and_invalid_entries() {
     );
 }
 
-/// Test: cache files remain compatible across stream health removal.
 #[tokio::test]
 async fn test_persistent_cache_preserves_legacy_stream_health_shape() {
     #[derive(serde::Deserialize)]
@@ -552,10 +463,7 @@ async fn test_persistent_cache_preserves_legacy_stream_health_shape() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("conversation_cache.json");
-    let key = CacheKey {
-        key_index: 0,
-        request_fingerprint: 0,
-    };
+    let key = cache_key(0, 0);
     let cache = ConversationCache::persistent(&path).await;
     cache
         .set(
