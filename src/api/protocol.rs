@@ -20,6 +20,12 @@ pub(crate) struct ResetApiState {
     pub files: Option<Arc<StagedFileStore>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct FileApiState {
+    pub cache: ConversationCache,
+    pub files: Option<Arc<StagedFileStore>>,
+}
+
 pub(crate) struct ProtocolMultipart(Multipart);
 
 impl<S> FromRequest<S> for ProtocolMultipart
@@ -37,17 +43,18 @@ where
 }
 
 pub(crate) async fn api_stage_file(
-    State(store): State<Option<Arc<StagedFileStore>>>,
+    State(state): State<FileApiState>,
     Extension(principal): Extension<AuthPrincipal>,
     ProtocolMultipart(mut multipart): ProtocolMultipart,
 ) -> Result<Json<FileResponse>, ProtocolError> {
-    let store = store.ok_or_else(|| {
+    let store = state.files.ok_or_else(|| {
         ProtocolError::new(
             StatusCode::NOT_IMPLEMENTED,
             "staged_files_unavailable",
             "Staged files are unavailable when filesystem persistence is disabled",
         )
     })?;
+    let _files = state.cache.lock_explicit_files().await;
     let field = multipart.next_field().await.map_err(invalid_multipart)?;
     let Some(field) = field else {
         return Err(invalid_multipart(
@@ -221,10 +228,13 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    fn files_app(store: Option<Arc<StagedFileStore>>) -> Router {
+    fn files_app(store: Option<Arc<StagedFileStore>>, cache: ConversationCache) -> Router {
         Router::new()
             .route("/v1/files", post(api_stage_file))
-            .with_state(store)
+            .with_state(FileApiState {
+                cache,
+                files: store,
+            })
             .layer(Extension(AuthPrincipal::for_authenticated_user()))
     }
 
@@ -251,7 +261,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let files = StagedFileStore::persistent(temp.path()).await.unwrap();
         let response = post_files(
-            files_app(Some(files.clone())),
+            files_app(Some(files.clone()), ConversationCache::new()),
             &[("file", "report.txt", "text/plain", b"hello")],
         )
         .await;
@@ -263,7 +273,7 @@ mod tests {
         assert_eq!(json["size_bytes"], 5);
         assert!(json["id"].as_str().unwrap().starts_with("file_clewdr_v1_"));
         let response = post_files(
-            files_app(Some(files.clone())),
+            files_app(Some(files.clone()), ConversationCache::new()),
             &[
                 ("file", "report.txt", "text/plain", b"hello"),
                 ("extra", "extra.txt", "text/plain", b"extra"),
@@ -277,7 +287,7 @@ mod tests {
                 .count(),
             1
         );
-        let response = post_files(files_app(None), &[]).await;
+        let response = post_files(files_app(None, ConversationCache::new()), &[]).await;
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         assert_eq!(
             response_json(response).await["error"]["type"],
@@ -421,8 +431,15 @@ mod tests {
         let staged = stage(&files, &principal, "first.txt", b'a').await.unwrap();
 
         let coordination = cache.lock_explicit_files().await;
+        let stage_app = files_app(Some(files.clone()), cache.clone());
+        let concurrent_stage = tokio::spawn(async move {
+            post_files(stage_app, &[("file", "second.txt", "text/plain", b"b")])
+                .await
+                .status()
+        });
         let reconcile = reconcile_task(cache.clone(), files.clone());
         tokio::task::yield_now().await;
+        assert!(!concurrent_stage.is_finished());
         files
             .add_reference(&staged, &key.session_ref())
             .await
@@ -434,11 +451,8 @@ mod tests {
         drop(coordination);
         reconcile.await.unwrap();
         assert_eq!(
-            stage(&files, &principal, "second.txt", b'b')
-                .await
-                .unwrap_err()
-                .code,
-            "staged_storage_full"
+            concurrent_stage.await.unwrap(),
+            StatusCode::INSUFFICIENT_STORAGE
         );
 
         let coordination = cache.lock_explicit_files().await;

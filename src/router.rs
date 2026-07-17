@@ -130,7 +130,10 @@ impl RouterBuilder {
                 DEFAULT_MAX_FILE_BYTES as usize + 1024 * 1024,
             ))
             .layer(from_extractor::<RequireFlexibleAuth>())
-            .with_state(self.staged_files.clone());
+            .with_state(FileApiState {
+                cache: self.protocol_cache.clone(),
+                files: self.staged_files.clone(),
+            });
         self.inner = self.inner.merge(reset).merge(files);
         self
     }
