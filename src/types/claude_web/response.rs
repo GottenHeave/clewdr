@@ -25,6 +25,8 @@ use crate::{
 pub async fn merge_sse(
     stream: EventStream<impl Stream<Item = Result<Bytes, wreq::Error>>>,
 ) -> Result<(String, bool), ClewdrError> {
+    // Collect all SSE events so completion text can be merged and message_stop can
+    // decide whether an explicit lifecycle may commit the turn.
     #[derive(Deserialize)]
     struct Data {
         completion: String,
@@ -64,6 +66,8 @@ where
 }
 
 impl ClaudeWebState {
+    /// Converts Claude Web SSE into the requested API format while accounting usage and
+    /// finalizing explicit session state only after a complete stream.
     pub async fn transform_response(
         &mut self,
         wreq_res: wreq::Response,
@@ -89,6 +93,7 @@ impl ClaudeWebState {
                 .eventsource()
                 .map_err(axum::Error::new);
             let stream = try_stream! {
+                // Accumulate completion deltas for output-token accounting and assistant digest.
                 let lifecycle = explicit_lifecycle;
                 let mut explicit_finalized = false;
                 let mut acc = String::new();
@@ -96,6 +101,7 @@ impl ClaudeWebState {
                 struct Data { completion: String }
                 futures::pin_mut!(stream);
                 while let Some(event) = stream.try_next().await? {
+                    // message_stop is the commit boundary; EOF or downstream drop is uncertain.
                     if is_message_stop(&event.event, &event.data)
                         && let Some(lifecycle) = &lifecycle
                     {
@@ -103,6 +109,7 @@ impl ClaudeWebState {
                         lifecycle.commit(digest).await.map_err(axum::Error::new)?;
                         explicit_finalized = true;
                     }
+                    // Forward every event while accumulating only completion payloads.
                     if let Ok(d) = serde_json::from_str::<Data>(&event.data) {
                         acc.push_str(&d.completion);
                     }
@@ -121,6 +128,7 @@ impl ClaudeWebState {
                 }
                 if !acc.is_empty() {
                     let mut out = None;
+                    // Prefer Claude Code token counting, then fall back to local response counting.
                     if enable_precise
                         && let Some(model) = last_params.as_ref().map(|p| p.model.clone())
                     {
