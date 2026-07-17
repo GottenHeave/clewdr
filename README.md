@@ -22,12 +22,11 @@ It keeps resource usage low, serves OpenAI-style endpoints, and ships with a Lep
 The HTTP surface is split into three references maintained in the ClewdR
 project documentation space:
 
-- Claude Web: native Messages, OpenAI-compatible chat, staged files, and
-  explicit session reset (`TN-0006-claude-web-api-reference.md`).
-- Claude Code: native Messages, token counting, and OpenAI-compatible chat
-  (`TN-0007-claude-code-api-reference.md`).
-- Shared and admin: authentication, configuration, cookies, errors, and
-  `--no-fs` behavior (`TN-0008-shared-service-admin-api.md`).
+- Claude Web API: native Messages, OpenAI-compatible chat, staged files, and
+  explicit session reset.
+- Claude Code API: native Messages, token counting, and OpenAI-compatible chat.
+- Shared service and admin API: authentication, configuration, cookies, errors,
+  and `--no-fs` behavior.
 
 Only `messages` and `chat/completions` routes support streaming. Models,
 `count_tokens`, files, session reset, and admin routes return one JSON response.
