@@ -15,13 +15,7 @@ pub struct Attachment {
 }
 
 impl Attachment {
-    /// Creates a new Attachment with the given content
-    ///
-    /// # Arguments
-    /// * `content` - The text content for the attachment
-    ///
-    /// # Returns
-    /// A new Attachment instance configured as a text file
+    /// Creates a text attachment with the default file name.
     pub fn new(content: String) -> Self {
         Self::new_with_file_name(content, "paste.txt")
     }
@@ -414,68 +408,49 @@ mod tests {
         assert_eq!(value["thinking_mode"], json!("auto"));
     }
 
-    #[test]
-    fn explicit_identity_ignores_unforwarded_metadata() {
-        let first: Message = serde_json::from_value(json!({
-            "role": "user",
-            "content": [{"type":"text", "text":"hello"}]
-        }))
-        .unwrap();
-        let second: Message = serde_json::from_value(json!({
-            "role": "user",
-            "content": [{
-                "type":"text",
-                "text":"hello",
-                "cache_control":{"type":"ephemeral", "ttl":"5m"},
-                "citations":[]
-            }]
-        }))
-        .unwrap();
-        assert_eq!(
-            normalize_explicit_message(&first).unwrap().identity,
-            normalize_explicit_message(&second).unwrap().identity
-        );
+    fn message(block: Value) -> Message {
+        serde_json::from_value(json!({"role":"user", "content":[block]})).unwrap()
     }
 
     #[test]
-    fn image_and_image_url_share_forwarded_identity() {
-        let image: Message = serde_json::from_value(json!({
-            "role": "user",
-            "content": [{
-                "type":"image",
-                "source":{"type":"base64", "media_type":"image/png", "data":"aW1hZ2U="}
-            }]
-        }))
-        .unwrap();
-        let image_url: Message = serde_json::from_value(json!({
-            "role": "user",
-            "content": [{
-                "type":"image_url",
-                "image_url":{"url":"data:image/png;base64,aW1hZ2U="}
-            }]
-        }))
-        .unwrap();
-        let image = normalize_explicit_message(&image).unwrap();
-        let image_url = normalize_explicit_message(&image_url).unwrap();
-        assert_eq!(image.identity, image_url.identity);
-        assert_eq!(image.images, image_url.images);
-    }
+    fn explicit_content_block_matrix_preserves_identity_forwarding_and_errors() {
+        let equivalent = [
+            (
+                json!({"type":"text", "text":"hello"}),
+                json!({"type":"text", "text":"hello", "cache_control":{"type":"ephemeral"}, "citations":[]}),
+                (1, 0, 0),
+            ),
+            (
+                json!({"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":"aW1hZ2U="}}),
+                json!({"type":"image_url", "image_url":{"url":"data:image/png;base64,aW1hZ2U="}}),
+                (0, 0, 1),
+            ),
+        ];
+        for (first, second, forwarded) in equivalent {
+            let first = normalize_explicit_message(&message(first)).unwrap();
+            let second = normalize_explicit_message(&message(second)).unwrap();
+            assert_eq!(first.identity, second.identity);
+            assert_eq!(first.images, second.images);
+            assert_eq!(
+                (
+                    first.text_blocks.len(),
+                    first.attachments.len(),
+                    first.images.len()
+                ),
+                forwarded
+            );
+        }
 
-    #[test]
-    fn invalid_documents_and_remote_urls_are_rejected() {
-        let invalid = [
+        for block in [
             json!({"type":"document", "source":{"type":"url", "url":"https://example.com/a"}}),
             json!({"type":"document", "source":{"type":"text", "data":"   "}}),
             json!({"type":"document", "source":{"type":"base64", "media_type":"application/pdf", "data":""}}),
             json!({"type":"image_url", "image_url":{"url":"https://example.com/a.png"}}),
-        ];
-        for block in invalid {
-            let message: Message = serde_json::from_value(json!({
-                "role":"user", "content":[block]
-            }))
-            .unwrap();
+        ] {
             assert_eq!(
-                normalize_explicit_message(&message).unwrap_err().kind,
+                normalize_explicit_message(&message(block))
+                    .unwrap_err()
+                    .kind,
                 ExplicitContentErrorKind::InvalidRequest
             );
         }

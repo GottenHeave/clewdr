@@ -59,31 +59,8 @@ mod tests {
 
     use super::*;
     use crate::claude_web_state::{
-        conversation_cache::CachedConversation,
-        explicit_session::{ExplicitConversation, ExplicitSessionState},
+        conversation_cache::explicit_test_conversation, explicit_session::ExplicitSessionState,
     };
-
-    fn cached_session(state: ExplicitSessionState) -> CachedConversation {
-        CachedConversation {
-            conv_uuid: "conversation".into(),
-            org_uuid: "org".into(),
-            cookie_id: "cookie".into(),
-            model: "model".into(),
-            is_pro: false,
-            system_hash: 0,
-            turns: Vec::new(),
-            created_at: chrono::Utc::now(),
-            last_used: chrono::Utc::now(),
-            valid: true,
-            explicit: Some(ExplicitConversation {
-                state,
-                model_digest: "model".into(),
-                system_digest: "system".into(),
-                turns: Vec::new(),
-                pending: None,
-            }),
-        }
-    }
 
     #[tokio::test]
     async fn reset_removes_tombstone_and_allows_recreation() {
@@ -92,11 +69,12 @@ mod tests {
         let digest = "ab".repeat(32);
         let key = ExplicitSessionKey::new(principal.as_str(), &digest);
         cache
-            .set_explicit(
+            .set_explicit_checked(
                 key.clone(),
-                cached_session(ExplicitSessionState::Tombstoned),
+                explicit_test_conversation(ExplicitSessionState::Tombstoned),
             )
-            .await;
+            .await
+            .unwrap();
         let app = Router::new()
             .route("/v1/sessions/reset", post(api_reset_session))
             .layer(Extension(principal))

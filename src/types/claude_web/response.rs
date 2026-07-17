@@ -325,10 +325,10 @@ mod explicit_session_tests {
     use crate::{
         claude_web_state::{
             ClaudeWebState,
-            conversation_cache::{CachedConversation, ConversationCache, ExplicitSessionKey},
-            explicit_session::{
-                ExplicitConversation, ExplicitLifecycle, ExplicitSessionState, PendingExplicitTurn,
+            conversation_cache::{
+                ConversationCache, ExplicitSessionKey, explicit_test_conversation,
             },
+            explicit_session::{ExplicitLifecycle, ExplicitSessionState, PendingExplicitTurn},
         },
         services::cookie_actor::CookieActorHandle,
     };
@@ -353,37 +353,19 @@ mod explicit_session_tests {
         let cache = ConversationCache::new();
         let key = ExplicitSessionKey::new("principal", "ab".repeat(32));
         let operation = cache.try_lock_explicit_operation(&key).await.unwrap();
+        let mut conversation = explicit_test_conversation(ExplicitSessionState::InFlight);
+        conversation.explicit.as_mut().unwrap().pending = Some(PendingExplicitTurn {
+            parent_uuid_before: None,
+            user_digests: vec!["user".into()],
+            assistant_uuid_after: "assistant".into(),
+            replace_from_turn: 0,
+            parent_timeline: Vec::new(),
+            request_timeline: vec!["user:user".into()],
+        });
         cache
-            .set_explicit(
-                key.clone(),
-                CachedConversation {
-                    conv_uuid: "conversation".into(),
-                    org_uuid: "org".into(),
-                    cookie_id: "cookie".into(),
-                    model: "model".into(),
-                    is_pro: false,
-                    system_hash: 0,
-                    turns: Vec::new(),
-                    created_at: chrono::Utc::now(),
-                    last_used: chrono::Utc::now(),
-                    valid: true,
-                    explicit: Some(ExplicitConversation {
-                        state: ExplicitSessionState::InFlight,
-                        model_digest: "model".into(),
-                        system_digest: "system".into(),
-                        turns: Vec::new(),
-                        pending: Some(PendingExplicitTurn {
-                            parent_uuid_before: None,
-                            user_digests: vec!["user".into()],
-                            assistant_uuid_after: "assistant".into(),
-                            replace_from_turn: 0,
-                            parent_timeline: Vec::new(),
-                            request_timeline: vec!["user:user".into()],
-                        }),
-                    }),
-                },
-            )
-            .await;
+            .set_explicit_checked(key.clone(), conversation)
+            .await
+            .unwrap();
         let lifecycle = ExplicitLifecycle::new(cache.clone(), key.clone(), operation);
         (cache, key, lifecycle)
     }
