@@ -49,7 +49,7 @@ pub struct CachedConversation {
     pub created_at: DateTime<Utc>,
     /// Last time this conversation was successfully used
     pub last_used: DateTime<Utc>,
-    /// Whether cache is currently valid (set to false on stream errors)
+    /// Whether this cache entry is currently valid for reuse.
     pub valid: bool,
 }
 
@@ -71,12 +71,22 @@ impl CachedConversation {
 }
 
 /// Cache key for an implicit request family.
+///
+/// The downstream key index and request fingerprint together identify one
+/// conversation slot. The fingerprint keeps auxiliary request families from
+/// sharing the conversation used by ordinary chat requests.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheKey {
+    /// Index of the downstream API key in configuration.
     pub key_index: usize,
+    /// Stable fingerprint of the request family and its relevant options.
     pub request_fingerprint: u64,
 }
 
+/// Identity of a caller-managed explicit session.
+///
+/// Explicit sessions use a separate key space from implicit request families,
+/// so a session cannot accidentally reuse an unrelated cached conversation.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplicitSessionKey {
     session_principal: String,
@@ -95,7 +105,9 @@ impl ExplicitSessionKey {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 enum StoredCacheKey {
+    /// Legacy cache entries addressed by downstream key and request family.
     Legacy(CacheKey),
+    /// Explicit sessions addressed by their authenticated principal and token.
     ExplicitSession(ExplicitSessionKey),
 }
 
@@ -158,6 +170,8 @@ impl From<PersistedConversation> for CachedConversation {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedCacheEntry {
+    /// The key is persisted with the conversation so entries retain their
+    /// isolation after a process restart.
     key: StoredCacheKey,
     conversation: PersistedConversation,
 }
@@ -183,7 +197,11 @@ impl PersistedConversationCache {
     }
 }
 
-/// Thread-safe conversation cache
+/// Thread-safe conversation cache.
+///
+/// `inner` protects the in-memory entries, `persist_lock` serializes snapshots
+/// written to disk, and `operation_locks` provides one async lock per key so
+/// concurrent turns for the same conversation cannot interleave.
 #[derive(Clone)]
 pub struct ConversationCache {
     inner: Arc<Mutex<HashMap<StoredCacheKey, CachedConversation>>>,
@@ -421,6 +439,8 @@ impl ConversationCache {
         let Some(path) = self.persist_path.as_deref() else {
             return;
         };
+        // Hold the persistence lock while taking and writing one snapshot so
+        // concurrent mutations cannot publish partially ordered cache files.
         let _guard = self.persist_lock.lock().await;
         let snapshot = {
             let map = self.inner.lock().await;
@@ -439,6 +459,8 @@ impl ConversationCache {
         path: &Path,
     ) -> Result<HashMap<StoredCacheKey, CachedConversation>, Box<dyn std::error::Error + Send + Sync>>
     {
+        // Invalid, expired, or unknown-version entries are omitted at load
+        // time; callers only observe reusable conversations.
         let data = match tokio::fs::read_to_string(path).await {
             Ok(data) if data.trim().is_empty() => return Ok(HashMap::new()),
             Ok(data) => data,
