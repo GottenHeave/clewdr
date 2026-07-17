@@ -77,6 +77,57 @@ pub struct CachedConversation {
     pub explicit: Option<ExplicitConversation>,
 }
 
+#[cfg(test)]
+pub(crate) fn explicit_test_conversation(state: ExplicitSessionState) -> CachedConversation {
+    CachedConversation {
+        conv_uuid: "conversation".into(),
+        org_uuid: "org".into(),
+        cookie_id: "cookie".into(),
+        model: "model".into(),
+        is_pro: false,
+        system_hash: 0,
+        turns: Vec::new(),
+        created_at: Utc::now(),
+        last_used: Utc::now(),
+        valid: true,
+        explicit: Some(ExplicitConversation {
+            state,
+            model_digest: "model".into(),
+            system_digest: "system".into(),
+            turns: Vec::new(),
+            pending: None,
+            file_mappings: Default::default(),
+        }),
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn explicit_test_seed(
+    cache: &ConversationCache,
+    key: ExplicitSessionKey,
+    value: CachedConversation,
+) {
+    cache
+        .inner
+        .lock()
+        .await
+        .insert(StoredCacheKey::ExplicitSession(key), value);
+}
+
+#[cfg(test)]
+pub(crate) async fn explicit_test_state(
+    cache: &ConversationCache,
+    key: &ExplicitSessionKey,
+) -> ExplicitSessionState {
+    cache
+        .get_explicit(key)
+        .await
+        .unwrap()
+        .explicit
+        .unwrap()
+        .state
+}
+
 impl CachedConversation {
     pub fn is_expired(&self) -> bool {
         Utc::now() - self.created_at > Duration::days(25)
@@ -338,11 +389,6 @@ impl ConversationCache {
             .await
     }
 
-    pub async fn lock_explicit_operation(&self, key: &ExplicitSessionKey) -> OwnedMutexGuard<()> {
-        self.lock_stored_operation(StoredCacheKey::ExplicitSession(key.clone()))
-            .await
-    }
-
     pub async fn try_lock_explicit_operation(
         &self,
         key: &ExplicitSessionKey,
@@ -379,11 +425,6 @@ impl ConversationCache {
 
     pub async fn set(&self, key: CacheKey, conv: CachedConversation) {
         self.set_stored(StoredCacheKey::Legacy(key), conv).await;
-    }
-
-    pub async fn set_explicit(&self, key: ExplicitSessionKey, conv: CachedConversation) {
-        self.set_stored(StoredCacheKey::ExplicitSession(key), conv)
-            .await;
     }
 
     pub async fn set_explicit_checked(
@@ -622,7 +663,11 @@ impl ConversationCache {
                 }
             }
         };
-        if let Err(error) = self.persist_snapshot().await {
+        let persisted = match self.persist_path.as_deref() {
+            Some(path) => self.persist_snapshot_to(path).await,
+            None => Ok(()),
+        };
+        if let Err(error) = persisted {
             let mut map = self.inner.lock().await;
             restore_record(&mut map, stored_key, previous);
             return Err(storage_error(error));
@@ -632,11 +677,6 @@ impl ConversationCache {
 
     pub async fn append_turn(&self, key: &CacheKey, turn: CachedTurn) {
         self.append_stored_turn(&StoredCacheKey::Legacy(key.clone()), turn)
-            .await;
-    }
-
-    pub async fn append_explicit_turn(&self, key: &ExplicitSessionKey, turn: CachedTurn) {
-        self.append_stored_turn(&StoredCacheKey::ExplicitSession(key.clone()), turn)
             .await;
     }
 
@@ -659,20 +699,6 @@ impl ConversationCache {
     pub async fn fork_and_append(&self, key: &CacheKey, from_index: usize, turn: CachedTurn) {
         self.fork_and_append_stored(&StoredCacheKey::Legacy(key.clone()), from_index, turn)
             .await;
-    }
-
-    pub async fn fork_and_append_explicit(
-        &self,
-        key: &ExplicitSessionKey,
-        from_index: usize,
-        turn: CachedTurn,
-    ) {
-        self.fork_and_append_stored(
-            &StoredCacheKey::ExplicitSession(key.clone()),
-            from_index,
-            turn,
-        )
-        .await;
     }
 
     async fn fork_and_append_stored(
@@ -699,11 +725,6 @@ impl ConversationCache {
 
     pub async fn invalidate(&self, key: &CacheKey) {
         self.invalidate_stored(&StoredCacheKey::Legacy(key.clone()))
-            .await;
-    }
-
-    pub async fn invalidate_explicit(&self, key: &ExplicitSessionKey) {
-        self.invalidate_stored(&StoredCacheKey::ExplicitSession(key.clone()))
             .await;
     }
 
@@ -758,31 +779,17 @@ impl ConversationCache {
     }
 
     async fn persist(&self) {
-        if let Err(err) = self.persist_result().await {
-            let Some(path) = self.persist_path.as_deref() else {
-                return;
-            };
+        let Some(path) = self.persist_path.as_deref() else {
+            return;
+        };
+        let _guard = self.persist_lock.lock().await;
+        if let Err(err) = self.persist_snapshot_to(path).await {
             warn!(
                 "[CACHE] failed to persist conversation cache to {}: {}",
                 path.display(),
                 err
             );
         }
-    }
-
-    async fn persist_result(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let Some(path) = self.persist_path.as_deref() else {
-            return Ok(());
-        };
-        let _guard = self.persist_lock.lock().await;
-        self.persist_snapshot_to(path).await
-    }
-
-    async fn persist_snapshot(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let Some(path) = self.persist_path.as_deref() else {
-            return Ok(());
-        };
-        self.persist_snapshot_to(path).await
     }
 
     async fn persist_snapshot_to(
@@ -834,26 +841,7 @@ mod explicit_tests {
     use super::*;
 
     fn conversation(state: ExplicitSessionState) -> CachedConversation {
-        CachedConversation {
-            conv_uuid: "conversation".into(),
-            org_uuid: "org".into(),
-            cookie_id: "cookie".into(),
-            model: "model".into(),
-            is_pro: false,
-            system_hash: 0,
-            turns: Vec::new(),
-            created_at: Utc::now(),
-            last_used: Utc::now(),
-            valid: true,
-            explicit: Some(ExplicitConversation {
-                state,
-                model_digest: "model".into(),
-                system_digest: "system".into(),
-                turns: Vec::new(),
-                pending: None,
-                file_mappings: Default::default(),
-            }),
-        }
+        explicit_test_conversation(state)
     }
 
     fn pending() -> PendingExplicitTurn {
@@ -878,6 +866,10 @@ mod explicit_tests {
                 conversation(state),
             );
         }
+    }
+
+    async fn seed(cache: &ConversationCache, key: ExplicitSessionKey, value: CachedConversation) {
+        explicit_test_seed(cache, key, value).await;
     }
 
     #[tokio::test]
@@ -914,8 +906,14 @@ mod explicit_tests {
         old_tombstone.last_used = Utc::now() - Duration::days(26);
         let mut old_uncertain = conversation(ExplicitSessionState::Uncertain);
         old_uncertain.last_used = Utc::now() - Duration::days(26);
-        cache.set_explicit(tombstone.clone(), old_tombstone).await;
-        cache.set_explicit(uncertain.clone(), old_uncertain).await;
+        cache
+            .set_explicit_checked(tombstone.clone(), old_tombstone)
+            .await
+            .unwrap();
+        cache
+            .set_explicit_checked(uncertain.clone(), old_uncertain)
+            .await
+            .unwrap();
         cache.cleanup().await;
         assert!(cache.get_explicit(&tombstone).await.is_none());
         assert!(cache.get_explicit(&uncertain).await.is_some());
@@ -936,9 +934,12 @@ mod explicit_tests {
         std::fs::write(&blocker, b"block").unwrap();
         let cache = ConversationCache::persistent(blocker.join("cache.json")).await;
         let key = ExplicitSessionKey::new("principal", "session");
-        cache
-            .set_explicit(key.clone(), conversation(ExplicitSessionState::Committed))
-            .await;
+        seed(
+            &cache,
+            key.clone(),
+            conversation(ExplicitSessionState::Committed),
+        )
+        .await;
 
         let new_key = ExplicitSessionKey::new("principal", "new");
         assert_storage_error!(cache.set_explicit_checked(
@@ -952,28 +953,16 @@ mod explicit_tests {
         assert_storage_error!(cache.tombstone_explicit(&key));
         assert_storage_error!(cache.reset_explicit(&key));
         assert_eq!(
-            cache
-                .get_explicit(&key)
-                .await
-                .unwrap()
-                .explicit
-                .unwrap()
-                .state,
+            explicit_test_state(&cache, &key).await,
             ExplicitSessionState::Committed
         );
 
         let mut in_flight = conversation(ExplicitSessionState::InFlight);
         in_flight.explicit.as_mut().unwrap().pending = Some(pending());
-        cache.set_explicit(key.clone(), in_flight).await;
+        seed(&cache, key.clone(), in_flight).await;
         assert_storage_error!(cache.commit_explicit_turn(&key, Some("assistant".into())));
         assert_eq!(
-            cache
-                .get_explicit(&key)
-                .await
-                .unwrap()
-                .explicit
-                .unwrap()
-                .state,
+            explicit_test_state(&cache, &key).await,
             ExplicitSessionState::InFlight
         );
     }
@@ -1004,9 +993,12 @@ mod explicit_tests {
         std::fs::write(&blocker, b"block").unwrap();
         let cache = ConversationCache::persistent(blocker.join("cache.json")).await;
         let key = ExplicitSessionKey::new("principal", "session");
-        cache
-            .set_explicit(key.clone(), conversation(ExplicitSessionState::InFlight))
-            .await;
+        seed(
+            &cache,
+            key.clone(),
+            conversation(ExplicitSessionState::InFlight),
+        )
+        .await;
         let baseline = cache.persistence_attempts.load(Ordering::Relaxed);
         let operation = cache.try_lock_explicit_operation(&key).await.unwrap();
         drop(ExplicitLifecycle::new(
@@ -1031,13 +1023,7 @@ mod explicit_tests {
             baseline + 1
         );
         assert_eq!(
-            cache
-                .get_explicit(&key)
-                .await
-                .unwrap()
-                .explicit
-                .unwrap()
-                .state,
+            explicit_test_state(&cache, &key).await,
             ExplicitSessionState::Uncertain
         );
     }

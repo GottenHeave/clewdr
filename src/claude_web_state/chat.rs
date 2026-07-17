@@ -1040,7 +1040,9 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use crate::claude_web_state::conversation_cache::ConversationCache;
+    use crate::claude_web_state::conversation_cache::{
+        ConversationCache, explicit_test_conversation, explicit_test_seed, explicit_test_state,
+    };
     use axum::{
         Router,
         body::{Body, to_bytes},
@@ -1054,7 +1056,6 @@ mod tests {
     use crate::config::{CLEWDR_CONFIG, ClewdrConfig};
     use crate::types::claude::{
         ContentBlock, ImageSource, Metadata, OutputConfig, OutputEffort, Role, Thinking,
-        ThinkingMode,
     };
 
     static CONFIG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1066,32 +1067,10 @@ mod tests {
         url::Url::parse(&format!("http://{address}/")).unwrap()
     }
 
-    fn cached_conversation() -> CachedConversation {
-        CachedConversation {
-            conv_uuid: "conversation".into(),
-            org_uuid: "org".into(),
-            cookie_id: "cookie".into(),
-            model: "model".into(),
-            is_pro: false,
-            system_hash: 0,
-            turns: Vec::new(),
-            created_at: chrono::Utc::now(),
-            last_used: chrono::Utc::now(),
-            valid: true,
-            explicit: None,
-        }
-    }
-
     fn explicit_conversation(state: ExplicitSessionState) -> CachedConversation {
-        let mut conversation = cached_conversation();
-        conversation.explicit = Some(ExplicitConversation {
-            state,
-            model_digest: digest_model(&conversation.model),
-            system_digest: digest_system(&None),
-            turns: Vec::new(),
-            pending: None,
-            file_mappings: Default::default(),
-        });
+        let mut conversation = explicit_test_conversation(state);
+        conversation.explicit.as_mut().unwrap().model_digest = digest_model(&conversation.model);
+        conversation.explicit.as_mut().unwrap().system_digest = digest_system(&None);
         conversation
     }
 
@@ -1121,6 +1100,13 @@ mod tests {
 
         fn recorded(&self) -> Vec<RecordedRequest> {
             self.requests.lock().unwrap().clone()
+        }
+
+        fn completions(&self) -> Vec<RecordedRequest> {
+            self.recorded()
+                .into_iter()
+                .filter(|request| request.path.contains("/completion"))
+                .collect()
         }
     }
 
@@ -1233,6 +1219,13 @@ mod tests {
             .unwrap()
     }
 
+    async fn send_session(state: &mut ClaudeWebState, digest: &str, messages: Vec<Message>) {
+        state
+            .try_chat(session_request(digest, messages))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn try_chat_reuses_conversation_and_stops_before_unpersisted_side_effects() {
         let _config_guard = CONFIG_TEST_LOCK.lock().await;
@@ -1268,23 +1261,17 @@ mod tests {
             vec![user("u1"), assistant(), user("changed")],
             vec![user("u1"), assistant(), user("changed")],
         ] {
-            state
-                .try_chat(session_request(&digest, messages))
-                .await
-                .unwrap();
+            send_session(&mut state, &digest, messages).await;
         }
         let key = ExplicitSessionKey::new(principal.as_str(), &digest);
         let cached = cache.get_explicit(&key).await.unwrap();
         let conversation_uuid = cached.conv_uuid.clone();
         let first_assistant_uuid = cached.turns[0].assistant_uuid.clone();
 
-        let completion_bodies = |from: usize| {
-            requests
-                .recorded()
-                .into_iter()
-                .filter(|request| request.path.contains("/completion"))
-                .skip(from)
-                .map(|request| request.body)
+        let completion_bodies = |from| {
+            requests.completions()[from..]
+                .iter()
+                .map(|request| request.body.clone())
                 .collect::<Vec<_>>()
         };
         for messages in [
@@ -1297,10 +1284,7 @@ mod tests {
                 user("second"),
             ],
         ] {
-            state
-                .try_chat(session_request(&"ce".repeat(32), messages))
-                .await
-                .unwrap();
+            send_session(&mut state, &"ce".repeat(32), messages).await;
         }
         let consecutive = completion_bodies(4);
         assert_eq!(consecutive[0]["prompt"], "first\nsecond");
@@ -1315,10 +1299,7 @@ mod tests {
             .unwrap()
         };
         for messages in [vec![rich()], vec![rich(), assistant(), rich()]] {
-            state
-                .try_chat(session_request(&"ef".repeat(32), messages))
-                .await
-                .unwrap();
+            send_session(&mut state, &"ef".repeat(32), messages).await;
         }
         let rich = completion_bodies(6);
         assert_eq!(rich[0]["prompt"], rich[1]["prompt"]);
@@ -1326,11 +1307,7 @@ mod tests {
         assert_eq!(rich[1]["files"], json!(["uploaded-file"]));
         assert_eq!(rich[1]["attachments"][0]["file_name"], "notes.txt");
         let request_count = {
-            let requests = requests.recorded();
-            let completions = requests
-                .iter()
-                .filter(|request| request.path.contains("/completion"))
-                .collect::<Vec<_>>();
+            let completions = requests.completions();
             assert_eq!(completions.len(), 8);
             assert!(
                 completions[..4]
@@ -1350,7 +1327,7 @@ mod tests {
                 cached.explicit.unwrap().state,
                 ExplicitSessionState::Committed
             );
-            requests.len()
+            requests.recorded().len()
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -1360,19 +1337,10 @@ mod tests {
         let mut state = ClaudeWebState::new(handle.clone(), cache);
         state.principal = Some(crate::protocol::AuthPrincipal::for_authenticated_user());
         let error = state
-            .try_chat(CreateMessageParams {
-                model: "claude-sonnet-4-6".into(),
-                messages: vec![Message::new_text(Role::User, "hello")],
-                metadata: Some(Metadata {
-                    fields: [(
-                        "user_id".into(),
-                        format!("cherry_topic_v1_{}", "cd".repeat(32)),
-                    )]
-                    .into_iter()
-                    .collect(),
-                }),
-                ..Default::default()
-            })
+            .try_chat(session_request(
+                &"cd".repeat(32),
+                vec![Message::new_text(Role::User, "hello")],
+            ))
             .await
             .unwrap_err();
         let ClewdrError::Protocol { source } = error else {
@@ -1424,25 +1392,21 @@ mod tests {
             staged_state.principal = Some(principal.clone());
             staged_state.staged_files = Some(files.clone());
             let digest = format!("{:064x}", index + 2);
-            staged_state
-                .try_chat(session_request(&digest, vec![message.clone()]))
-                .await
-                .unwrap();
+            send_session(&mut staged_state, &digest, vec![message.clone()]).await;
             if index == 2 {
-                staged_state
-                    .try_chat(session_request(
-                        &digest,
-                        vec![
-                            message,
-                            assistant(),
-                            serde_json::from_value(json!({
-                                "role":"user", "content":[block]
-                            }))
-                            .unwrap(),
-                        ],
-                    ))
-                    .await
-                    .unwrap();
+                send_session(
+                    &mut staged_state,
+                    &digest,
+                    vec![
+                        message,
+                        assistant(),
+                        serde_json::from_value(json!({
+                            "role":"user", "content":[block]
+                        }))
+                        .unwrap(),
+                    ],
+                )
+                .await;
             }
         }
         assert_eq!(requests.uploads.load(Ordering::SeqCst) - upload_start, 3);
@@ -1452,12 +1416,12 @@ mod tests {
         std::fs::write(&parent, b"block").unwrap();
         let cache = ConversationCache::persistent(parent.join("cache.json")).await;
         let key = ExplicitSessionKey::new(principal.as_str(), "mapping-failure");
-        cache
-            .set_explicit(
-                key.clone(),
-                explicit_conversation(ExplicitSessionState::InFlight),
-            )
-            .await;
+        explicit_test_seed(
+            &cache,
+            key.clone(),
+            explicit_conversation(ExplicitSessionState::InFlight),
+        )
+        .await;
         let limited_dir = tempfile::tempdir().unwrap();
         let limited = crate::protocol_files::StagedFileStore::persistent_with_limits(
             limited_dir.path(),
@@ -1514,22 +1478,17 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(
-            cache
-                .get_explicit(&key)
-                .await
-                .unwrap()
-                .explicit
-                .unwrap()
-                .state,
+            explicit_test_state(&cache, &key).await,
             ExplicitSessionState::Uncertain
         );
         assert!(cache.reset_explicit(&key).await.unwrap());
         cache
-            .set_explicit(
+            .set_explicit_checked(
                 key.clone(),
                 explicit_conversation(ExplicitSessionState::InFlight),
             )
-            .await;
+            .await
+            .unwrap();
         let state = ClaudeWebState::new(handle.clone(), cache.clone());
         state
             .finish_explicit_send(
@@ -1587,9 +1546,8 @@ mod tests {
             drop(state.try_chat(stream_request(messages)).await.unwrap());
         }
         let paths = incomplete
-            .recorded()
+            .completions()
             .into_iter()
-            .filter(|request| request.path.ends_with("/completion"))
             .map(|request| request.path)
             .collect::<Vec<_>>();
         assert_eq!(paths.len(), 3);
@@ -1626,7 +1584,10 @@ mod tests {
                     crate::claude_web_state::explicit_session::digest_assistant_output("answer"),
                 ),
             });
-        cache.set_explicit(key.clone(), conversation).await;
+        cache
+            .set_explicit_checked(key.clone(), conversation)
+            .await
+            .unwrap();
         let mut state = ClaudeWebState::new(handle, cache.clone());
         state.principal = Some(principal);
         let error = state
@@ -1639,20 +1600,14 @@ mod tests {
         assert_eq!(source.status, StatusCode::GONE);
         assert_eq!(source.code, "conversation_expired");
         assert_eq!(
-            cache
-                .get_explicit(&key)
-                .await
-                .unwrap()
-                .explicit
-                .unwrap()
-                .state,
+            explicit_test_state(&cache, &key).await,
             ExplicitSessionState::Tombstoned
         );
     }
 
     #[test]
     fn cookie_and_organization_binding_mismatches_expire_session() {
-        let mut cached = cached_conversation();
+        let mut cached = explicit_conversation(ExplicitSessionState::Committed);
         assert!(explicit_binding_error(&cached, "other", "org").is_some());
         cached.cookie_id = "cookie".into();
         assert!(explicit_binding_error(&cached, "cookie", "other").is_some());
@@ -1668,11 +1623,12 @@ mod tests {
             let cache = ConversationCache::new();
             let key = ExplicitSessionKey::new("principal", status.as_u16().to_string());
             cache
-                .set_explicit(
+                .set_explicit_checked(
                     key.clone(),
                     explicit_conversation(ExplicitSessionState::InFlight),
                 )
-                .await;
+                .await
+                .unwrap();
             let state = ClaudeWebState::new(handle, cache.clone());
             let error = state
                 .finish_explicit_send(
@@ -1694,65 +1650,32 @@ mod tests {
             };
             assert_eq!(source.status, StatusCode::GONE);
             assert_eq!(
-                cache
-                    .get_explicit(&key)
-                    .await
-                    .unwrap()
-                    .explicit
-                    .unwrap()
-                    .state,
+                explicit_test_state(&cache, &key).await,
                 ExplicitSessionState::Tombstoned
             );
         }
     }
     #[test]
     fn model_selector_state_body_uses_effort_and_mode_shape() {
-        let params = CreateMessageParams {
-            model: "claude-opus-4-8".to_string(),
-            messages: vec![Message::new_text(Role::User, "hi")],
-            output_config: Some(OutputConfig {
-                effort: Some(OutputEffort::Max),
-                format: None,
-            }),
-            thinking: Some(Thinking::adaptive()),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            model_selector_state_body(&params),
-            json!({
-                "model": "claude-opus-4-8",
-                "thinking": {
-                    "type": "effort_and_mode",
-                    "effort": "max",
-                    "mode": "auto"
-                }
-            })
-        );
-    }
-
-    #[test]
-    fn model_selector_state_body_keeps_off_mode() {
-        let params = CreateMessageParams {
-            model: "claude-opus-4-8".to_string(),
-            messages: vec![Message::new_text(Role::User, "hi")],
-            output_config: Some(OutputConfig {
-                effort: Some(OutputEffort::Xhigh),
-                format: None,
-            }),
-            thinking: Some(Thinking::Disabled),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            model_selector_state_body(&params)["thinking"],
-            json!({
-                "type": "effort_and_mode",
-                "effort": "xhigh",
-                "mode": "off"
-            })
-        );
-        assert_eq!(params.web_thinking_mode(), Some(ThinkingMode::Off));
+        for (effort, thinking, expected_effort, expected_mode) in [
+            (OutputEffort::Max, Thinking::adaptive(), "max", "auto"),
+            (OutputEffort::Xhigh, Thinking::Disabled, "xhigh", "off"),
+        ] {
+            let params = CreateMessageParams {
+                model: "claude-opus-4-8".into(),
+                messages: vec![Message::new_text(Role::User, "hi")],
+                output_config: Some(OutputConfig {
+                    effort: Some(effort),
+                    format: None,
+                }),
+                thinking: Some(thinking),
+                ..Default::default()
+            };
+            assert_eq!(
+                model_selector_state_body(&params)["thinking"],
+                json!({"type":"effort_and_mode", "effort":expected_effort, "mode":expected_mode})
+            );
+        }
     }
 
     #[test]

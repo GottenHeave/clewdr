@@ -835,45 +835,35 @@ mod tests {
     use super::*;
 
     struct Fixture {
-        _temp: tempfile::TempDir,
-        principal: AuthPrincipal,
+        temp: tempfile::TempDir,
         store: Arc<StagedFileStore>,
-        limits: (u64, u64),
     }
     impl Fixture {
-        async fn new(max_file: u64, max_staged: u64) -> Self {
+        async fn new(limits: (u64, u64)) -> Self {
             let temp = tempfile::tempdir().unwrap();
-            let store = StagedFileStore::persistent_with_limits(temp.path(), max_file, max_staged)
+            let store = StagedFileStore::persistent_with_limits(temp.path(), limits.0, limits.1)
                 .await
                 .unwrap();
-            Self {
-                _temp: temp,
-                principal: AuthPrincipal::for_authenticated_user(),
-                store,
-                limits: (max_file, max_staged),
-            }
+            Self { temp, store }
         }
-        async fn unbounded() -> Self {
-            Self::new(DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_STAGED_BYTES).await
-        }
-        async fn try_stage(&self, name: &str, bytes: &[u8]) -> Result<FileResponse, ProtocolError> {
+        async fn stage(&self, name: &str, bytes: &[u8]) -> Result<FileResponse, ProtocolError> {
             self.store
                 .stage_stream(
-                    &self.principal,
+                    &AuthPrincipal::for_authenticated_user(),
                     name,
                     "application/octet-stream",
                     stream::iter([Ok::<_, std::io::Error>(Bytes::copy_from_slice(bytes))]),
                 )
                 .await
         }
-        async fn stage(&self, name: &str, bytes: &[u8]) -> FileResponse {
-            self.try_stage(name, bytes).await.unwrap()
+        async fn ok(&self, name: &str, bytes: &[u8]) -> FileResponse {
+            self.stage(name, bytes).await.unwrap()
         }
         async fn restart(&mut self) {
             self.store = StagedFileStore::persistent_with_limits(
-                self._temp.path(),
-                self.limits.0,
-                self.limits.1,
+                self.temp.path(),
+                self.store.max_file_bytes,
+                self.store.max_staged_bytes,
             )
             .await
             .unwrap();
@@ -888,11 +878,14 @@ mod tests {
                 .unwrap()
                 .last_used = Utc::now().timestamp() - FILE_TTL_SECONDS - 1;
         }
-        async fn resolve(&self, id: &str) {
-            self.store.resolve(&self.principal, id).await.unwrap();
-        }
-        fn object_count(&self) -> usize {
-            std::fs::read_dir(&self.store.objects).unwrap().count()
+        async fn state(&self, id: Option<&str>) -> (usize, usize, usize, bool) {
+            let index = self.store.index.lock().await;
+            (
+                index.files.len(),
+                std::fs::read_dir(&self.store.objects).unwrap().count(),
+                index.files.values().filter(|file| file.expired).count(),
+                id.is_some_and(|id| self.store.object_path(id).exists()),
+            )
         }
     }
     #[derive(Clone, Copy)]
@@ -909,50 +902,55 @@ mod tests {
         }
         .store(1, Ordering::SeqCst);
     }
-    macro_rules! assert_code {
-        ($future:expr, $code:literal) => {
-            assert_eq!($future.await.unwrap_err().code, $code)
-        };
+    fn code<T: std::fmt::Debug>(result: Result<T, ProtocolError>, expected: &str) {
+        assert_eq!(result.unwrap_err().code, expected);
     }
+    fn principal() -> AuthPrincipal {
+        AuthPrincipal::for_authenticated_user()
+    }
+
     #[tokio::test]
-    async fn file_and_referenced_aggregate_limits_are_enforced() {
-        let limited = Fixture::new(4, 5).await;
-        assert_code!(limited.try_stage("large.bin", b"12345"), "file_too_large");
-        let first = limited.stage("first.bin", b"1234").await;
+    async fn quotas_and_expired_identity_status_survive_restart() {
+        let mut limited = Fixture::new((4, 5)).await;
+        code(limited.stage("large", b"12345").await, "file_too_large");
+        let first = limited.ok("first", b"1234").await;
         limited
             .store
             .add_reference(&first.id, "session")
             .await
             .unwrap();
-        assert_code!(
-            limited.try_stage("second.bin", b"12"),
-            "staged_storage_full"
+        code(limited.stage("second", b"12").await, "staged_storage_full");
+        limited
+            .store
+            .remove_session_references("session")
+            .await
+            .unwrap();
+        limited.expire(&first.id).await;
+        limited.store.cleanup().await.unwrap();
+        limited.restart().await;
+        code(
+            limited.store.resolve(&principal(), &first.id).await,
+            "file_expired",
         );
-    }
-    #[tokio::test]
-    async fn expiration_references_and_leases_control_capacity() {
-        let mut fixture = Fixture::new(2, 2).await;
-        let file = fixture.stage("old.txt", b"aa").await;
-        fixture.expire(&file.id).await;
-        fixture.store.cleanup().await.unwrap();
-        fixture.restart().await;
-        assert_code!(
-            fixture.store.resolve(&fixture.principal, &file.id),
-            "file_expired"
-        );
-        assert_code!(
-            fixture
+        code(
+            limited
                 .store
-                .resolve(&fixture.principal, "file_clewdr_v1_missing"),
-            "file_not_found"
+                .resolve(&principal(), "file_clewdr_v1_missing")
+                .await,
+            "file_not_found",
         );
-        fixture.stage("new.txt", b"bb").await;
     }
 
     #[tokio::test]
-    async fn startup_reconciles_cleanup_artifacts_and_orphans() {
-        let mut fixture = Fixture::unbounded().await;
-        let file = fixture.stage("file.txt", b"file").await;
+    async fn leases_and_startup_cleanup_artifacts_preserve_live_files() {
+        let mut fixture = Fixture::new((10, 10)).await;
+        let file = fixture.ok("file", b"file").await;
+        let lease = fixture.store.resolve(&principal(), &file.id).await.unwrap();
+        fixture.expire(&file.id).await;
+        fixture.store.cleanup().await.unwrap();
+        assert!(fixture.store.object_path(&file.id).exists());
+        drop(lease);
+        tokio::task::yield_now().await;
         let artifact =
             fixture
                 .store
@@ -963,54 +961,68 @@ mod tests {
             .unwrap();
         fixture.restart().await;
         assert!(!artifact.exists());
-        fixture.resolve(&file.id).await;
+        assert!(!fixture.store.index.lock().await.files[&file.id].expired);
     }
 
+    #[derive(Clone, Copy)]
+    enum Operation {
+        Stage,
+        Evict,
+        Cleanup,
+    }
     #[tokio::test]
-    async fn stage_faults_leave_no_index_or_object_and_survive_restart() {
-        for fault in [Fault::Persist, Fault::Rename] {
-            let mut fixture = Fixture::unbounded().await;
+    async fn fault_operation_matrix_rolls_back_or_reconciles_after_restart() {
+        let cases = [
+            (Operation::Stage, Fault::Persist),
+            (Operation::Stage, Fault::Rename),
+            (Operation::Evict, Fault::Persist),
+            (Operation::Evict, Fault::Delete),
+            (Operation::Cleanup, Fault::Persist),
+            (Operation::Cleanup, Fault::Delete),
+        ];
+        for (operation, fault) in cases {
+            let mut fixture = Fixture::new((1, 1)).await;
+            let previous = match operation {
+                Operation::Stage => None,
+                _ => Some(fixture.ok("old", b"a").await),
+            };
+            if matches!(operation, Operation::Cleanup) {
+                fixture.expire(&previous.as_ref().unwrap().id).await;
+            }
             inject(&fixture.store, fault);
-            assert_code!(
-                fixture.try_stage("failed.txt", b"failed"),
-                "staged_files_unavailable"
-            );
-            assert!(fixture.store.index.lock().await.files.is_empty());
-            assert_eq!(fixture.object_count(), 0);
+            let result = match operation {
+                Operation::Stage => fixture.stage("new", b"b").await.map(|_| ()),
+                Operation::Evict => fixture.stage("new", b"b").await.map(|_| ()),
+                Operation::Cleanup => fixture.store.cleanup().await,
+            };
+            if !matches!((operation, fault), (Operation::Evict, Fault::Delete)) {
+                code(result, "staged_files_unavailable");
+            }
+            let old_id = previous.as_ref().map(|file| file.id.as_str());
+            let before = match (operation, fault) {
+                (Operation::Stage, _) => (0, 0, 0, false),
+                (Operation::Evict, Fault::Delete) => (1, 2, 0, true),
+                _ => (1, 1, 0, true),
+            };
+            assert_eq!(fixture.state(old_id).await, before);
             fixture.restart().await;
-            let file = fixture.stage("failed.txt", b"failed").await;
-            fixture.resolve(&file.id).await;
+            let old_exists = !matches!((operation, fault), (Operation::Evict, Fault::Delete));
+            let after = if matches!(operation, Operation::Stage) {
+                (0, 0, 0, false)
+            } else {
+                (1, 1, 0, old_exists)
+            };
+            assert_eq!(fixture.state(old_id).await, after);
+            if matches!(operation, Operation::Stage) {
+                fixture.ok("new", b"b").await;
+            }
         }
     }
 
     #[tokio::test]
-    async fn eviction_persist_and_delete_failures_recover_on_restart() {
-        let mut fixture = Fixture::new(1, 1).await;
-        let previous = fixture.stage("previous.txt", b"a").await;
-        inject(&fixture.store, Fault::Persist);
-        assert_code!(
-            fixture.try_stage("incoming.txt", b"b"),
-            "staged_files_unavailable"
-        );
-        fixture.resolve(&previous.id).await;
-        fixture.restart().await;
-        fixture.resolve(&previous.id).await;
-        inject(&fixture.store, Fault::Delete);
-        let incoming = fixture.stage("incoming.txt", b"b").await;
-        assert_eq!(fixture.object_count(), 2);
-        assert_code!(
-            fixture.store.resolve(&fixture.principal, &previous.id),
-            "file_not_found"
-        );
-        fixture.restart().await;
-        assert_eq!(fixture.object_count(), 1);
-        fixture.resolve(&incoming.id).await;
-    }
-
-    #[tokio::test]
-    async fn existing_deterministic_object_is_reused() {
-        let fixture = Fixture::unbounded().await;
-        let first = fixture.stage("same.txt", b"same").await;
+    async fn existing_target_and_exact_reference_reconciliation() {
+        let fixture = Fixture::new((10, 10)).await;
+        let first = fixture.ok("same", b"same").await;
         fixture
             .store
             .update_index(|index| {
@@ -1018,47 +1030,26 @@ mod tests {
             })
             .await
             .unwrap();
-        let second = fixture.stage("same.txt", b"same").await;
+        let second = fixture.ok("same", b"same").await;
         assert_eq!(first.id, second.id);
-        assert_eq!(fixture.object_count(), 1);
-        fixture.resolve(&second.id).await;
-    }
-
-    #[tokio::test]
-    async fn cleanup_failures_restore_live_files() {
-        for fault in [Fault::Delete, Fault::Persist] {
-            let mut fixture = Fixture::unbounded().await;
-            let file = fixture.stage("old.txt", b"old").await;
-            fixture.expire(&file.id).await;
-            inject(&fixture.store, fault);
-            assert_code!(fixture.store.cleanup(), "staged_files_unavailable");
-            assert!(!fixture.store.index.lock().await.files[&file.id].expired);
-            assert!(fixture.store.object_path(&file.id).exists());
-            fixture.restart().await;
-            fixture.resolve(&file.id).await;
-        }
-    }
-    #[tokio::test]
-    async fn bulk_reference_updates_reconcile_and_rollback() {
-        let fixture = Fixture::unbounded().await;
-        let file = fixture.stage("file.txt", b"file").await;
+        assert_eq!(fixture.state(Some(&second.id)).await, (1, 1, 0, true));
         fixture
             .store
-            .set_session_references("stale", std::slice::from_ref(&file.id))
+            .set_session_references("stale", std::slice::from_ref(&second.id))
             .await
             .unwrap();
         fixture
             .store
-            .reconcile_references(&BTreeSet::from([("expected".into(), file.id.clone())]))
+            .reconcile_references(&BTreeSet::from([("expected".into(), second.id.clone())]))
             .await
             .unwrap();
         inject(&fixture.store, Fault::Persist);
-        assert_code!(
-            fixture.store.remove_session_references("expected"),
-            "staged_files_unavailable"
+        code(
+            fixture.store.remove_session_references("expected").await,
+            "staged_files_unavailable",
         );
         assert_eq!(
-            fixture.store.index.lock().await.files[&file.id].references,
+            fixture.store.index.lock().await.files[&second.id].references,
             BTreeSet::from(["expected".into()])
         );
     }

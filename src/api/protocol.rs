@@ -200,8 +200,8 @@ mod tests {
 
     use super::*;
     use crate::claude_web_state::{
-        conversation_cache::CachedConversation,
-        explicit_session::{ExplicitConversation, ExplicitSessionState},
+        conversation_cache::{explicit_test_conversation, explicit_test_seed},
+        explicit_session::ExplicitSessionState,
     };
 
     fn multipart_body(boundary: &str, fields: &[(&str, &str, &str, &[u8])]) -> Vec<u8> {
@@ -295,29 +295,6 @@ mod tests {
         );
     }
 
-    fn cached_session(state: ExplicitSessionState) -> CachedConversation {
-        CachedConversation {
-            conv_uuid: "conversation".into(),
-            org_uuid: "org".into(),
-            cookie_id: "cookie".into(),
-            model: "model".into(),
-            is_pro: false,
-            system_hash: 0,
-            turns: Vec::new(),
-            created_at: chrono::Utc::now(),
-            last_used: chrono::Utc::now(),
-            valid: true,
-            explicit: Some(ExplicitConversation {
-                state,
-                model_digest: "model".into(),
-                system_digest: "system".into(),
-                turns: Vec::new(),
-                pending: None,
-                file_mappings: Default::default(),
-            }),
-        }
-    }
-
     async fn stage(
         files: &StagedFileStore,
         principal: &AuthPrincipal,
@@ -377,7 +354,7 @@ mod tests {
         let files = StagedFileStore::persistent_with_limits(file_dir.path(), 1, 2)
             .await
             .unwrap();
-        let mut session = cached_session(ExplicitSessionState::Committed);
+        let mut session = explicit_test_conversation(ExplicitSessionState::Committed);
         for (name, byte) in [("first.txt", b'a'), ("second.txt", b'b')] {
             let id = stage(&files, &principal, name, byte).await.unwrap();
             files.add_reference(&id, &key.session_ref()).await.unwrap();
@@ -388,7 +365,7 @@ mod tests {
                 .file_mappings
                 .insert(id, format!("upstream-{byte}"));
         }
-        cache.set_explicit(key.clone(), session).await;
+        explicit_test_seed(&cache, key.clone(), session).await;
 
         let app = reset_app(
             ResetApiState {
@@ -421,7 +398,10 @@ mod tests {
         let key = ExplicitSessionKey::new(principal.as_str(), "coordinated");
         let cache = ConversationCache::new();
         cache
-            .set_explicit_checked(key.clone(), cached_session(ExplicitSessionState::Committed))
+            .set_explicit_checked(
+                key.clone(),
+                explicit_test_conversation(ExplicitSessionState::Committed),
+            )
             .await
             .unwrap();
         let temp = tempfile::tempdir().unwrap();
