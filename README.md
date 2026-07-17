@@ -17,6 +17,21 @@ It keeps resource usage low, serves OpenAI-style endpoints, and ships with a Lep
 - Drops into existing OpenAI-compatible clients while keeping native Claude formats.
 - Typical production footprint: `<10 MB` RAM, `<1 s` startup, `~15 MB` binary.
 
+## API Reference
+
+The HTTP surface is split into three references maintained in the ClewdR
+project documentation space:
+
+- Claude Web: native Messages, OpenAI-compatible chat, staged files, and
+  explicit session reset (`TN-0006-claude-web-api-reference.md`).
+- Claude Code: native Messages, token counting, and OpenAI-compatible chat
+  (`TN-0007-claude-code-api-reference.md`).
+- Shared and admin: authentication, configuration, cookies, errors, and
+  `--no-fs` behavior (`TN-0008-shared-service-admin-api.md`).
+
+Only `messages` and `chat/completions` routes support streaming. Models,
+`count_tokens`, files, session reset, and admin routes return one JSON response.
+
 ## Supported Endpoints
 
 | Service | Endpoint |
@@ -28,7 +43,7 @@ It keeps resource usage low, serves OpenAI-style endpoints, and ships with a Lep
 | Claude Code | `http://127.0.0.1:8484/code/v1/messages` |
 | Claude Code OpenAI compatible | `http://127.0.0.1:8484/code/v1/chat/completions` |
 
-Streaming responses work on every endpoint.
+Streaming responses are available on `messages` and `chat/completions` routes.
 
 Versioned explicit sessions use `metadata.user_id` values beginning with
 `cherry_topic_v1_`. ClewdR binds each session to its selected Cookie, Claude
