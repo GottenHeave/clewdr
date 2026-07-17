@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -110,8 +110,22 @@ pub(crate) fn explicit_test_conversation(state: ExplicitSessionState) -> CachedC
             system_digest: "system".into(),
             turns: Vec::new(),
             pending: None,
+            file_mappings: Default::default(),
         }),
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn explicit_test_seed(
+    cache: &ConversationCache,
+    key: ExplicitSessionKey,
+    value: CachedConversation,
+) {
+    cache
+        .inner
+        .lock()
+        .await
+        .insert(StoredCacheKey::ExplicitSession(key), value);
 }
 
 #[cfg(test)]
@@ -185,6 +199,10 @@ impl ExplicitSessionKey {
             session_principal: session_principal.into(),
             session_digest: session_digest.into(),
         }
+    }
+
+    pub fn session_ref(&self) -> String {
+        format!("{}:{}", self.session_principal, self.session_digest)
     }
 }
 
@@ -334,6 +352,7 @@ pub struct ConversationCache {
     persist_path: Option<Arc<PathBuf>>,
     persist_lock: Arc<Mutex<()>>,
     explicit_mutation_lock: Arc<Mutex<()>>,
+    explicit_file_lock: Arc<Mutex<()>>,
     #[cfg(test)]
     persistence_attempts: Arc<AtomicUsize>,
 }
@@ -346,6 +365,7 @@ impl ConversationCache {
             persist_path: None,
             persist_lock: Arc::new(Mutex::new(())),
             explicit_mutation_lock: Arc::new(Mutex::new(())),
+            explicit_file_lock: Arc::new(Mutex::new(())),
             #[cfg(test)]
             persistence_attempts: Arc::new(AtomicUsize::new(0)),
         }
@@ -378,6 +398,7 @@ impl ConversationCache {
             persist_path: Some(Arc::new(persist_path)),
             persist_lock: Arc::new(Mutex::new(())),
             explicit_mutation_lock: Arc::new(Mutex::new(())),
+            explicit_file_lock: Arc::new(Mutex::new(())),
             #[cfg(test)]
             persistence_attempts: Arc::new(AtomicUsize::new(0)),
         }
@@ -391,6 +412,10 @@ impl ConversationCache {
     pub async fn get_explicit(&self, key: &ExplicitSessionKey) -> Option<CachedConversation> {
         self.get_stored(&StoredCacheKey::ExplicitSession(key.clone()))
             .await
+    }
+
+    pub async fn lock_explicit_files(&self) -> OwnedMutexGuard<()> {
+        self.explicit_file_lock.clone().lock_owned().await
     }
 
     async fn get_stored(&self, key: &StoredCacheKey) -> Option<CachedConversation> {
@@ -545,6 +570,23 @@ impl ConversationCache {
         Ok(())
     }
 
+    pub async fn restore_explicit_committed(
+        &self,
+        key: &ExplicitSessionKey,
+    ) -> Result<(), ProtocolError> {
+        self.mutate_explicit(key, |map, stored_key| {
+            let explicit = map
+                .get_mut(stored_key)
+                .and_then(|conversation| conversation.explicit.as_mut())
+                .ok_or_else(|| explicit_missing("Session disappeared before restoring state"))?;
+            explicit.state = ExplicitSessionState::Committed;
+            explicit.pending = None;
+            Ok(true)
+        })
+        .await?;
+        Ok(())
+    }
+
     pub async fn mark_explicit_uncertain_in_memory(&self, key: &ExplicitSessionKey) {
         let mut map = self.inner.lock().await;
         if let Some(explicit) = map
@@ -576,6 +618,65 @@ impl ConversationCache {
     pub async fn reset_explicit(&self, key: &ExplicitSessionKey) -> Result<bool, ProtocolError> {
         self.mutate_explicit(key, |map, stored_key| Ok(map.remove(stored_key).is_some()))
             .await
+    }
+
+    pub async fn explicit_file_mapping(
+        &self,
+        key: &ExplicitSessionKey,
+        staged_file_id: &str,
+    ) -> Option<String> {
+        self.get_explicit(key)
+            .await
+            .and_then(|conversation| conversation.explicit)
+            .and_then(|explicit| explicit.file_mappings.get(staged_file_id).cloned())
+    }
+
+    pub async fn explicit_staged_file_ids(&self, key: &ExplicitSessionKey) -> Vec<String> {
+        self.get_explicit(key)
+            .await
+            .and_then(|conversation| conversation.explicit)
+            .map(|explicit| explicit.file_mappings.into_keys().collect())
+            .unwrap_or_default()
+    }
+
+    pub async fn put_explicit_file_mapping(
+        &self,
+        key: &ExplicitSessionKey,
+        staged_file_id: &str,
+        upstream_file_id: &str,
+    ) -> Result<(), ProtocolError> {
+        self.mutate_explicit(key, |map, stored_key| {
+            let explicit = map
+                .get_mut(stored_key)
+                .and_then(|conversation| conversation.explicit.as_mut())
+                .ok_or_else(|| explicit_missing("Session disappeared while uploading a file"))?;
+            explicit
+                .file_mappings
+                .insert(staged_file_id.to_owned(), upstream_file_id.to_owned());
+            Ok(true)
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub async fn explicit_file_references(&self) -> BTreeSet<(String, String)> {
+        self.inner
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(stored_key, conversation)| match stored_key {
+                StoredCacheKey::ExplicitSession(key) => Some((key, conversation)),
+                StoredCacheKey::Legacy(_) => None,
+            })
+            .flat_map(|(key, conversation)| {
+                let session_ref = key.session_ref();
+                conversation
+                    .explicit
+                    .iter()
+                    .flat_map(|explicit| explicit.file_mappings.keys())
+                    .map(move |id| (session_ref.clone(), id.clone()))
+            })
+            .collect()
     }
 
     async fn mutate_explicit(
@@ -815,11 +916,7 @@ mod explicit_tests {
     }
 
     async fn seed(cache: &ConversationCache, key: ExplicitSessionKey, value: CachedConversation) {
-        cache
-            .inner
-            .lock()
-            .await
-            .insert(StoredCacheKey::ExplicitSession(key), value);
+        explicit_test_seed(cache, key, value).await;
     }
 
     #[tokio::test]

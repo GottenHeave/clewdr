@@ -1,6 +1,7 @@
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -54,6 +55,8 @@ pub struct ExplicitConversation {
     pub system_digest: String,
     pub turns: Vec<ExplicitTurn>,
     pub pending: Option<PendingExplicitTurn>,
+    #[serde(default)]
+    pub file_mappings: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -343,11 +346,6 @@ fn digest_message(message: &Message) -> Result<String, ProtocolError> {
 pub(super) fn content_error(error: ExplicitContentError) -> ProtocolError {
     match error.kind {
         ExplicitContentErrorKind::InvalidRequest => invalid_request(error.message),
-        ExplicitContentErrorKind::StagedFilesUnavailable => ProtocolError::new(
-            StatusCode::NOT_IMPLEMENTED,
-            "staged_files_unavailable",
-            error.message,
-        ),
     }
 }
 
@@ -425,6 +423,7 @@ mod tests {
             system_digest: "system".into(),
             turns: vec![turn(None, &["u1"], "a1")],
             pending: None,
+            file_mappings: Default::default(),
         };
         let reject = |users: &[&str], timeline: &[&str], model, system| {
             assert_eq!(
@@ -464,16 +463,13 @@ mod tests {
     }
 
     #[test]
-    fn staged_file_reference_is_explicitly_unavailable() {
+    fn staged_file_reference_is_part_of_explicit_identity() {
         let message: Message = serde_json::from_value(serde_json::json!({
             "role": "user",
             "content": [{"type":"container_upload", "file_id":"file_clewdr_v1_abc"}]
         }))
         .unwrap();
-        assert_eq!(
-            digest_messages(&[message]).unwrap_err().code,
-            "staged_files_unavailable"
-        );
+        assert!(digest_messages(&[message]).is_ok());
     }
 
     #[test]

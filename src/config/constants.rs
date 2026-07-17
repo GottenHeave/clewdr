@@ -12,6 +12,7 @@ use crate::{Args, config::ClewdrConfig};
 
 pub const CONFIG_NAME: &str = "clewdr.toml";
 pub const CONVERSATION_CACHE_NAME: &str = "conversation_cache.json";
+pub const STAGED_FILES_DIR_NAME: &str = "staged_files";
 pub const CLAUDE_ENDPOINT: &str = "https://api.anthropic.com/";
 #[allow(dead_code)]
 pub const CLAUDE_CONSOLE_ENDPOINT: &str = "https://console.anthropic.com/";
@@ -81,6 +82,13 @@ pub static CONVERSATION_CACHE_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
         .parent()
         .map(|path| path.join(CONVERSATION_CACHE_NAME))
         .unwrap_or_else(|| PathBuf::from(CONVERSATION_CACHE_NAME))
+});
+
+pub static STAGED_FILES_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
+    CONFIG_PATH
+        .parent()
+        .map(|path| path.join(STAGED_FILES_DIR_NAME))
+        .unwrap_or_else(|| PathBuf::from(STAGED_FILES_DIR_NAME))
 });
 
 #[cfg(feature = "portable")]

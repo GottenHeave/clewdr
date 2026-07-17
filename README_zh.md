@@ -17,16 +17,6 @@ ClewdR 是面向 Claude（Claude.ai、Claude Code）的 Rust 代理。
 - 同时支持 OpenAI 兼容接口和原生 Claude 协议，流式响应可用。
 - 典型占用：`<10 MB` 内存、`<1 秒` 启动、`~15 MB` 二进制。
 
-## 支持的端点
-
-| 服务 | 地址 |
-|------|------|
-| Claude 原生 | `http://127.0.0.1:8484/v1/messages` |
-| Claude OpenAI 兼容 | `http://127.0.0.1:8484/v1/chat/completions` |
-| Claude Code | `http://127.0.0.1:8484/code/v1/messages` |
-
-所有端点均支持流式返回。
-
 ## 快速开始
 
 1. 从 GitHub Releases 下载对应平台的最新版。  

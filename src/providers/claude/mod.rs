@@ -12,6 +12,7 @@ use crate::{
     error::ClewdrError,
     middleware::claude::{ClaudeApiFormat, ClaudeContext},
     protocol::AuthPrincipal,
+    protocol_files::StagedFileStore,
     services::cookie_actor::CookieActorHandle,
     types::claude::CreateMessageParams,
     utils::{enabled, print_out_json},
@@ -72,13 +73,19 @@ pub struct ClaudeProviderResponse {
 struct ClaudeSharedState {
     cookie_actor_handle: CookieActorHandle,
     conv_cache: ConversationCache,
+    staged_files: Option<Arc<StagedFileStore>>,
 }
 
 impl ClaudeSharedState {
-    fn new(cookie_actor_handle: CookieActorHandle, conv_cache: ConversationCache) -> Self {
+    fn new(
+        cookie_actor_handle: CookieActorHandle,
+        conv_cache: ConversationCache,
+        staged_files: Option<Arc<StagedFileStore>>,
+    ) -> Self {
         Self {
             cookie_actor_handle,
             conv_cache,
+            staged_files,
         }
     }
 }
@@ -90,8 +97,16 @@ pub struct ClaudeProviders {
 }
 
 impl ClaudeProviders {
-    pub fn new(cookie_actor_handle: CookieActorHandle, conv_cache: ConversationCache) -> Self {
-        let shared = Arc::new(ClaudeSharedState::new(cookie_actor_handle, conv_cache));
+    pub fn new(
+        cookie_actor_handle: CookieActorHandle,
+        conv_cache: ConversationCache,
+        staged_files: Option<Arc<StagedFileStore>>,
+    ) -> Self {
+        let shared = Arc::new(ClaudeSharedState::new(
+            cookie_actor_handle,
+            conv_cache,
+            staged_files,
+        ));
         let web = Arc::new(ClaudeWebProvider::new(shared.clone()));
         let code = Arc::new(ClaudeCodeProvider::new(shared.clone()));
         Self { web, code }
@@ -127,6 +142,7 @@ impl LLMProvider for ClaudeWebProvider {
             self.shared.cookie_actor_handle.clone(),
             self.shared.conv_cache.clone(),
         );
+        state.staged_files = self.shared.staged_files.clone();
         let stream = request.context.is_stream();
         state.api_format = request.context.api_format();
         state.stream = stream;
@@ -241,6 +257,7 @@ impl LLMProvider for ClaudeCodeProvider {
 pub fn build_providers(
     cookie_actor_handle: CookieActorHandle,
     conv_cache: ConversationCache,
+    staged_files: Option<Arc<StagedFileStore>>,
 ) -> ClaudeProviders {
-    ClaudeProviders::new(cookie_actor_handle, conv_cache)
+    ClaudeProviders::new(cookie_actor_handle, conv_cache, staged_files)
 }

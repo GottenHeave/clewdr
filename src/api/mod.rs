@@ -14,5 +14,4 @@ pub use error::ApiError;
 pub use misc::{
     api_auth, api_delete_cookie, api_get_cookies, api_get_models, api_post_cookie, api_version,
 };
-pub(crate) use protocol::api_reset_session;
-// merged above
+pub(crate) use protocol::{FileApiState, ResetApiState, api_reset_session, api_stage_file};

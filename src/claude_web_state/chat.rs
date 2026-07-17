@@ -182,6 +182,8 @@ impl ClaudeWebState {
     ) -> Result<axum::response::Response, ClewdrError> {
         let principal = self.principal.clone().ok_or(ClewdrError::InvalidAuth)?;
         let key = ExplicitSessionKey::new(principal.as_str(), &session_digest);
+        self.explicit_file_key = Some(key.clone());
+        self.explicit_completion_started = false;
         let operation = self.conv_cache.try_lock_explicit_operation(&key).await?;
         let digested = digest_messages(&p.messages)?;
         let user_digests = digested
@@ -303,7 +305,9 @@ impl ClaudeWebState {
 
         let send_result = self.send_explicit_operation(&prepared).await;
         self.pending_cache_write.take();
-        let response = self.finish_explicit_send(&key, send_result).await?;
+        let response = self
+            .finish_explicit_send(&key, existing.is_some(), send_result)
+            .await?;
         self.explicit_lifecycle = Some(ExplicitLifecycle::new(
             self.conv_cache.clone(),
             key,
@@ -315,6 +319,7 @@ impl ClaudeWebState {
     async fn finish_explicit_send(
         &self,
         key: &ExplicitSessionKey,
+        existing_session: bool,
         result: Result<Response, ClewdrError>,
     ) -> Result<Response, ClewdrError> {
         match result {
@@ -331,7 +336,11 @@ impl ClaudeWebState {
                 .into())
             }
             Err(error) => {
-                self.conv_cache.mark_explicit_uncertain(key).await?;
+                if existing_session && !self.explicit_completion_started {
+                    self.conv_cache.restore_explicit_committed(key).await?;
+                } else {
+                    self.conv_cache.mark_explicit_uncertain(key).await?;
+                }
                 Err(error)
             }
         }
@@ -465,6 +474,7 @@ impl ClaudeWebState {
                 system_digest: operation.system_digest.clone(),
                 turns: Vec::new(),
                 pending: Some(pending),
+                file_mappings: Default::default(),
             });
             self.conv_cache
                 .set_explicit_checked(key.clone(), *conversation)
@@ -654,6 +664,7 @@ impl ClaudeWebState {
             ))
             .expect("Url parse error");
 
+        self.explicit_completion_started = true;
         let response = self
             .build_request(Method::POST, endpoint)
             .json(&body)
@@ -743,6 +754,7 @@ impl ClaudeWebState {
             ))
             .expect("Url parse error");
 
+        self.explicit_completion_started = true;
         let response = self
             .build_request(Method::POST, endpoint)
             .json(&body)
@@ -833,6 +845,7 @@ impl ClaudeWebState {
             ))
             .expect("Url parse error");
 
+        self.explicit_completion_started = true;
         let response = self
             .build_request(Method::POST, endpoint)
             .json(&body)
@@ -905,7 +918,7 @@ impl ClaudeWebState {
 
     /// Builds the incremental body, preserving model, tools, thinking, and paprika settings.
     async fn build_incremental_body(
-        &self,
+        &mut self,
         bundled: &BundledMessages,
         turn: IncrementalTurn<'_>,
         p: &CreateMessageParams,
@@ -1050,7 +1063,7 @@ mod tests {
     };
 
     use crate::claude_web_state::conversation_cache::{
-        ConversationCache, explicit_test_conversation, explicit_test_state,
+        ConversationCache, explicit_test_conversation, explicit_test_seed, explicit_test_state,
     };
     use axum::{
         Router,
@@ -1211,6 +1224,23 @@ mod tests {
         request
     }
 
+    async fn stage_file(
+        store: &crate::protocol_files::StagedFileStore,
+        principal: &crate::protocol::AuthPrincipal,
+        name: &str,
+        bytes: &'static [u8],
+    ) -> crate::protocol_files::FileResponse {
+        store
+            .stage_stream(
+                principal,
+                name,
+                "application/octet-stream",
+                futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(bytes))]),
+            )
+            .await
+            .unwrap()
+    }
+
     async fn send_session(state: &mut ClaudeWebState, digest: &str, messages: Vec<Message>) {
         state
             .try_chat(session_request(digest, messages))
@@ -1339,15 +1369,105 @@ mod tests {
             panic!("expected protocol storage error");
         };
         assert_eq!(source.code, "session_storage_unavailable");
-        let requests = requests.recorded();
+        let recorded = requests.recorded();
         assert!(
-            requests[request_count..]
+            recorded[request_count..]
                 .iter()
                 .any(|request| request.path == "/api/bootstrap")
         );
-        assert!(!requests[request_count..].iter().any(|request| {
+        assert!(!recorded[request_count..].iter().any(|request| {
             request.path.contains("/upload-file") || request.path.contains("/completion")
         }));
+
+        let staged_dir = tempfile::tempdir().unwrap();
+        let files = crate::protocol_files::StagedFileStore::persistent(staged_dir.path())
+            .await
+            .unwrap();
+        let staged = stage_file(&files, &principal, "asset.png", b"image").await;
+        let blocks = [
+            json!({"type":"image","source":{"type":"file","file_id":staged.id}}),
+            json!({"type":"document","source":{"type":"file","file_id":staged.id}}),
+            json!({"type":"container_upload","file_id":staged.id}),
+        ];
+        let no_fs_message = serde_json::from_value(json!({
+            "role":"user", "content":[blocks[0].clone()]
+        }))
+        .unwrap();
+        let mut no_fs = ClaudeWebState::new(handle.clone(), ConversationCache::new());
+        no_fs.principal = Some(principal.clone());
+        let ClewdrError::Protocol { source } = no_fs
+            .try_chat(session_request(&"a1".repeat(32), vec![no_fs_message]))
+            .await
+            .unwrap_err()
+        else {
+            panic!("expected staged files error");
+        };
+        assert_eq!(source.code, "staged_files_unavailable");
+
+        let upload_start = requests.uploads.load(Ordering::SeqCst);
+        for (index, block) in blocks.into_iter().enumerate() {
+            let message: Message = serde_json::from_value(json!({
+                "role":"user", "content":[block.clone()]
+            }))
+            .unwrap();
+            let mut staged_state = ClaudeWebState::new(handle.clone(), ConversationCache::new());
+            staged_state.principal = Some(principal.clone());
+            staged_state.staged_files = Some(files.clone());
+            let digest = format!("{:064x}", index + 2);
+            send_session(&mut staged_state, &digest, vec![message.clone()]).await;
+            if index == 2 {
+                send_session(
+                    &mut staged_state,
+                    &digest,
+                    vec![
+                        message,
+                        assistant(),
+                        serde_json::from_value(json!({
+                            "role":"user", "content":[block]
+                        }))
+                        .unwrap(),
+                    ],
+                )
+                .await;
+            }
+        }
+        assert_eq!(requests.uploads.load(Ordering::SeqCst) - upload_start, 3);
+
+        let blocked = tempfile::tempdir().unwrap();
+        let parent = blocked.path().join("blocked");
+        std::fs::write(&parent, b"block").unwrap();
+        let cache = ConversationCache::persistent(parent.join("cache.json")).await;
+        let key = ExplicitSessionKey::new(principal.as_str(), "mapping-failure");
+        explicit_test_seed(
+            &cache,
+            key.clone(),
+            explicit_conversation(ExplicitSessionState::InFlight),
+        )
+        .await;
+        let limited_dir = tempfile::tempdir().unwrap();
+        let limited = crate::protocol_files::StagedFileStore::persistent_with_limits(
+            limited_dir.path(),
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+        let first = stage_file(&limited, &principal, "first", b"a").await;
+        let mut failed = ClaudeWebState::new(handle.clone(), cache);
+        failed.principal = Some(principal.clone());
+        failed.staged_files = Some(limited.clone());
+        failed.explicit_file_key = Some(key);
+        assert!(
+            failed
+                .upload_files(
+                    vec![ImageSource::File { file_id: first.id }],
+                    "org",
+                    "conversation",
+                )
+                .await
+                .is_err()
+        );
+        stage_file(&limited, &principal, "second", b"b").await;
 
         let partial = MockClaudeServer {
             fail_second_upload: true,
@@ -1384,6 +1504,34 @@ mod tests {
             ExplicitSessionState::Uncertain
         );
         assert!(cache.reset_explicit(&key).await.unwrap());
+        cache
+            .set_explicit_checked(
+                key.clone(),
+                explicit_conversation(ExplicitSessionState::InFlight),
+            )
+            .await
+            .unwrap();
+        let state = ClaudeWebState::new(handle.clone(), cache.clone());
+        state
+            .finish_explicit_send(
+                &key,
+                true,
+                Err(ClewdrError::BadRequest {
+                    msg: "upload failed",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            cache
+                .get_explicit(&key)
+                .await
+                .unwrap()
+                .explicit
+                .unwrap()
+                .state,
+            ExplicitSessionState::Committed
+        );
 
         let incomplete = MockClaudeServer {
             incomplete_completion: true,
@@ -1507,6 +1655,7 @@ mod tests {
             let error = state
                 .finish_explicit_send(
                     &key,
+                    true,
                     Err(ClewdrError::ClaudeHttpError {
                         code: status,
                         inner: crate::error::ClaudeErrorBody {

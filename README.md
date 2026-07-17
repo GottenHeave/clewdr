@@ -23,17 +23,24 @@ It keeps resource usage low, serves OpenAI-style endpoints, and ships with a Lep
 |---------|----------|
 | Claude.ai | `http://127.0.0.1:8484/v1/messages` |
 | Claude.ai session reset | `http://127.0.0.1:8484/v1/sessions/reset` |
+| Claude.ai staged files | `http://127.0.0.1:8484/v1/files` |
 | Claude.ai OpenAI compatible | `http://127.0.0.1:8484/v1/chat/completions` |
 | Claude Code | `http://127.0.0.1:8484/code/v1/messages` |
 | Claude Code OpenAI compatible | `http://127.0.0.1:8484/code/v1/chat/completions` |
 
-Streaming responses work on every endpoint.
+Streaming responses are available on `messages` and `chat/completions` routes.
 
 Versioned explicit sessions use `metadata.user_id` values beginning with
 `cherry_topic_v1_`. ClewdR binds each session to its selected Cookie, Claude
 Web conversation, and parent message. A `409` requires explicit client or user
 recovery rather than an automatic retry. After a `410`, call
 `/v1/sessions/reset` once before retrying the request.
+
+Upload large files to `/v1/files` as multipart form data containing exactly one
+field named `file`. The returned `file_clewdr_v1_*` ID can be referenced by
+image, document, and container upload content blocks in an explicit session.
+Staged files require filesystem persistence; with `--no-fs`, the upload endpoint
+and messages that reference staged IDs return `501 staged_files_unavailable`.
 
 ## Quick Start
 

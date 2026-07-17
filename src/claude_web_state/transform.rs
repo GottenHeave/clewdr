@@ -1,7 +1,6 @@
 use std::{fmt::Write, mem};
 
 use base64::{Engine, prelude::BASE64_STANDARD};
-use futures::{StreamExt, TryStreamExt, stream};
 use itertools::Itertools;
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -60,7 +59,7 @@ impl ClaudeWebState {
 
     /// Upload files through the conversation-scoped Claude.ai file service.
     pub async fn upload_files(
-        &self,
+        &mut self,
         files: Vec<ImageSource>,
         org_uuid: &str,
         conversation_uuid: &str,
@@ -71,69 +70,159 @@ impl ClaudeWebState {
                 source: Some(Box::new(source)),
             })?;
 
-        stream::iter(files)
-            .map(|file| {
-                let endpoint = endpoint.clone();
-                async move {
-                    let ImageSource::Base64 {
-                        media_type,
-                        data,
-                        file_name,
-                    } = file
-                    else {
-                        if let ImageSource::File { file_id } = file {
-                            return Ok(file_id);
-                        }
-                        return Err(crate::error::ClewdrError::BadRequest {
-                            msg: "Unsupported URL file source",
-                        });
-                    };
-                    let bytes = BASE64_STANDARD.decode(data).map_err(|error| {
-                        warn!("Failed to decode uploaded file: {error}");
-                        crate::error::ClewdrError::BadRequest {
-                            msg: "Invalid base64 file data",
-                        }
-                    })?;
-                    let main_type = media_type.split(';').next().unwrap_or(&media_type);
-                    let file_name = file_name
-                        .as_deref()
-                        .and_then(normalize_file_name)
-                        .unwrap_or_else(|| default_upload_file_name(main_type).to_string());
-                    let part = Part::bytes(bytes)
-                        .file_name(file_name)
-                        .mime_str(main_type)
-                        .map_err(|error| crate::error::ClewdrError::Whatever {
-                            message: "Invalid uploaded file media type".to_string(),
-                            source: Some(Box::new(error)),
-                        })?;
-                    let form = Form::new().part("file", part);
-                    let response = self
-                        .build_request(http::Method::POST, endpoint)
-                        .multipart(form)
-                        .send()
-                        .await
-                        .map_err(|source| crate::error::ClewdrError::WreqError {
-                            msg: "Failed to upload file",
-                            source,
-                        })?
-                        .check_claude()
-                        .await?;
-                    #[derive(serde::Deserialize)]
-                    struct UploadResponse {
-                        file_uuid: String,
-                    }
-                    let upload = response.json::<UploadResponse>().await.map_err(|source| {
-                        crate::error::ClewdrError::WreqError {
-                            msg: "Failed to parse file upload response",
-                            source,
-                        }
-                    })?;
-                    Ok(upload.file_uuid)
-                }
-            })
-            .buffered(5)
-            .try_collect()
+        let mut uploaded = Vec::with_capacity(files.len());
+        for file in files {
+            if let ImageSource::File { file_id } = &file
+                && file_id.starts_with("file_clewdr_v1_")
+                && self.explicit_file_key.is_some()
+            {
+                uploaded.push(self.upload_staged_file(file_id, endpoint.clone()).await?);
+            } else {
+                uploaded.push(self.upload_standard_file(file, endpoint.clone()).await?);
+            }
+        }
+        Ok(uploaded)
+    }
+
+    async fn upload_standard_file(
+        &self,
+        file: ImageSource,
+        endpoint: Url,
+    ) -> Result<String, crate::error::ClewdrError> {
+        let ImageSource::Base64 {
+            media_type,
+            data,
+            file_name,
+        } = file
+        else {
+            if let ImageSource::File { file_id } = file {
+                return Ok(file_id);
+            }
+            return Err(crate::error::ClewdrError::BadRequest {
+                msg: "Unsupported URL file source",
+            });
+        };
+        let bytes = BASE64_STANDARD.decode(data).map_err(|error| {
+            warn!("Failed to decode uploaded file: {error}");
+            crate::error::ClewdrError::BadRequest {
+                msg: "Invalid base64 file data",
+            }
+        })?;
+        let main_type = media_type.split(';').next().unwrap_or(&media_type);
+        let file_name = file_name
+            .as_deref()
+            .and_then(normalize_file_name)
+            .unwrap_or_else(|| default_upload_file_name(main_type).to_string());
+        let part = Part::bytes(bytes)
+            .file_name(file_name)
+            .mime_str(main_type)
+            .map_err(|error| crate::error::ClewdrError::Whatever {
+                message: "Invalid uploaded file media type".to_string(),
+                source: Some(Box::new(error)),
+            })?;
+        self.upload_file_part(
+            endpoint,
+            part,
+            "Failed to upload file",
+            "Failed to parse file upload response",
+        )
+        .await
+    }
+
+    async fn upload_staged_file(
+        &mut self,
+        staged_file_id: &str,
+        endpoint: Url,
+    ) -> Result<String, crate::error::ClewdrError> {
+        let key = self
+            .explicit_file_key
+            .clone()
+            .expect("staged files require an explicit session key");
+        if let Some(mapped) = self
+            .conv_cache
+            .explicit_file_mapping(&key, staged_file_id)
             .await
+        {
+            return Ok(mapped);
+        }
+        let store = self.staged_files.clone().ok_or_else(|| {
+            crate::protocol::ProtocolError::new(
+                http::StatusCode::NOT_IMPLEMENTED,
+                "staged_files_unavailable",
+                "Staged file references require filesystem persistence",
+            )
+        })?;
+        let principal = self.principal.as_ref().expect("authenticated principal");
+        let resolved = store.resolve(principal, staged_file_id).await?;
+        let part = Part::file(&resolved.path)
+            .await
+            .map_err(|error| crate::error::ClewdrError::Whatever {
+                message: "Failed to open staged file".to_string(),
+                source: Some(Box::new(error)),
+            })?
+            .file_name(resolved.filename.clone())
+            .mime_str(&resolved.mime_type)
+            .map_err(|error| crate::error::ClewdrError::Whatever {
+                message: "Invalid staged file media type".to_string(),
+                source: Some(Box::new(error)),
+            })?;
+        let upstream_file_id = self
+            .upload_file_part(
+                endpoint,
+                part,
+                "Failed to upload staged file",
+                "Failed to parse staged file upload response",
+            )
+            .await?;
+        let _files = self.conv_cache.lock_explicit_files().await;
+        let reference_added = store
+            .add_reference(staged_file_id, &key.session_ref())
+            .await?;
+        if let Err(error) = self
+            .conv_cache
+            .put_explicit_file_mapping(&key, staged_file_id, &upstream_file_id)
+            .await
+        {
+            if reference_added {
+                store
+                    .remove_reference(staged_file_id, &key.session_ref())
+                    .await?;
+            }
+            return Err(error.into());
+        }
+        Ok(upstream_file_id)
+    }
+
+    async fn upload_file_part(
+        &self,
+        endpoint: Url,
+        part: Part,
+        upload_error: &'static str,
+        parse_error: &'static str,
+    ) -> Result<String, crate::error::ClewdrError> {
+        let response = self
+            .build_request(http::Method::POST, endpoint)
+            .multipart(Form::new().part("file", part))
+            .send()
+            .await
+            .map_err(|source| crate::error::ClewdrError::WreqError {
+                msg: upload_error,
+                source,
+            })?
+            .check_claude()
+            .await?;
+        #[derive(serde::Deserialize)]
+        struct UploadResponse {
+            file_uuid: String,
+        }
+        response
+            .json::<UploadResponse>()
+            .await
+            .map(|upload| upload.file_uuid)
+            .map_err(|source| crate::error::ClewdrError::WreqError {
+                msg: parse_error,
+                source,
+            })
     }
 }
 

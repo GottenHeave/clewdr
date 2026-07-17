@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use axum::http::{HeaderValue, header::COOKIE};
 use serde_json::Value;
@@ -16,6 +16,7 @@ use crate::{
     config::{CLAUDE_ENDPOINT, CLEWDR_CONFIG, CookieStatus, Reason},
     error::{ClewdrError, WreqSnafu},
     middleware::claude::ClaudeApiFormat,
+    protocol_files::StagedFileStore,
     services::cookie_actor::CookieActorHandle,
     types::claude::{CreateMessageParams, Usage},
     utils::build_http_client,
@@ -76,6 +77,9 @@ pub struct ClaudeWebState {
     pub pending_cache_write: Option<PendingCacheWrite>,
     pub principal: Option<AuthPrincipal>,
     pub explicit_lifecycle: Option<ExplicitLifecycle>,
+    pub staged_files: Option<Arc<StagedFileStore>>,
+    pub explicit_file_key: Option<conversation_cache::ExplicitSessionKey>,
+    pub explicit_completion_started: bool,
 }
 
 impl ClaudeWebState {
@@ -100,6 +104,9 @@ impl ClaudeWebState {
             pending_cache_write: None,
             principal: None,
             explicit_lifecycle: None,
+            staged_files: None,
+            explicit_file_key: None,
+            explicit_completion_started: false,
         }
     }
 

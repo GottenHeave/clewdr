@@ -26,6 +26,7 @@ fn cached_conversation(id: &str) -> CachedConversation {
             system_digest: "system".into(),
             turns: Vec::new(),
             pending: None,
+            file_mappings: Default::default(),
         }),
     }
 }

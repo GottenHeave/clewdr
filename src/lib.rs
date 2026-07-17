@@ -12,6 +12,7 @@ pub mod config;
 pub mod error;
 pub mod middleware;
 pub mod protocol;
+pub mod protocol_files;
 pub mod providers;
 pub mod router;
 pub mod services;
