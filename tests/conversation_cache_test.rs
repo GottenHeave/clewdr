@@ -61,7 +61,7 @@ async fn cached_diff(
         &extract_user_hashes(&messages),
     )
 }
-
+/// Test: 3 sequential requests, verify 2nd and 3rd use cache
 #[tokio::test]
 async fn test_sequential_requests_use_cache() {
     let cache = ConversationCache::new();
@@ -135,6 +135,7 @@ async fn test_sequential_requests_use_cache() {
     }
 }
 
+/// Test: edit scenario (message modification -> fork)
 #[tokio::test]
 async fn test_edit_scenario_fork() {
     let sys_hash = hash_system(&None);
@@ -159,6 +160,7 @@ async fn test_edit_scenario_fork() {
     ));
 }
 
+/// Test: edit scenario with multi-turn fork
 #[tokio::test]
 async fn test_edit_scenario_fork_multi_turn() {
     let sys_hash = hash_system(&None);
@@ -194,6 +196,7 @@ async fn test_edit_scenario_fork_multi_turn() {
     }
 }
 
+/// Test: system prompt change -> full rebuild
 #[tokio::test]
 async fn test_system_prompt_change_full_rebuild() {
     let sys_hash1 = hash_system(&Some(serde_json::json!("system v1")));
@@ -212,6 +215,7 @@ async fn test_system_prompt_change_full_rebuild() {
     ));
 }
 
+/// Test: incremental failure -> fallback to full rebuild
 #[tokio::test]
 async fn test_incremental_failure_fallback() {
     let cache = ConversationCache::new();
@@ -250,6 +254,7 @@ async fn test_incremental_failure_fallback() {
     assert_eq!(cached.conv_uuid, "conv2");
 }
 
+/// Test: cookie rotation -> cache invalidation
 #[tokio::test]
 async fn test_cookie_rotation_invalidation() {
     let cache = ConversationCache::new();
@@ -269,6 +274,7 @@ async fn test_cookie_rotation_invalidation() {
     assert!(cached.is_none());
 }
 
+/// Test: cache cleanup removes expired entries
 #[tokio::test]
 async fn test_cache_cleanup() {
     let cache = ConversationCache::new();
@@ -289,6 +295,7 @@ async fn test_cache_cleanup() {
     cache.cleanup().await;
 }
 
+/// Test: cache key isolation
 #[tokio::test]
 async fn test_cache_key_isolation() {
     for (first, second) in [((0, 0), (1, 0)), ((0, 1), (0, 2))] {
@@ -310,6 +317,7 @@ async fn test_cache_key_isolation() {
     }
 }
 
+/// Test: persistent cache reloads valid entries from disk
 #[tokio::test]
 async fn test_persistent_cache_reloads_valid_entries() {
     let dir = tempfile::tempdir().unwrap();
@@ -338,6 +346,7 @@ async fn test_persistent_cache_reloads_valid_entries() {
     assert_eq!(cached.turns.len(), 1);
 }
 
+/// Test: persistent cache skips expired and invalid entries after restart
 #[tokio::test]
 async fn test_persistent_cache_skips_expired_and_invalid_entries() {
     let dir = tempfile::tempdir().unwrap();
@@ -373,6 +382,7 @@ async fn test_persistent_cache_skips_expired_and_invalid_entries() {
     );
 }
 
+/// Test: legacy cache entries remain loadable after a restart
 #[tokio::test]
 async fn test_persistent_cache_preserves_legacy_stream_health_shape() {
     #[derive(serde::Deserialize)]
