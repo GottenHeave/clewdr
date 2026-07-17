@@ -68,6 +68,7 @@ async fn test_sequential_requests_use_cache() {
     let key = cache_key(0, 0);
     let sys_hash = hash_system(&None);
 
+    // Request 1 stores the full user prefix and its assistant parent.
     let msgs1 = vec![
         make_user_msg("u1"),
         make_user_msg("u2"),
@@ -81,6 +82,7 @@ async fn test_sequential_requests_use_cache() {
     );
     cache.set(key.clone(), conv).await;
 
+    // Request 2 appends one user while preserving the cached parent.
     let msgs2 = vec![
         make_user_msg("u1"),
         make_user_msg("u2"),
@@ -103,10 +105,12 @@ async fn test_sequential_requests_use_cache() {
         _ => panic!("Expected Append, got {result:?}"),
     }
 
+    // Simulate the successful append before the next request.
     cache
         .append_turn(&key, turn(vec![hashes2[3].1], "asst1"))
         .await;
 
+    // Request 3 appends another user after the new cached turn.
     let msgs3 = vec![
         make_user_msg("u1"),
         make_user_msg("u2"),
@@ -134,6 +138,7 @@ async fn test_sequential_requests_use_cache() {
 #[tokio::test]
 async fn test_edit_scenario_fork() {
     let sys_hash = hash_system(&None);
+    // Editing a message in the first turn requires a complete rebuild.
     let hashes = extract_user_hashes(&[
         make_user_msg("u1"),
         make_user_msg("u2"),
@@ -157,6 +162,7 @@ async fn test_edit_scenario_fork() {
 #[tokio::test]
 async fn test_edit_scenario_fork_multi_turn() {
     let sys_hash = hash_system(&None);
+    // A mismatch in turn one forks from turn zero and retains the edited suffix.
     let hashes = extract_user_hashes(&[
         make_user_msg("u1"),
         make_user_msg("u2"),
@@ -192,6 +198,7 @@ async fn test_edit_scenario_fork_multi_turn() {
 async fn test_system_prompt_change_full_rebuild() {
     let sys_hash1 = hash_system(&Some(serde_json::json!("system v1")));
     let sys_hash2 = hash_system(&Some(serde_json::json!("system v2")));
+    // A changed system digest invalidates reuse even when user messages match.
     let hash = hash_user_message(&make_user_msg("u1"));
     assert!(matches!(
         cached_diff(
@@ -220,6 +227,7 @@ async fn test_incremental_failure_fallback() {
     );
     cache.set(key.clone(), conv).await;
 
+    // A failed incremental request invalidates the entry before send_full recreates it.
     cache.invalidate(&key).await;
     assert!(cache.get(&key).await.is_none());
     let new_msgs = vec![
@@ -255,6 +263,7 @@ async fn test_cookie_rotation_invalidation() {
     );
     cache.set(key.clone(), conv).await;
 
+    // Rotating a cookie invalidates every conversation bound to the old identity.
     cache.invalidate_by_cookie("cookie").await;
     let cached = cache.get(&key).await;
     assert!(cached.is_none());
@@ -266,6 +275,7 @@ async fn test_cache_cleanup() {
     let key = cache_key(0, 0);
     let sys_hash = hash_system(&None);
 
+    // Implicit entries use the 25-day TTL and are removed by cleanup.
     let mut conv = make_cached(
         "conv_expired",
         vec![turn(vec![hash_user_message(&make_user_msg("u1"))], "asst0")],
@@ -282,6 +292,7 @@ async fn test_cache_cleanup() {
 #[tokio::test]
 async fn test_cache_key_isolation() {
     for (first, second) in [((0, 0), (1, 0)), ((0, 1), (0, 2))] {
+        // Both key dimensions isolate cache records from each other.
         let cache = ConversationCache::new();
         let first = cache_key(first.0, first.1);
         let second = cache_key(second.0, second.1);
