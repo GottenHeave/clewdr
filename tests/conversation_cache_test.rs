@@ -21,7 +21,6 @@ fn turn(user_hashes: Vec<u64>, assistant_uuid: &str) -> CachedTurn {
     CachedTurn {
         user_hashes,
         assistant_uuid: assistant_uuid.to_owned(),
-        model: None,
     }
 }
 
@@ -134,31 +133,6 @@ async fn test_sequential_requests_use_cache() {
         }
         _ => panic!("Expected Append, got {result:?}"),
     }
-}
-
-#[tokio::test]
-async fn completed_turn_updates_cached_model_without_replacing_conversation() {
-    let cache = ConversationCache::new();
-    let key = cache_key(0, 0);
-    let mut conversation = make_cached("conv1", vec![], 0);
-    conversation.model = "old-model".into();
-    cache.set(key.clone(), conversation).await;
-
-    cache
-        .append_turn(
-            &key,
-            CachedTurn {
-                user_hashes: vec![],
-                assistant_uuid: "assistant-new".into(),
-                model: Some("new-model".into()),
-            },
-        )
-        .await;
-
-    let cached = cache.get(&key).await.unwrap();
-    assert_eq!(cached.conv_uuid, "conv1");
-    assert_eq!(cached.model, "new-model");
-    assert_eq!(cached.turns[0].model.as_deref(), Some("new-model"));
 }
 
 /// Test: edit scenario (message modification -> fork)

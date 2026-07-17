@@ -30,8 +30,6 @@ pub enum ExplicitSessionState {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplicitTurn {
-    #[serde(default)]
-    pub model: Option<String>,
     pub parent_uuid_before: Option<String>,
     pub user_digests: Vec<String>,
     pub assistant_uuid_after: String,
@@ -42,10 +40,6 @@ pub struct ExplicitTurn {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingExplicitTurn {
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub model_digest: Option<String>,
     pub parent_uuid_before: Option<String>,
     pub user_digests: Vec<String>,
     pub assistant_uuid_after: String,
@@ -214,7 +208,7 @@ pub fn plan(
     explicit: Option<&ExplicitConversation>,
     user_digests: &[String],
     timeline: &[String],
-    _model_digest: &str,
+    model_digest: &str,
     system_digest: &str,
 ) -> Result<ExplicitReusePlan, ProtocolError> {
     let Some(explicit) = explicit else {
@@ -237,8 +231,8 @@ pub fn plan(
         }
         ExplicitSessionState::Committed => {}
     }
-    if explicit.system_digest != system_digest {
-        return Err(reuse_failed("System prompt changed"));
+    if explicit.model_digest != model_digest || explicit.system_digest != system_digest {
+        return Err(reuse_failed("Model or system prompt changed"));
     }
     let result = plan_turns(&explicit.turns, user_digests)?;
     validate_timeline(&explicit.turns, user_digests, timeline, &result)?;
@@ -386,7 +380,6 @@ mod tests {
 
     fn turn(parent: Option<&str>, users: &[&str], assistant: &str) -> ExplicitTurn {
         ExplicitTurn {
-            model: None,
             parent_uuid_before: parent.map(str::to_owned),
             user_digests: users.iter().map(|value| (*value).to_owned()).collect(),
             assistant_uuid_after: assistant.to_owned(),
@@ -423,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn timeline_and_system_mismatches_are_rejected_but_model_changes_are_allowed() {
+    fn timeline_model_system_and_prefill_mismatches_are_rejected() {
         let explicit = ExplicitConversation {
             state: ExplicitSessionState::Committed,
             model_digest: "model".into(),
@@ -459,21 +452,8 @@ mod tests {
             "model",
             "system",
         );
+        reject(&["u1", "u2"], &valid, "changed-model", "system");
         reject(&["u1", "u2"], &valid, "model", "changed-system");
-        assert!(matches!(
-            plan(
-                Some(&explicit),
-                &["u1".into(), "u2".into()],
-                &valid
-                    .iter()
-                    .map(|value| (*value).into())
-                    .collect::<Vec<_>>(),
-                "changed-model",
-                "system",
-            )
-            .unwrap(),
-            ExplicitReusePlan::Append { .. }
-        ));
         reject(
             &["u1"],
             &["user:u1", "assistant:prefill"],

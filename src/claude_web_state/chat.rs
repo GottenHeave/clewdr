@@ -407,7 +407,6 @@ impl ClaudeWebState {
                     turns: vec![CachedTurn {
                         user_hashes: user_hashes.to_vec(),
                         assistant_uuid: assistant_uuid.clone(),
-                        model: Some(p.model.clone()),
                     }],
                     created_at: chrono::Utc::now(),
                     last_used: chrono::Utc::now(),
@@ -420,7 +419,6 @@ impl ClaudeWebState {
                 turn: CachedTurn {
                     user_hashes: user_hashes.to_vec(),
                     assistant_uuid: assistant_uuid.clone(),
-                    model: Some(p.model.clone()),
                 },
             },
             ExplicitReusePlan::Fork { .. } | ExplicitReusePlan::Regenerate { .. } => {
@@ -430,7 +428,6 @@ impl ClaudeWebState {
                     turn: CachedTurn {
                         user_hashes: user_hashes.to_vec(),
                         assistant_uuid: assistant_uuid.clone(),
-                        model: Some(p.model.clone()),
                     },
                 }
             }
@@ -462,8 +459,6 @@ impl ClaudeWebState {
             | PendingCacheWrite::ForkAndAppend { turn, .. } => (turn.assistant_uuid, None),
         };
         let pending = PendingExplicitTurn {
-            model: Some(operation.request.model.clone()),
-            model_digest: Some(operation.model_digest.clone()),
             parent_uuid_before: operation.parent_uuid.clone(),
             user_digests: operation.user_digests.clone(),
             assistant_uuid_after,
@@ -529,10 +524,9 @@ impl ClaudeWebState {
             return None;
         }
         if cached.model != p.model {
-            info!(
-                "[CACHE] switching model for conversation: {} -> {}",
-                cached.model, p.model
-            );
+            info!("[CACHE] model changed: {} → {}", cached.model, p.model);
+            self.conv_cache.invalidate(&key).await;
+            return None;
         }
         if cached.is_pro != self.is_pro() {
             info!("[CACHE] pro status changed");
@@ -1230,21 +1224,6 @@ mod tests {
         request
     }
 
-    fn session_request_with_model(
-        digest: &str,
-        messages: Vec<Message>,
-        model: &str,
-    ) -> CreateMessageParams {
-        let mut request = params(messages);
-        request.model = model.into();
-        request.metadata = Some(Metadata {
-            fields: [("user_id".into(), format!("cherry_topic_v1_{digest}"))]
-                .into_iter()
-                .collect(),
-        });
-        request
-    }
-
     async fn stage_file(
         store: &crate::protocol_files::StagedFileStore,
         principal: &crate::protocol::AuthPrincipal,
@@ -1349,7 +1328,7 @@ mod tests {
         assert_eq!(rich[0]["attachments"], rich[1]["attachments"]);
         assert_eq!(rich[1]["files"], json!(["uploaded-file"]));
         assert_eq!(rich[1]["attachments"][0]["file_name"], "notes.txt");
-        let _initial_request_count = {
+        let request_count = {
             let completions = requests.completions();
             assert_eq!(completions.len(), 8);
             assert!(
@@ -1372,54 +1351,6 @@ mod tests {
             );
             requests.recorded().len()
         };
-
-        let switched_messages = vec![
-            user("u1"),
-            assistant(),
-            user("changed"),
-            assistant(),
-            user("next"),
-        ];
-        let first_switch = state
-            .try_chat(session_request_with_model(
-                &digest,
-                switched_messages.clone(),
-                "claude-opus-4-6",
-            ))
-            .await;
-        assert!(
-            first_switch.is_ok(),
-            "first model switch failed: {first_switch:?}"
-        );
-        let switched_back_messages = vec![
-            user("u1"),
-            assistant(),
-            user("changed"),
-            assistant(),
-            user("next"),
-            assistant(),
-            user("back"),
-        ];
-        let second_switch = state
-            .try_chat(session_request_with_model(
-                &digest,
-                switched_back_messages,
-                "claude-sonnet-4-6",
-            ))
-            .await;
-        assert!(
-            second_switch.is_ok(),
-            "second model switch failed: {second_switch:?}"
-        );
-        let switched = cache.get_explicit(&key).await.unwrap();
-        assert_eq!(switched.conv_uuid, conversation_uuid);
-        assert_eq!(switched.model, "claude-sonnet-4-6");
-        assert_eq!(switched.turns[2].model.as_deref(), Some("claude-opus-4-6"));
-        assert_eq!(
-            switched.turns[3].model.as_deref(),
-            Some("claude-sonnet-4-6")
-        );
-        let request_count = requests.recorded().len();
 
         let dir = tempfile::tempdir().unwrap();
         let blocker = dir.path().join("not-a-directory");
@@ -1666,7 +1597,6 @@ mod tests {
         explicit
             .turns
             .push(crate::claude_web_state::explicit_session::ExplicitTurn {
-                model: None,
                 parent_uuid_before: None,
                 user_digests: vec![user_digest.clone()],
                 assistant_uuid_after: "assistant".into(),

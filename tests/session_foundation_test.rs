@@ -37,8 +37,6 @@ fn session(digest: char) -> ExplicitSessionKey {
 
 fn pending(assistant_uuid: &str, replace_from_turn: usize) -> PendingExplicitTurn {
     PendingExplicitTurn {
-        model: None,
-        model_digest: None,
         parent_uuid_before: None,
         user_digests: vec![assistant_uuid.into()],
         assistant_uuid_after: assistant_uuid.into(),
