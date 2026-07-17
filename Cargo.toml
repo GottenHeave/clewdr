@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 arc-swap = "1"
+atomic-write-file = "0.3"
 async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }

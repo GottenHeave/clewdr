@@ -1,3 +1,6 @@
+use std::{io::Write, path::Path};
+
+use atomic_write_file::AtomicWriteFile;
 use axum::body::Body;
 use colored::{ColoredString, Colorize};
 use tokio::spawn;
@@ -9,6 +12,26 @@ use crate::{
     config::{CLEWDR_CONFIG, LOG_DIR},
     error::ClewdrError,
 };
+
+pub async fn write_json_atomically(
+    path: &Path,
+    value: &impl serde::Serialize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let data = serde_json::to_vec_pretty(value)?;
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let mut file = AtomicWriteFile::open(path)?;
+        file.write_all(&data)?;
+        file.commit()
+    })
+    .await??;
+    Ok(())
+}
 
 /// Helper function to format a boolean value as "Enabled" or "Disabled"
 pub fn enabled(flag: bool) -> ColoredString {

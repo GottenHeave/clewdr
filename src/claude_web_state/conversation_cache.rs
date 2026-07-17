@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::{TimestampSecondsWithFrac, serde_as};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::warn;
+
+use crate::utils::write_json_atomically;
 
 const CACHE_FILE_VERSION: u32 = 1;
 
@@ -47,7 +49,7 @@ pub struct CachedConversation {
     pub created_at: DateTime<Utc>,
     /// Last time this conversation was successfully used
     pub last_used: DateTime<Utc>,
-    /// Whether cache is currently valid (set to false on stream errors)
+    /// Whether this cache entry is currently valid for reuse.
     pub valid: bool,
 }
 
@@ -68,15 +70,45 @@ impl CachedConversation {
     }
 }
 
-/// Cache key: identifies a unique "conversation slot"
-/// First version: one conversation per (cookie, key_index) pair
-/// This means each downstream API key gets one cached conversation per cookie
+/// Cache key for an implicit request family.
+///
+/// The downstream key index and request fingerprint together identify one
+/// conversation slot. The fingerprint keeps auxiliary request families from
+/// sharing the conversation used by ordinary chat requests.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheKey {
-    /// Index of the downstream API key in config (from self.key)
+    /// Index of the downstream API key in configuration.
     pub key_index: usize,
-    /// Request-family fingerprint used to isolate auxiliary requests.
+    /// Stable fingerprint of the request family and its relevant options.
     pub request_fingerprint: u64,
+}
+
+/// Identity of a caller-managed explicit session.
+///
+/// Explicit sessions use a separate key space from implicit request families,
+/// so a session cannot accidentally reuse an unrelated cached conversation.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplicitSessionKey {
+    session_principal: String,
+    session_digest: String,
+}
+
+impl ExplicitSessionKey {
+    pub fn new(session_principal: impl Into<String>, session_digest: impl Into<String>) -> Self {
+        Self {
+            session_principal: session_principal.into(),
+            session_digest: session_digest.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredCacheKey {
+    /// Legacy cache entries addressed by downstream key and request family.
+    Legacy(CacheKey),
+    /// Explicit sessions addressed by their authenticated principal and token.
+    ExplicitSession(ExplicitSessionKey),
 }
 
 #[serde_as]
@@ -138,7 +170,9 @@ impl From<PersistedConversation> for CachedConversation {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedCacheEntry {
-    key: CacheKey,
+    /// The key is persisted with the conversation so entries retain their
+    /// isolation after a process restart.
+    key: StoredCacheKey,
     conversation: PersistedConversation,
 }
 
@@ -149,7 +183,7 @@ struct PersistedConversationCache {
 }
 
 impl PersistedConversationCache {
-    fn from_map(map: &HashMap<CacheKey, CachedConversation>) -> Self {
+    fn from_map(map: &HashMap<StoredCacheKey, CachedConversation>) -> Self {
         Self {
             version: CACHE_FILE_VERSION,
             conversations: map
@@ -163,10 +197,15 @@ impl PersistedConversationCache {
     }
 }
 
-/// Thread-safe conversation cache
+/// Thread-safe conversation cache.
+///
+/// `inner` protects the in-memory entries, `persist_lock` serializes snapshots
+/// written to disk, and `operation_locks` provides one async lock per key so
+/// concurrent turns for the same conversation cannot interleave.
 #[derive(Clone)]
 pub struct ConversationCache {
-    inner: Arc<Mutex<HashMap<CacheKey, CachedConversation>>>,
+    inner: Arc<Mutex<HashMap<StoredCacheKey, CachedConversation>>>,
+    operation_locks: Arc<Mutex<HashMap<StoredCacheKey, Weak<Mutex<()>>>>>,
     persist_path: Option<Arc<PathBuf>>,
     persist_lock: Arc<Mutex<()>>,
 }
@@ -175,6 +214,7 @@ impl ConversationCache {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            operation_locks: Arc::new(Mutex::new(HashMap::new())),
             persist_path: None,
             persist_lock: Arc::new(Mutex::new(())),
         }
@@ -203,17 +243,61 @@ impl ConversationCache {
         };
         Self {
             inner: Arc::new(Mutex::new(inner)),
+            operation_locks: Arc::new(Mutex::new(HashMap::new())),
             persist_path: Some(Arc::new(persist_path)),
             persist_lock: Arc::new(Mutex::new(())),
         }
     }
 
     pub async fn get(&self, key: &CacheKey) -> Option<CachedConversation> {
+        self.get_stored(&StoredCacheKey::Legacy(key.clone())).await
+    }
+
+    pub async fn get_explicit(&self, key: &ExplicitSessionKey) -> Option<CachedConversation> {
+        self.get_stored(&StoredCacheKey::ExplicitSession(key.clone()))
+            .await
+    }
+
+    async fn get_stored(&self, key: &StoredCacheKey) -> Option<CachedConversation> {
         let map = self.inner.lock().await;
         map.get(key).filter(|c| c.valid && !c.is_expired()).cloned()
     }
 
+    pub async fn lock_operation(&self, key: &CacheKey) -> OwnedMutexGuard<()> {
+        self.lock_stored_operation(StoredCacheKey::Legacy(key.clone()))
+            .await
+    }
+
+    pub async fn lock_explicit_operation(&self, key: &ExplicitSessionKey) -> OwnedMutexGuard<()> {
+        self.lock_stored_operation(StoredCacheKey::ExplicitSession(key.clone()))
+            .await
+    }
+
+    async fn lock_stored_operation(&self, key: StoredCacheKey) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.operation_locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+
     pub async fn set(&self, key: CacheKey, conv: CachedConversation) {
+        self.set_stored(StoredCacheKey::Legacy(key), conv).await;
+    }
+
+    pub async fn set_explicit(&self, key: ExplicitSessionKey, conv: CachedConversation) {
+        self.set_stored(StoredCacheKey::ExplicitSession(key), conv)
+            .await;
+    }
+
+    async fn set_stored(&self, key: StoredCacheKey, conv: CachedConversation) {
         {
             let mut map = self.inner.lock().await;
             map.insert(key, conv);
@@ -223,6 +307,16 @@ impl ConversationCache {
 
     /// Append a new turn to an existing cached conversation
     pub async fn append_turn(&self, key: &CacheKey, turn: CachedTurn) {
+        self.append_stored_turn(&StoredCacheKey::Legacy(key.clone()), turn)
+            .await;
+    }
+
+    pub async fn append_explicit_turn(&self, key: &ExplicitSessionKey, turn: CachedTurn) {
+        self.append_stored_turn(&StoredCacheKey::ExplicitSession(key.clone()), turn)
+            .await;
+    }
+
+    async fn append_stored_turn(&self, key: &StoredCacheKey, turn: CachedTurn) {
         let updated = {
             let mut map = self.inner.lock().await;
             if let Some(conv) = map.get_mut(key) {
@@ -240,6 +334,30 @@ impl ConversationCache {
 
     /// Truncate turns and append a new one (fork scenario)
     pub async fn fork_and_append(&self, key: &CacheKey, from_index: usize, turn: CachedTurn) {
+        self.fork_and_append_stored(&StoredCacheKey::Legacy(key.clone()), from_index, turn)
+            .await;
+    }
+
+    pub async fn fork_and_append_explicit(
+        &self,
+        key: &ExplicitSessionKey,
+        from_index: usize,
+        turn: CachedTurn,
+    ) {
+        self.fork_and_append_stored(
+            &StoredCacheKey::ExplicitSession(key.clone()),
+            from_index,
+            turn,
+        )
+        .await;
+    }
+
+    async fn fork_and_append_stored(
+        &self,
+        key: &StoredCacheKey,
+        from_index: usize,
+        turn: CachedTurn,
+    ) {
         let updated = {
             let mut map = self.inner.lock().await;
             if let Some(conv) = map.get_mut(key) {
@@ -258,6 +376,16 @@ impl ConversationCache {
 
     /// Mark a cached conversation as invalid
     pub async fn invalidate(&self, key: &CacheKey) {
+        self.invalidate_stored(&StoredCacheKey::Legacy(key.clone()))
+            .await;
+    }
+
+    pub async fn invalidate_explicit(&self, key: &ExplicitSessionKey) {
+        self.invalidate_stored(&StoredCacheKey::ExplicitSession(key.clone()))
+            .await;
+    }
+
+    async fn invalidate_stored(&self, key: &StoredCacheKey) {
         let updated = {
             let mut map = self.inner.lock().await;
             if let Some(conv) = map.get_mut(key) {
@@ -311,12 +439,14 @@ impl ConversationCache {
         let Some(path) = self.persist_path.as_deref() else {
             return;
         };
+        // Hold the persistence lock while taking and writing one snapshot so
+        // concurrent mutations cannot publish partially ordered cache files.
         let _guard = self.persist_lock.lock().await;
         let snapshot = {
             let map = self.inner.lock().await;
             PersistedConversationCache::from_map(&map)
         };
-        if let Err(err) = Self::write_to_path(path, &snapshot).await {
+        if let Err(err) = write_json_atomically(path, &snapshot).await {
             warn!(
                 "[CACHE] failed to persist conversation cache to {}: {}",
                 path.display(),
@@ -327,8 +457,10 @@ impl ConversationCache {
 
     async fn load_from_path(
         path: &Path,
-    ) -> Result<HashMap<CacheKey, CachedConversation>, Box<dyn std::error::Error + Send + Sync>>
+    ) -> Result<HashMap<StoredCacheKey, CachedConversation>, Box<dyn std::error::Error + Send + Sync>>
     {
+        // Invalid, expired, or unknown-version entries are omitted at load
+        // time; callers only observe reusable conversations.
         let data = match tokio::fs::read_to_string(path).await {
             Ok(data) if data.trim().is_empty() => return Ok(HashMap::new()),
             Ok(data) => data,
@@ -353,33 +485,5 @@ impl ConversationCache {
             }
         }
         Ok(map)
-    }
-
-    async fn write_to_path(
-        path: &Path,
-        snapshot: &PersistedConversationCache,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(parent) = path.parent()
-            && !parent.exists()
-        {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let tmp_path = path.with_extension("json.tmp");
-        let data = serde_json::to_vec_pretty(snapshot)?;
-        tokio::fs::write(&tmp_path, data).await?;
-        match tokio::fs::rename(&tmp_path, path).await {
-            Ok(()) => Ok(()),
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                let _ = tokio::fs::remove_file(path).await;
-                tokio::fs::rename(&tmp_path, path).await?;
-                Ok(())
-            }
-            Err(err) => Err(Box::new(err)),
-        }
     }
 }
