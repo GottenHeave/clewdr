@@ -264,6 +264,7 @@ mod tests {
             vec![CachedTurn {
                 user_hashes: vec![hashes[0].1, hashes[1].1],
                 assistant_uuid: "asst1".to_string(),
+                model: None,
             }],
             sys_hash,
         );
@@ -296,6 +297,7 @@ mod tests {
             vec![CachedTurn {
                 user_hashes: vec![hashes[0].1],
                 assistant_uuid: "asst1".to_string(),
+                model: None,
             }],
             sys_hash1,
         );
@@ -314,6 +316,7 @@ mod tests {
             vec![CachedTurn {
                 user_hashes: vec![12345u64], // mismatching hash
                 assistant_uuid: "asst1".to_string(),
+                model: None,
             }],
             hash_system(&None),
         );
@@ -339,10 +342,12 @@ mod tests {
                 CachedTurn {
                     user_hashes: vec![hashes[0].1],
                     assistant_uuid: "asst0".to_string(),
+                    model: None,
                 },
                 CachedTurn {
                     user_hashes: vec![u2_original_hash], // mismatch at turn 1
                     assistant_uuid: "asst1".to_string(),
+                    model: None,
                 },
             ],
             hash_system(&None),
@@ -377,6 +382,7 @@ mod tests {
             vec![CachedTurn {
                 user_hashes: vec![hashes[0].1],
                 assistant_uuid: "asst1".to_string(),
+                model: None,
             }],
             sys_hash,
         );
@@ -399,10 +405,12 @@ mod tests {
                 CachedTurn {
                     user_hashes: vec![hashes[0].1],
                     assistant_uuid: "asst0".to_string(),
+                    model: None,
                 },
                 CachedTurn {
                     user_hashes: vec![99999u64], // additional turn that new messages don't have
                     assistant_uuid: "asst1".to_string(),
+                    model: None,
                 },
             ],
             sys_hash,

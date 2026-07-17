@@ -363,6 +363,8 @@ mod explicit_session_tests {
         let operation = cache.try_lock_explicit_operation(&key).await.unwrap();
         let mut conversation = explicit_test_conversation(ExplicitSessionState::InFlight);
         conversation.explicit.as_mut().unwrap().pending = Some(PendingExplicitTurn {
+            model: None,
+            model_digest: None,
             parent_uuid_before: None,
             user_digests: vec!["user".into()],
             assistant_uuid_after: "assistant".into(),

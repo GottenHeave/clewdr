@@ -62,6 +62,9 @@ pub struct CachedTurn {
     pub user_hashes: Vec<u64>,
     /// Assistant UUID used as the parent for the next request.
     pub assistant_uuid: String,
+    /// Model selected for this turn. Legacy cache entries may omit it.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// A conversation record shared by implicit cache reuse and explicit sessions.
@@ -73,7 +76,7 @@ pub struct CachedConversation {
     pub org_uuid: String,
     /// Cookie identity; a different cookie represents a different account.
     pub cookie_id: String,
-    /// Model used to create the conversation.
+    /// Model selected for the most recently completed turn.
     pub model: String,
     /// Whether the account was pro when the conversation was created.
     pub is_pro: bool,
@@ -521,21 +524,32 @@ impl ConversationCache {
             let conversation = map
                 .get_mut(stored_key)
                 .ok_or_else(|| explicit_missing("Session disappeared before commit"))?;
+            let pending = conversation
+                .explicit
+                .as_mut()
+                .ok_or_else(|| explicit_missing("Session metadata is unavailable"))?
+                .pending
+                .take()
+                .ok_or_else(|| explicit_missing("Session has no pending turn"))?;
+            if let Some(model) = &pending.model {
+                conversation.model = model.clone();
+            }
             let explicit = conversation
                 .explicit
                 .as_mut()
                 .ok_or_else(|| explicit_missing("Session metadata is unavailable"))?;
-            let pending = explicit
-                .pending
-                .take()
-                .ok_or_else(|| explicit_missing("Session has no pending turn"))?;
+            if let Some(model_digest) = &pending.model_digest {
+                explicit.model_digest = model_digest.clone();
+            }
             conversation.turns.truncate(pending.replace_from_turn);
             conversation.turns.push(CachedTurn {
                 user_hashes: Vec::new(),
                 assistant_uuid: pending.assistant_uuid_after.clone(),
+                model: pending.model.clone(),
             });
             explicit.turns.truncate(pending.replace_from_turn);
             explicit.turns.push(ExplicitTurn {
+                model: pending.model.clone(),
                 parent_uuid_before: pending.parent_uuid_before,
                 user_digests: pending.user_digests,
                 assistant_uuid_after: pending.assistant_uuid_after,
@@ -724,6 +738,9 @@ impl ConversationCache {
         let updated = {
             let mut map = self.inner.lock().await;
             if let Some(conv) = map.get_mut(key) {
+                if let Some(model) = &turn.model {
+                    conv.model = model.clone();
+                }
                 conv.turns.push(turn);
                 conv.last_used = Utc::now();
                 true
@@ -751,6 +768,9 @@ impl ConversationCache {
         let updated = {
             let mut map = self.inner.lock().await;
             if let Some(conv) = map.get_mut(key) {
+                if let Some(model) = &turn.model {
+                    conv.model = model.clone();
+                }
                 conv.truncate_turns(from_index);
                 conv.turns.push(turn);
                 conv.last_used = Utc::now();
@@ -893,6 +913,8 @@ mod explicit_tests {
 
     fn pending() -> PendingExplicitTurn {
         PendingExplicitTurn {
+            model: None,
+            model_digest: None,
             parent_uuid_before: None,
             user_digests: vec!["user".into()],
             assistant_uuid_after: "assistant".into(),
