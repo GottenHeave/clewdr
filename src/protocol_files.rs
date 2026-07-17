@@ -928,6 +928,8 @@ mod tests {
         limited.expire(&first.id).await;
         limited.store.cleanup().await.unwrap();
         limited.restart().await;
+        limited.ok("live", b"1234").await;
+        limited.ok("incoming", b"1234").await;
         code(
             limited.store.resolve(&principal(), &first.id).await,
             "file_expired",
