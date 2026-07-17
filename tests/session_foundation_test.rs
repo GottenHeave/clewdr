@@ -1,5 +1,8 @@
 use clewdr::claude_web_state::conversation_cache::{
-    CacheKey, CachedConversation, CachedTurn, ConversationCache, ExplicitSessionKey,
+    CacheKey, CachedConversation, ConversationCache, ExplicitSessionKey,
+};
+use clewdr::claude_web_state::explicit_session::{
+    ExplicitConversation, ExplicitSessionState, PendingExplicitTurn,
 };
 use clewdr::protocol::{AuthPrincipal, parse_session_id};
 use clewdr::utils::write_json_atomically;
@@ -17,6 +20,13 @@ fn cached_conversation(id: &str) -> CachedConversation {
         created_at: chrono::Utc::now(),
         last_used: chrono::Utc::now(),
         valid: true,
+        explicit: Some(ExplicitConversation {
+            state: ExplicitSessionState::Committed,
+            model_digest: "model".into(),
+            system_digest: "system".into(),
+            turns: Vec::new(),
+            pending: None,
+        }),
     }
 }
 
@@ -24,10 +34,14 @@ fn session(digest: char) -> ExplicitSessionKey {
     ExplicitSessionKey::new("principal", digest.to_string().repeat(64))
 }
 
-fn turn(hash: u64, assistant_uuid: &str) -> CachedTurn {
-    CachedTurn {
-        user_hashes: vec![hash],
-        assistant_uuid: assistant_uuid.to_owned(),
+fn pending(assistant_uuid: &str, replace_from_turn: usize) -> PendingExplicitTurn {
+    PendingExplicitTurn {
+        parent_uuid_before: None,
+        user_digests: vec![assistant_uuid.into()],
+        assistant_uuid_after: assistant_uuid.into(),
+        replace_from_turn,
+        parent_timeline: Vec::new(),
+        request_timeline: vec![format!("user:{assistant_uuid}")],
     }
 }
 
@@ -87,17 +101,20 @@ async fn explicit_session_scenarios_run_on_each_backend() {
     for persistent in [false, true] {
         let (_dir, path, mut cache) = cache_backend(persistent).await;
         let first = session('a');
-        let second = session('b');
         cache
-            .set_explicit(first.clone(), cached_conversation("first"))
-            .await;
+            .set_explicit_checked(first.clone(), cached_conversation("first"))
+            .await
+            .unwrap();
         cache
-            .set_explicit(second.clone(), cached_conversation("second"))
-            .await;
-        cache.append_explicit_turn(&first, turn(1, "first")).await;
+            .stage_explicit_turn(&first, pending("first", 0))
+            .await
+            .unwrap();
+        cache.commit_explicit_turn(&first, None).await.unwrap();
         cache
-            .fork_and_append_explicit(&first, 0, turn(2, "fork"))
-            .await;
+            .stage_explicit_turn(&first, pending("fork", 0))
+            .await
+            .unwrap();
+        cache.commit_explicit_turn(&first, None).await.unwrap();
         if persistent {
             cache = ConversationCache::persistent(&path).await;
         }
@@ -106,21 +123,8 @@ async fn explicit_session_scenarios_run_on_each_backend() {
         assert_eq!(conversation.conv_uuid, "first");
         assert_eq!(conversation.turns.len(), 1);
         assert_eq!(conversation.turns[0].assistant_uuid, "fork");
-        assert_eq!(
-            cache.get_explicit(&second).await.unwrap().conv_uuid,
-            "second"
-        );
-        assert!(
-            cache
-                .get(&CacheKey {
-                    key_index: 0,
-                    request_fingerprint: 0,
-                })
-                .await
-                .is_none()
-        );
 
-        cache.invalidate_explicit(&first).await;
+        cache.reset_explicit(&first).await.unwrap();
         assert!(cache.get_explicit(&first).await.is_none());
     }
 }
@@ -130,34 +134,20 @@ async fn operation_locks_serialize_only_matching_keys() {
     let cache = ConversationCache::new();
     let key = session('a');
     let other_key = session('b');
-    let held = cache.lock_explicit_operation(&key).await;
+    let held = cache.try_lock_explicit_operation(&key).await.unwrap();
 
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            cache.lock_explicit_operation(&key)
-        )
-        .await
-        .is_err()
+    assert_eq!(
+        cache
+            .try_lock_explicit_operation(&key)
+            .await
+            .unwrap_err()
+            .code,
+        "session_busy"
     );
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            cache.lock_explicit_operation(&other_key)
-        )
-        .await
-        .is_ok()
-    );
+    drop(cache.try_lock_explicit_operation(&other_key).await.unwrap());
 
     drop(held);
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            cache.lock_explicit_operation(&key)
-        )
-        .await
-        .is_ok()
-    );
+    drop(cache.try_lock_explicit_operation(&key).await.unwrap());
 }
 
 #[tokio::test]

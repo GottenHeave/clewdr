@@ -200,6 +200,7 @@ mod tests {
             created_at: Utc::now(),
             last_used: Utc::now(),
             valid: true,
+            explicit: None,
         }
     }
 

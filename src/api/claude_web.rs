@@ -5,6 +5,7 @@ use axum::{Extension, extract::State, response::Response};
 use crate::{
     error::ClewdrError,
     middleware::claude::{ClaudeContext, ClaudeWebPreprocess},
+    protocol::AuthPrincipal,
     providers::{
         LLMProvider,
         claude::{ClaudeInvocation, ClaudeProviderResponse, ClaudeWebProvider},
@@ -23,10 +24,15 @@ use crate::{
 /// * `Response` - Stream or JSON response from Claude
 pub async fn api_claude_web(
     State(provider): State<Arc<ClaudeWebProvider>>,
+    Extension(principal): Extension<AuthPrincipal>,
     ClaudeWebPreprocess(params, context): ClaudeWebPreprocess,
 ) -> Result<(Extension<ClaudeContext>, Response), ClewdrError> {
     let ClaudeProviderResponse { context, response } = provider
-        .invoke(ClaudeInvocation::messages(params, context.clone()))
+        .invoke(ClaudeInvocation::authenticated_messages(
+            params,
+            context.clone(),
+            principal,
+        ))
         .await?;
     Ok((Extension(context), response))
 }

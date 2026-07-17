@@ -25,6 +25,7 @@ pub struct RouterBuilder {
     claude_providers: ClaudeProviders,
     cookie_actor_handle: CookieActorHandle,
     inner: Router,
+    protocol_cache: ConversationCache,
 }
 
 impl RouterBuilder {
@@ -56,11 +57,12 @@ impl RouterBuilder {
         });
 
         let claude_providers =
-            crate::providers::claude::build_providers(cookie_handle.clone(), conv_cache);
+            crate::providers::claude::build_providers(cookie_handle.clone(), conv_cache.clone());
         RouterBuilder {
             claude_providers,
             cookie_actor_handle: cookie_handle,
             inner: Router::new(),
+            protocol_cache: conv_cache,
         }
     }
 
@@ -69,12 +71,22 @@ impl RouterBuilder {
     pub fn with_default_setup(self) -> Self {
         self.route_claude_code_endpoints()
             .route_claude_web_endpoints()
+            .route_protocol_endpoints()
             .route_admin_endpoints()
             .route_claude_web_oai_endpoints()
             .route_claude_code_oai_endpoints()
             .setup_static_serving()
             .with_tower_trace()
             .with_cors()
+    }
+
+    fn route_protocol_endpoints(mut self) -> Self {
+        let router = Router::new()
+            .route("/v1/sessions/reset", post(api_reset_session))
+            .layer(from_extractor::<RequireFlexibleAuth>())
+            .with_state(self.protocol_cache.clone());
+        self.inner = self.inner.merge(router);
+        self
     }
 
     /// Sets up routes for v1 endpoints

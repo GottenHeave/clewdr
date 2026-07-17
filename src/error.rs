@@ -22,6 +22,10 @@ use crate::{config::Reason, types::claude::Message};
 #[snafu(visibility(pub(crate)))]
 #[strum(serialize_all = "snake_case")]
 pub enum ClewdrError {
+    #[snafu(transparent)]
+    Protocol {
+        source: crate::protocol::ProtocolError,
+    },
     #[snafu(display("HTTP error: {}, at: {}", source, loc))]
     #[snafu(context(false))]
     HttpError {
@@ -168,6 +172,9 @@ pub enum ClewdrError {
 
 impl IntoResponse for ClewdrError {
     fn into_response(self) -> axum::response::Response {
+        if let ClewdrError::Protocol { source } = self {
+            return source.into_response();
+        }
         let (status, msg) = match self {
             ClewdrError::UrlError {
                 loc,

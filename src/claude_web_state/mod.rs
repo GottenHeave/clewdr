@@ -25,11 +25,14 @@ pub mod bootstrap;
 pub mod chat;
 pub mod conversation_cache;
 pub mod diff;
+pub mod explicit_session;
 mod transform;
 /// Placeholder
 pub static SUPER_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
 
+use crate::protocol::AuthPrincipal;
 use conversation_cache::{CacheKey, CachedConversation, CachedTurn, ConversationCache};
+use explicit_session::ExplicitLifecycle;
 
 /// Information needed to write cache after a successful response
 #[derive(Clone, Debug)]
@@ -37,7 +40,7 @@ pub enum PendingCacheWrite {
     /// First request: initialize cache with full conversation info
     Init {
         key: CacheKey,
-        conv: CachedConversation,
+        conv: Box<CachedConversation>,
     },
     /// Subsequent request: append a new turn
     AppendTurn { key: CacheKey, turn: CachedTurn },
@@ -71,6 +74,8 @@ pub struct ClaudeWebState {
     pub conv_cache: ConversationCache,
     /// Pending cache write info (set by send_chat, consumed after success)
     pub pending_cache_write: Option<PendingCacheWrite>,
+    pub principal: Option<AuthPrincipal>,
+    pub explicit_lifecycle: Option<ExplicitLifecycle>,
 }
 
 impl ClaudeWebState {
@@ -93,6 +98,8 @@ impl ClaudeWebState {
             last_params: None,
             conv_cache,
             pending_cache_write: None,
+            principal: None,
+            explicit_lifecycle: None,
         }
     }
 
@@ -162,6 +169,25 @@ impl ClaudeWebState {
             msg: "Failed to build client with new cookie",
         })?;
         self.cookie_header_value = HeaderValue::from_str(res.cookie.to_string().as_str())?;
+        Ok(res)
+    }
+
+    pub async fn request_session_cookie(
+        &mut self,
+        session_digest: &str,
+        required_cookie_id: Option<&str>,
+    ) -> Result<CookieStatus, ClewdrError> {
+        let res = self
+            .cookie_actor_handle
+            .request_session(session_digest, required_cookie_id)
+            .await?;
+        self.cookie = Some(res.clone());
+        self.proxy = CLEWDR_CONFIG.load().wreq_proxy.to_owned();
+        self.endpoint = CLEWDR_CONFIG.load().endpoint();
+        self.client = Self::build_client(self.proxy.as_ref()).context(WreqSnafu {
+            msg: "Failed to build client with session cookie",
+        })?;
+        self.cookie_header_value = HeaderValue::from_str(&res.cookie.to_string())?;
         Ok(res)
     }
 

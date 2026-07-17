@@ -13,6 +13,7 @@ use wreq::Proxy;
 use crate::{
     claude_code_state::ClaudeCodeState,
     claude_web_state::ClaudeWebState,
+    claude_web_state::explicit_session::digest_assistant_output,
     error::{CheckClaudeErr, ClewdrError},
     types::claude::{
         ContentBlock, CountMessageTokensResponse, CreateMessageParams, CreateMessageResponse,
@@ -21,65 +22,58 @@ use crate::{
     utils::print_out_text,
 };
 
-/// Merges server-sent events (SSE) from a stream into a single string
-/// Extracts and concatenates completion data from events
-///
-/// # Arguments
-/// * `stream` - Event stream to process
-///
-/// # Returns
-/// Combined completion text from all events
 pub async fn merge_sse(
     stream: EventStream<impl Stream<Item = Result<Bytes, wreq::Error>>>,
-) -> Result<String, ClewdrError> {
+) -> Result<(String, bool), ClewdrError> {
+    // Collect all SSE events so completion text can be merged and message_stop can
+    // decide whether an explicit lifecycle may commit the turn.
     #[derive(Deserialize)]
     struct Data {
         completion: String,
     }
-    Ok(stream
-        .try_filter_map(async |event| {
-            Ok(serde_json::from_str::<Data>(&event.data)
-                .map(|data| data.completion)
-                .ok())
-        })
-        .try_collect()
-        .await?)
+    let events = stream.try_collect::<Vec<_>>().await?;
+    let saw_message_stop = events
+        .iter()
+        .any(|event| is_message_stop(&event.event, &event.data));
+    let text = events
+        .iter()
+        .filter_map(|event| serde_json::from_str::<Data>(&event.data).ok())
+        .map(|data| data.completion)
+        .collect();
+    Ok((text, saw_message_stop))
+}
+
+fn is_message_stop(event: &str, data: &str) -> bool {
+    event == "message_stop"
+        || serde_json::from_str::<serde_json::Value>(data)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .is_some_and(|kind| kind == "message_stop")
 }
 
 impl<S> From<S> for Message
 where
     S: Into<String>,
 {
-    /// Converts a string into a Message with assistant role
-    ///
-    /// # Arguments
-    /// * `str` - The text content for the message
-    ///
-    /// # Returns
-    /// * `Message` - A message with assistant role and text content
     fn from(str: S) -> Self {
         Message::new_blocks(Role::Assistant, vec![ContentBlock::text(str.into())])
     }
 }
 
 impl ClaudeWebState {
-    /// Converts the response from the Claude Web into Claude API or OpenAI API format
-    ///
-    /// This method transforms streams of bytes from Claude's web response into the appropriate
-    /// format based on the client's requested API format (Claude or OpenAI). It handles both
-    /// streaming and non-streaming responses, and manages caching for responses.
-    ///
-    /// # Arguments
-    /// * `input` - The response stream from the Claude Web API
-    ///
-    /// # Returns
-    /// * `axum::response::Response` - Transformed response in the requested format
+    /// Converts Claude Web SSE into the requested API format while accounting usage and
+    /// finalizing explicit session state only after a complete stream.
     pub async fn transform_response(
         &mut self,
         wreq_res: wreq::Response,
     ) -> Result<axum::response::Response, ClewdrError> {
+        let explicit_lifecycle = self.explicit_lifecycle.take();
         if self.stream {
-            // Stream through while accumulating completion text; persist usage at end
             let mut input_tokens = self.usage.input_tokens as u64;
             let handle = self.cookie_actor_handle.clone();
             let cookie = self.cookie.clone();
@@ -88,7 +82,6 @@ impl ClaudeWebState {
             let endpoint = self.endpoint.clone();
             let proxy = self.proxy.clone();
             let client = self.client.clone();
-            // try to get precise input tokens via Claude Code count_tokens if enabled
             if crate::config::CLEWDR_CONFIG.load().enable_web_count_tokens
                 && let Some(tokens) = self.try_code_count_tokens().await
             {
@@ -100,11 +93,23 @@ impl ClaudeWebState {
                 .eventsource()
                 .map_err(axum::Error::new);
             let stream = try_stream! {
+                // Accumulate completion deltas for output-token accounting and assistant digest.
+                let lifecycle = explicit_lifecycle;
+                let mut explicit_finalized = false;
                 let mut acc = String::new();
                 #[derive(serde::Deserialize)]
                 struct Data { completion: String }
                 futures::pin_mut!(stream);
                 while let Some(event) = stream.try_next().await? {
+                    // message_stop is the commit boundary; EOF or downstream drop is uncertain.
+                    if is_message_stop(&event.event, &event.data)
+                        && let Some(lifecycle) = &lifecycle
+                    {
+                        let digest = (!acc.is_empty()).then(|| digest_assistant_output(&acc));
+                        lifecycle.commit(digest).await.map_err(axum::Error::new)?;
+                        explicit_finalized = true;
+                    }
+                    // Forward every event while accumulating only completion payloads.
                     if let Ok(d) = serde_json::from_str::<Data>(&event.data) {
                         acc.push_str(&d.completion);
                     }
@@ -112,10 +117,18 @@ impl ClaudeWebState {
                     let e = if let Some(retry) = event.retry { e.retry(retry) } else { e };
                     yield e.data(event.data);
                 }
-                // on end of stream, compute output tokens and persist totals
+                if let Some(lifecycle) = &lifecycle
+                    && !explicit_finalized
+                {
+                    lifecycle.uncertain().await.map_err(axum::Error::new)?;
+                    Err(axum::Error::new(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "Claude Web stream ended without message_stop",
+                    )))?;
+                }
                 if !acc.is_empty() {
-                    // Prefer official count_tokens if enabled and possible; else estimate locally
                     let mut out = None;
+                    // Prefer Claude Code token counting, then fall back to local response counting.
                     if enable_precise
                         && let Some(model) = last_params.as_ref().map(|p| p.model.clone())
                     {
@@ -148,7 +161,6 @@ impl ClaudeWebState {
                         let _ = handle.return_cookie(c, None).await;
                     }
                 } else if let Some(mut c) = cookie.clone() {
-                    // still persist input tokens to maintain parity
                     let family = last_params
                         .as_ref()
                         .map(|p| p.model.as_str())
@@ -167,7 +179,6 @@ impl ClaudeWebState {
                     let _ = handle.return_cookie(c, None).await;
                 }
             };
-            // normalize error type for axum SSE
             let stream = stream.map_err(|e: axum::Error| -> BoxError { e.into() });
             return Ok(Sse::new(stream)
                 .keep_alive(Default::default())
@@ -176,13 +187,34 @@ impl ClaudeWebState {
 
         let stream = wreq_res.bytes_stream();
         let stream = stream.eventsource();
-        let text = merge_sse(stream).await?;
+        let (text, saw_message_stop) = match merge_sse(stream).await {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(lifecycle) = explicit_lifecycle {
+                    lifecycle.uncertain().await?;
+                }
+                return Err(error);
+            }
+        };
+        if let Some(lifecycle) = explicit_lifecycle {
+            if saw_message_stop {
+                let digest = (!text.is_empty()).then(|| digest_assistant_output(&text));
+                lifecycle.commit(digest).await?;
+            } else {
+                lifecycle.uncertain().await?;
+                return Err(crate::protocol::ProtocolError::new(
+                    http::StatusCode::BAD_GATEWAY,
+                    "conversation_state_uncertain",
+                    "Claude Web response ended without message_stop",
+                )
+                .into());
+            }
+        }
 
         print_out_text(text.to_owned(), "claude_web_non_stream.txt");
         let mut response =
             CreateMessageResponse::text(text.clone(), Default::default(), self.usage.to_owned());
 
-        // Prefer official counting if enabled
         let enable_precise = crate::config::CLEWDR_CONFIG.load().enable_web_count_tokens;
         let mut usage = self.usage.to_owned();
         if enable_precise && let Some(inp) = self.try_code_count_tokens().await {
@@ -241,24 +273,20 @@ impl ClaudeWebState {
         code.endpoint = self.endpoint.clone();
         code.proxy = self.proxy.clone();
         code.client = self.client.clone();
-        // populate cookie header for Claude code API requests
         if let Some(ref c) = self.cookie
             && let Ok(val) = http::HeaderValue::from_str(&c.cookie.to_string())
         {
             code.set_cookie_header_value(val);
         }
 
-        // OAuth exchange to get access token
         let org = code.get_organization().await.ok()?;
         let exch = code.exchange_code(&org).await.ok()?;
         code.exchange_token(exch).await.ok()?;
         let access = code.cookie.as_ref()?.token.as_ref()?.access_token.clone();
 
-        // prepare body
         let mut body = params.clone();
         body.stream = Some(false);
 
-        // do count_tokens
         bearer_count_tokens(&code, &access, &body).await
     }
 }
@@ -294,4 +322,110 @@ async fn count_code_output_tokens_for_text(
     };
     // do not set count_tokens_allowed flag here to avoid races; handled by try_code_count_tokens
     bearer_count_tokens(&code, &access, &body).await
+}
+
+#[cfg(test)]
+mod explicit_session_tests {
+    use axum::{
+        Router, body, body::Body, http::header::CONTENT_TYPE, response::Response, routing::get,
+    };
+
+    use crate::{
+        claude_web_state::{
+            ClaudeWebState,
+            conversation_cache::{
+                ConversationCache, ExplicitSessionKey, explicit_test_conversation,
+            },
+            explicit_session::{ExplicitLifecycle, ExplicitSessionState, PendingExplicitTurn},
+        },
+        services::cookie_actor::CookieActorHandle,
+    };
+
+    async fn healthy_stream() -> Response {
+        Response::builder()
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(
+                "data: {\"type\":\"message_start\"}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+            ))
+            .unwrap()
+    }
+
+    async fn incomplete_stream() -> Response {
+        Response::builder()
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from("data: {\"type\":\"message_start\"}\n\n"))
+            .unwrap()
+    }
+
+    async fn setup_lifecycle() -> (ConversationCache, ExplicitSessionKey, ExplicitLifecycle) {
+        let cache = ConversationCache::new();
+        let key = ExplicitSessionKey::new("principal", "ab".repeat(32));
+        let operation = cache.try_lock_explicit_operation(&key).await.unwrap();
+        let mut conversation = explicit_test_conversation(ExplicitSessionState::InFlight);
+        conversation.explicit.as_mut().unwrap().pending = Some(PendingExplicitTurn {
+            parent_uuid_before: None,
+            user_digests: vec!["user".into()],
+            assistant_uuid_after: "assistant".into(),
+            replace_from_turn: 0,
+            parent_timeline: Vec::new(),
+            request_timeline: vec!["user:user".into()],
+        });
+        cache
+            .set_explicit_checked(key.clone(), conversation)
+            .await
+            .unwrap();
+        let lifecycle = ExplicitLifecycle::new(cache.clone(), key.clone(), operation);
+        (cache, key, lifecycle)
+    }
+
+    async fn upstream_response(path: &'static str) -> wreq::Response {
+        let app = Router::new()
+            .route("/healthy", get(healthy_stream))
+            .route("/incomplete", get(incomplete_stream));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        wreq::Client::new()
+            .get(format!("http://{address}/{path}"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn transform(lifecycle: ExplicitLifecycle, path: &'static str) -> Response {
+        let handle = CookieActorHandle::start().await.unwrap();
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
+        state.stream = true;
+        state.explicit_lifecycle = Some(lifecycle);
+        state
+            .transform_response(upstream_response(path).await)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn response_consumption_controls_explicit_lifecycle() {
+        for (path, consume, expected) in [
+            ("healthy", true, ExplicitSessionState::Committed),
+            ("incomplete", true, ExplicitSessionState::Uncertain),
+            ("healthy", false, ExplicitSessionState::Uncertain),
+        ] {
+            let (cache, key, lifecycle) = setup_lifecycle().await;
+            let response = transform(lifecycle, path).await;
+            if consume {
+                let result = body::to_bytes(response.into_body(), usize::MAX).await;
+                assert_eq!(result.is_ok(), path == "healthy");
+            } else {
+                drop(response);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let explicit = cache.get_explicit(&key).await.unwrap().explicit.unwrap();
+            assert_eq!(explicit.state, expected);
+            if expected == ExplicitSessionState::Committed {
+                assert_eq!(explicit.turns[0].assistant_uuid_after, "assistant");
+            }
+        }
+    }
 }

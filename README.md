@@ -22,11 +22,18 @@ It keeps resource usage low, serves OpenAI-style endpoints, and ships with a Lep
 | Service | Endpoint |
 |---------|----------|
 | Claude.ai | `http://127.0.0.1:8484/v1/messages` |
+| Claude.ai session reset | `http://127.0.0.1:8484/v1/sessions/reset` |
 | Claude.ai OpenAI compatible | `http://127.0.0.1:8484/v1/chat/completions` |
 | Claude Code | `http://127.0.0.1:8484/code/v1/messages` |
 | Claude Code OpenAI compatible | `http://127.0.0.1:8484/code/v1/chat/completions` |
 
 Streaming responses work on every endpoint.
+
+Versioned explicit sessions use `metadata.user_id` values beginning with
+`cherry_topic_v1_`. ClewdR binds each session to its selected Cookie, Claude
+Web conversation, and parent message. A `409` requires explicit client or user
+recovery rather than an automatic retry. After a `410`, call
+`/v1/sessions/reset` once before retrying the request.
 
 ## Quick Start
 
