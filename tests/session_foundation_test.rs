@@ -21,6 +21,30 @@ fn cached_conversation(id: &str) -> CachedConversation {
     }
 }
 
+fn session(digest: char) -> ExplicitSessionKey {
+    ExplicitSessionKey::new("principal", digest.to_string().repeat(64))
+}
+
+fn turn(hash: u64, assistant_uuid: &str) -> CachedTurn {
+    CachedTurn {
+        user_hashes: vec![hash],
+        assistant_uuid: assistant_uuid.to_owned(),
+    }
+}
+
+async fn cache_backend(
+    persistent: bool,
+) -> (tempfile::TempDir, std::path::PathBuf, ConversationCache) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("conversation_cache.json");
+    let cache = if persistent {
+        ConversationCache::persistent(&path).await
+    } else {
+        ConversationCache::new()
+    };
+    (dir, path, cache)
+}
+
 #[tokio::test]
 async fn reads_v1_cache_keys_without_a_scope_field() {
     let dir = tempfile::tempdir().unwrap();
@@ -60,41 +84,53 @@ async fn reads_v1_cache_keys_without_a_scope_field() {
 }
 
 #[tokio::test]
-async fn explicit_sessions_are_separate_cache_scopes() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("conversation_cache.json");
-    let cache = ConversationCache::persistent(&path).await;
-    let first = ExplicitSessionKey::new("principal", "a".repeat(64));
-    let second = ExplicitSessionKey::new("principal", "b".repeat(64));
-    cache
-        .set_explicit(first.clone(), cached_conversation("first"))
-        .await;
-    cache
-        .set_explicit(second.clone(), cached_conversation("second"))
-        .await;
-    let cache = ConversationCache::persistent(&path).await;
-
-    assert_eq!(cache.get_explicit(&first).await.unwrap().conv_uuid, "first");
-    assert_eq!(
-        cache.get_explicit(&second).await.unwrap().conv_uuid,
-        "second"
-    );
-    assert!(
+async fn explicit_session_scenarios_run_on_each_backend() {
+    for persistent in [false, true] {
+        let (_dir, path, mut cache) = cache_backend(persistent).await;
+        let first = session('a');
+        let second = session('b');
         cache
-            .get(&CacheKey {
-                key_index: 0,
-                request_fingerprint: 0,
-            })
-            .await
-            .is_none()
-    );
+            .set_explicit(first.clone(), cached_conversation("first"))
+            .await;
+        cache
+            .set_explicit(second.clone(), cached_conversation("second"))
+            .await;
+        cache.append_explicit_turn(&first, turn(1, "first")).await;
+        cache
+            .fork_and_append_explicit(&first, 0, turn(2, "fork"))
+            .await;
+        if persistent {
+            cache = ConversationCache::persistent(&path).await;
+        }
+
+        let conversation = cache.get_explicit(&first).await.unwrap();
+        assert_eq!(conversation.conv_uuid, "first");
+        assert_eq!(conversation.turns.len(), 1);
+        assert_eq!(conversation.turns[0].assistant_uuid, "fork");
+        assert_eq!(
+            cache.get_explicit(&second).await.unwrap().conv_uuid,
+            "second"
+        );
+        assert!(
+            cache
+                .get(&CacheKey {
+                    key_index: 0,
+                    request_fingerprint: 0,
+                })
+                .await
+                .is_none()
+        );
+
+        cache.invalidate_explicit(&first).await;
+        assert!(cache.get_explicit(&first).await.is_none());
+    }
 }
 
 #[tokio::test]
 async fn operation_locks_serialize_only_matching_keys() {
     let cache = ConversationCache::new();
-    let key = ExplicitSessionKey::new("principal", "a".repeat(64));
-    let other_key = ExplicitSessionKey::new("principal", "b".repeat(64));
+    let key = session('a');
+    let other_key = session('b');
     let held = cache.lock_explicit_operation(&key).await;
 
     assert!(
@@ -123,41 +159,6 @@ async fn operation_locks_serialize_only_matching_keys() {
         .await
         .is_ok()
     );
-}
-
-#[tokio::test]
-async fn explicit_session_mutations_use_the_explicit_scope() {
-    let cache = ConversationCache::new();
-    let key = ExplicitSessionKey::new("principal", "a".repeat(64));
-    cache
-        .set_explicit(key.clone(), cached_conversation("explicit"))
-        .await;
-    cache
-        .append_explicit_turn(
-            &key,
-            CachedTurn {
-                user_hashes: vec![1],
-                assistant_uuid: "first".to_owned(),
-            },
-        )
-        .await;
-    cache
-        .fork_and_append_explicit(
-            &key,
-            0,
-            CachedTurn {
-                user_hashes: vec![2],
-                assistant_uuid: "fork".to_owned(),
-            },
-        )
-        .await;
-
-    let conversation = cache.get_explicit(&key).await.unwrap();
-    assert_eq!(conversation.turns.len(), 1);
-    assert_eq!(conversation.turns[0].assistant_uuid, "fork");
-
-    cache.invalidate_explicit(&key).await;
-    assert!(cache.get_explicit(&key).await.is_none());
 }
 
 #[tokio::test]
