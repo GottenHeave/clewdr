@@ -24,9 +24,13 @@ use crate::{
     utils::{TIME_ZONE, print_out_json},
 };
 
+/// User content split into the Claude Web prompt, text attachments, and images.
 struct BundledMessages {
+    /// Short text stays in the prompt; long text is represented by an attachment.
     prompt: String,
+    /// Text documents extracted from user content.
     attachments: Vec<Attachment>,
+    /// Images uploaded before the completion request.
     #[allow(dead_code)]
     images: Vec<ImageSource>,
 }
@@ -100,6 +104,8 @@ fn create_conversation_params(
 }
 
 impl ClaudeWebState {
+    /// Routes explicit metadata sessions to the lifecycle path and retries implicit requests.
+    /// Cache validation happens before any upload or completion side effect.
     pub async fn try_chat(
         &mut self,
         p: CreateMessageParams,
@@ -137,6 +143,7 @@ impl ClaudeWebState {
 
             match transform_res.await {
                 Ok(b) => {
+                    // Commit cache state only after the response has been transformed successfully.
                     if let Some(pending) = state.pending_cache_write.take() {
                         state.commit_cache_write(pending).await;
                     }
@@ -147,6 +154,7 @@ impl ClaudeWebState {
                     return Ok(b);
                 }
                 Err(e) => {
+                    // Failed implicit requests cannot be reused on the next retry.
                     state.conv_cache.invalidate(&state.cache_key()).await;
                     state.pending_cache_write = None;
 
@@ -166,6 +174,7 @@ impl ClaudeWebState {
         Err(ClewdrError::TooManyRetries)
     }
 
+    /// Plans and stages an explicit operation before invoking the existing send paths.
     async fn try_explicit_chat(
         &mut self,
         p: CreateMessageParams,
@@ -574,6 +583,7 @@ impl ClaudeWebState {
         }
     }
 
+    /// Sends a new conversation request, including UUID generation and file uploads.
     async fn send_full(
         &mut self,
         p: CreateMessageParams,
@@ -604,8 +614,8 @@ impl ClaudeWebState {
 
         self.sync_model_selector_state(&p).await?;
 
-        // Claude Web generates the UUID client-side and creates the conversation
-        // as part of the first completion request.
+        // The client-generated UUID is sent with the first completion and becomes the
+        // conversation identity used by subsequent incremental requests.
         let new_uuid = prepared.conversation_uuid.clone();
         let is_temporary = !CLEWDR_CONFIG.load().preserve_chats;
         self.conv_uuid = Some(new_uuid.clone());
@@ -631,6 +641,7 @@ impl ClaudeWebState {
             self.pending_cache_write = Some(prepared.cache_write.clone());
         }
 
+        // Upload images before completion; a failed upload must not produce an upstream turn.
         let images = body.images.drain(..).collect::<Vec<_>>();
         let files = self.upload_files(images, &org_uuid, &new_uuid).await?;
         body.files = files;
@@ -658,6 +669,7 @@ impl ClaudeWebState {
         Ok(response)
     }
 
+    /// Appends new user messages to a validated conversation parent.
     async fn send_incremental(
         &mut self,
         cached: &CachedConversation,
@@ -693,6 +705,7 @@ impl ClaudeWebState {
             && self.is_pro();
         self.update_paprika(&cached.conv_uuid, need_thinking).await;
 
+        // Only the suffix selected by cache diff is forwarded; cached history stays upstream.
         let new_user_msgs: Vec<&Message> = new_user_indices
             .iter()
             .map(|&idx| &p.messages[idx])
@@ -745,6 +758,7 @@ impl ClaudeWebState {
         Ok(response)
     }
 
+    /// Sends an edited suffix from a parent UUID after truncating the cached timeline.
     async fn send_incremental_fork(
         &mut self,
         cached: &CachedConversation,
@@ -835,6 +849,7 @@ impl ClaudeWebState {
     }
 
     async fn update_paprika(&self, conv_uuid: &str, need_thinking: bool) {
+        // Claude Web keeps paprika mode on the conversation, so synchronize it before completion.
         let paprika = if need_thinking {
             "auto".into()
         } else {
@@ -873,6 +888,7 @@ impl ClaudeWebState {
                 source: Some(Box::new(e)),
             })?;
         let body = model_selector_state_body(p);
+        // Model selector state is a pro-account side request and must precede the completion.
 
         self.build_request(Method::PATCH, endpoint)
             .json(&body)
@@ -887,6 +903,7 @@ impl ClaudeWebState {
         Ok(())
     }
 
+    /// Builds the incremental body, preserving model, tools, thinking, and paprika settings.
     async fn build_incremental_body(
         &self,
         bundled: &BundledMessages,
@@ -914,6 +931,7 @@ impl ClaudeWebState {
         if let Some(parent_uuid) = turn.parent_uuid {
             body["parent_message_uuid"] = json!(parent_uuid);
         }
+        // Pro requests carry the model; all requests preserve effort and thinking controls.
         if self.is_pro() {
             body["model"] = json!(p.model);
         }
@@ -927,12 +945,14 @@ impl ClaudeWebState {
         if CLEWDR_CONFIG.load().web_search {
             tools.push(json!({"type": "web_search_v0", "name": "web_search"}));
         }
+        // Web search is opt-in and is forwarded only when enabled in ClewdR configuration.
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
         Ok(body)
     }
 
+    /// Extracts text/documents/images and applies the short-prompt versus attachment boundary.
     fn bundle_user_messages(
         &self,
         user_msgs: &[&Message],
@@ -951,10 +971,12 @@ impl ClaudeWebState {
             images.extend(normalized.images);
         }
 
+        // Explicit sessions use one newline for consecutive users; implicit callers pass two.
         let combined = texts.join(message_separator);
 
         const PROMPT_THRESHOLD: usize = 4000;
 
+        // Keep short text in the prompt; long text becomes one attachment for Claude Web.
         if combined.len() <= PROMPT_THRESHOLD {
             let mut prompt = combined;
             if prompt.is_empty() && (!attachments.is_empty() || !images.is_empty()) {

@@ -55,23 +55,37 @@ fn legacy_stream_health_default() -> bool {
     true
 }
 
+/// One completed Claude Web round trip stored for conversation reuse.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CachedTurn {
+    /// Hashes of the ordered user messages sent in this turn. Turn zero may bundle several users.
     pub user_hashes: Vec<u64>,
+    /// Assistant UUID used as the parent for the next request.
     pub assistant_uuid: String,
 }
 
+/// A conversation record shared by implicit cache reuse and explicit sessions.
 #[derive(Clone, Debug)]
 pub struct CachedConversation {
+    /// Claude Web conversation UUID.
     pub conv_uuid: String,
+    /// Organization UUID selected when the conversation was created.
     pub org_uuid: String,
+    /// Cookie identity; a different cookie represents a different account.
     pub cookie_id: String,
+    /// Model used to create the conversation.
     pub model: String,
+    /// Whether the account was pro when the conversation was created.
     pub is_pro: bool,
+    /// Hash of the system prompt; a change requires a full rebuild.
     pub system_hash: u64,
+    /// Ordered completed turns used to select append or fork reuse.
     pub turns: Vec<CachedTurn>,
+    /// Creation timestamp used by the implicit 25-day retention policy.
     pub created_at: DateTime<Utc>,
+    /// Last successful use, also used to age tombstoned explicit records.
     pub last_used: DateTime<Utc>,
+    /// Whether an implicit cache entry is eligible for reuse.
     pub valid: bool,
     /// Strict client-managed session state. Legacy cache entries leave this unset.
     pub explicit: Option<ExplicitConversation>,
@@ -115,6 +129,7 @@ pub(crate) async fn explicit_test_state(
 }
 
 impl CachedConversation {
+    /// Returns whether an implicit entry has exceeded the conservative 25-day TTL.
     pub fn is_expired(&self) -> bool {
         Utc::now() - self.created_at > Duration::days(25)
     }
@@ -129,15 +144,18 @@ impl CachedConversation {
         }
     }
 
+    /// Returns the assistant UUID that should be sent as `parent_message_uuid`.
     pub fn last_parent_uuid(&self) -> Option<&str> {
         self.turns.last().map(|t| t.assistant_uuid.as_str())
     }
 
+    /// Removes turns at and after an edit point before appending a forked turn.
     pub fn truncate_turns(&mut self, from_index: usize) {
         self.turns.truncate(from_index);
     }
 }
 
+/// Cache key for an implicit request family. Both dimensions are part of the scope.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheKey {
     pub key_index: usize,
@@ -151,6 +169,7 @@ pub struct ExplicitSessionKey {
 }
 
 impl ExplicitSessionKey {
+    /// Creates a key scoped to one authenticated principal and one client session digest.
     pub fn new(session_principal: impl Into<String>, session_digest: impl Into<String>) -> Self {
         Self {
             session_principal: session_principal.into(),
@@ -290,6 +309,7 @@ fn enforce_explicit_capacity(
 }
 
 #[derive(Clone)]
+/// Thread-safe cache for implicit conversations and scoped explicit session records.
 pub struct ConversationCache {
     inner: Arc<Mutex<HashMap<StoredCacheKey, CachedConversation>>>,
     operation_locks: Arc<Mutex<HashMap<StoredCacheKey, Weak<Mutex<()>>>>>,
@@ -345,6 +365,7 @@ impl ConversationCache {
         }
     }
 
+    /// Returns a retained implicit record, filtering expired or invalid entries.
     pub async fn get(&self, key: &CacheKey) -> Option<CachedConversation> {
         self.get_stored(&StoredCacheKey::Legacy(key.clone())).await
     }
@@ -574,6 +595,7 @@ impl ConversationCache {
         Ok(true)
     }
 
+    /// Appends a completed implicit turn and persists the resulting snapshot.
     pub async fn append_turn(&self, key: &CacheKey, turn: CachedTurn) {
         self.append_stored_turn(&StoredCacheKey::Legacy(key.clone()), turn)
             .await;
@@ -595,6 +617,7 @@ impl ConversationCache {
         }
     }
 
+    /// Truncates an implicit conversation at a fork point, appends the turn, and persists it.
     pub async fn fork_and_append(&self, key: &CacheKey, from_index: usize, turn: CachedTurn) {
         self.fork_and_append_stored(&StoredCacheKey::Legacy(key.clone()), from_index, turn)
             .await;
@@ -622,6 +645,7 @@ impl ConversationCache {
         }
     }
 
+    /// Marks an implicit entry unavailable so the caller falls back to a full request.
     pub async fn invalidate(&self, key: &CacheKey) {
         self.invalidate_stored(&StoredCacheKey::Legacy(key.clone()))
             .await;
@@ -642,6 +666,7 @@ impl ConversationCache {
         }
     }
 
+    /// Removes expired implicit entries and old explicit tombstones.
     pub async fn cleanup(&self) {
         let _explicit_mutation = self.explicit_mutation_lock.lock().await;
         let removed = {
@@ -655,7 +680,7 @@ impl ConversationCache {
         }
     }
 
-    /// Invalidate all entries for a given cookie_id (cookie rotation)
+    /// Invalidates all entries bound to a cookie after cookie rotation.
     pub async fn invalidate_by_cookie(&self, cookie_id: &str) {
         let updated = {
             let mut map = self.inner.lock().await;
