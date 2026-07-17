@@ -78,6 +78,7 @@ impl RouterBuilder {
         let cleanup_cache = conv_cache.clone();
         let cleanup_files = staged_files.clone();
         tokio::spawn(async move {
+            // Spawn periodic cleanup task (every hour)
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 interval.tick().await;
