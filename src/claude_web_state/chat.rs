@@ -1,13 +1,19 @@
+use std::sync::Arc;
+
 use colored::Colorize;
-use futures::TryFutureExt;
+use futures::{StreamExt, TryFutureExt};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use snafu::ResultExt;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 use wreq::{Method, Response, header::ACCEPT};
 
 use super::{ClaudeWebState, PendingCacheWrite};
 use crate::{
-    claude_web_state::conversation_cache::{CachedConversation, CachedTurn, ExplicitSessionKey},
+    claude_web_state::conversation_cache::{
+        CachedConversation, CachedTurn, ConversationCache, ExplicitOperationPermit,
+        ExplicitResponseSnapshot, ExplicitSessionKey,
+    },
     claude_web_state::diff::{self, DiffResult, extract_user_hashes, hash_system},
     claude_web_state::explicit_session::{
         ExplicitConversation, ExplicitLifecycle, ExplicitReusePlan, ExplicitSessionState,
@@ -23,6 +29,179 @@ use crate::{
     },
     utils::{TIME_ZONE, print_out_json},
 };
+
+const MAX_EXPLICIT_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+struct PreservedFileReferencesGuard {
+    cache: ConversationCache,
+    files: Arc<crate::protocol_files::StagedFileStore>,
+    key: ExplicitSessionKey,
+    armed: bool,
+}
+
+impl PreservedFileReferencesGuard {
+    fn new(
+        cache: ConversationCache,
+        files: Arc<crate::protocol_files::StagedFileStore>,
+        key: ExplicitSessionKey,
+    ) -> Self {
+        Self {
+            cache,
+            files,
+            key,
+            armed: true,
+        }
+    }
+
+    async fn reconcile_exclusive(&mut self) -> Result<(), ProtocolError> {
+        reconcile_explicit_file_references(&self.cache, &self.files, &self.key).await?;
+        self.armed = false;
+        Ok(())
+    }
+
+    async fn reconcile_after_operation(&mut self) -> Result<(), ProtocolError> {
+        let operation = self.cache.lock_explicit_operation(&self.key).await;
+        let result = self.reconcile_exclusive().await;
+        drop(operation);
+        result
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PreservedFileReferencesGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let cache = self.cache.clone();
+        let files = self.files.clone();
+        let key = self.key.clone();
+        tokio::spawn(async move {
+            let operation = cache.lock_explicit_operation(&key).await;
+            if let Err(error) = reconcile_explicit_file_references(&cache, &files, &key).await {
+                warn!("Failed to reconcile staged files after cancelled recovery: {error}");
+            }
+            drop(operation);
+        });
+    }
+}
+
+async fn reconcile_explicit_file_references(
+    cache: &ConversationCache,
+    files: &crate::protocol_files::StagedFileStore,
+    key: &ExplicitSessionKey,
+) -> Result<(), ProtocolError> {
+    let _files = cache.lock_explicit_files().await;
+    let staged_file_ids = cache.explicit_staged_file_ids(key).await;
+    files
+        .set_session_references(&key.session_ref(), &staged_file_ids)
+        .await
+}
+
+fn explicit_request_fingerprint(state: &ClaudeWebState, request: &CreateMessageParams) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"clewdr-explicit-request-v1\0");
+    digest.update(state.api_format.to_string().as_bytes());
+    digest.update([u8::from(state.stream)]);
+    digest.update(serde_json::to_vec(request).expect("request parameters serialize"));
+    hex::encode(digest.finalize())
+}
+
+fn replay_response(snapshot: ExplicitResponseSnapshot) -> axum::response::Response {
+    let mut response = axum::response::Response::new(axum::body::Body::from(snapshot.body));
+    *response.status_mut() = snapshot.status;
+    *response.headers_mut() = snapshot.headers;
+    response
+}
+
+async fn materialize_explicit_response(
+    response: axum::response::Response,
+) -> Result<(axum::response::Response, ExplicitResponseSnapshot), ClewdrError> {
+    let (parts, body) = response.into_parts();
+    let status = parts.status;
+    let headers = parts.headers.clone();
+    let mut stream = body.into_data_stream();
+    let mut buffered = bytes::BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| {
+            ProtocolError::new(
+                http::StatusCode::BAD_GATEWAY,
+                "conversation_state_uncertain",
+                "Claude Web response ended before a verified completion",
+            )
+        })?;
+        if buffered.len().saturating_add(chunk.len()) > MAX_EXPLICIT_RESPONSE_BYTES {
+            return Err(ProtocolError::new(
+                http::StatusCode::BAD_GATEWAY,
+                "explicit_response_too_large",
+                format!(
+                    "Explicit session response exceeds the {MAX_EXPLICIT_RESPONSE_BYTES} byte buffer limit"
+                ),
+            )
+            .into());
+        }
+        buffered.extend_from_slice(&chunk);
+    }
+    let body = buffered.freeze();
+    let snapshot = ExplicitResponseSnapshot {
+        status,
+        headers,
+        body: body.clone(),
+    };
+    Ok((
+        axum::response::Response::from_parts(parts, axum::body::Body::from(body)),
+        snapshot,
+    ))
+}
+
+fn recoverable_explicit_error(error: &ClewdrError) -> Option<&'static str> {
+    let ClewdrError::Protocol { source } = error else {
+        return None;
+    };
+    is_recoverable_protocol_error(source).then_some(source.code)
+}
+
+fn is_recoverable_protocol_error(error: &ProtocolError) -> bool {
+    matches!(
+        (error.status, error.code),
+        (http::StatusCode::CONFLICT, "conversation_reuse_failed")
+            | (http::StatusCode::CONFLICT, "conversation_state_uncertain")
+            | (
+                http::StatusCode::BAD_GATEWAY,
+                "conversation_state_uncertain"
+            )
+            | (http::StatusCode::GONE, "conversation_expired")
+    )
+}
+
+fn explicit_recovery_still_needed(
+    existing: Option<&CachedConversation>,
+    request: &CreateMessageParams,
+) -> Result<bool, ProtocolError> {
+    let Some(explicit) = existing.and_then(|conversation| conversation.explicit.as_ref()) else {
+        return Ok(false);
+    };
+    let digested = digest_messages(&request.messages)?;
+    let user_digests = digested
+        .users
+        .iter()
+        .map(|(_, digest)| digest.clone())
+        .collect::<Vec<_>>();
+    match plan(
+        Some(explicit),
+        &user_digests,
+        &digested.timeline,
+        &digest_model(&request.model),
+        &digest_system(&request.system),
+    ) {
+        Ok(_) => Ok(false),
+        Err(error) if is_recoverable_protocol_error(&error) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
 
 /// User content split into the Claude Web prompt, text attachments, and images.
 struct BundledMessages {
@@ -182,9 +361,160 @@ impl ClaudeWebState {
     ) -> Result<axum::response::Response, ClewdrError> {
         let principal = self.principal.clone().ok_or(ClewdrError::InvalidAuth)?;
         let key = ExplicitSessionKey::new(principal.as_str(), &session_digest);
+        let fingerprint = explicit_request_fingerprint(self, &p);
+        let mut recovery_attempted = false;
+        let mut preserved_file_references: Option<PreservedFileReferencesGuard> = None;
+        let mut operation = None;
+        loop {
+            match self
+                .try_explicit_chat_once(
+                    p.clone(),
+                    session_digest.clone(),
+                    operation.take(),
+                    preserved_file_references.is_some(),
+                )
+                .await
+            {
+                Ok(response) => {
+                    if let Some(mut references) = preserved_file_references.take() {
+                        references.disarm();
+                    }
+                    return Ok(response);
+                }
+                Err(error @ ClewdrError::InvalidCookie { .. }) => {
+                    let permit = self
+                        .conv_cache
+                        .lock_explicit_request(&key, fingerprint.clone())
+                        .await;
+                    if let Some(response) = permit.observed_replay() {
+                        if let Some(mut references) = preserved_file_references.take() {
+                            references.reconcile_after_operation().await?;
+                        }
+                        return Ok(replay_response(response));
+                    }
+                    if recovery_attempted {
+                        if let Some(mut references) = preserved_file_references.take() {
+                            references.reconcile_exclusive().await?;
+                        }
+                        return Err(error);
+                    }
+                    let ClewdrError::InvalidCookie { reason } = &error else {
+                        unreachable!()
+                    };
+                    self.return_cookie(Some(reason.clone())).await;
+                    preserved_file_references = self.reset_explicit_for_rebuild(&key).await?;
+                    self.pause_after_explicit_reset().await;
+                    self.clear_explicit_attempt_state();
+                    recovery_attempted = true;
+                    operation = Some(permit);
+                }
+                Err(error) => {
+                    let Some(code) = recoverable_explicit_error(&error) else {
+                        if let Some(mut references) = preserved_file_references.take() {
+                            references.reconcile_after_operation().await?;
+                        }
+                        return Err(error);
+                    };
+                    warn!(
+                        "[SESSION] recovering {code} by rebuilding explicit session {}",
+                        session_digest
+                    );
+                    #[cfg(test)]
+                    if let Some(barrier) = &self.explicit_recovery_barrier {
+                        barrier.wait().await;
+                    }
+                    let permit = self
+                        .conv_cache
+                        .lock_explicit_request(&key, fingerprint.clone())
+                        .await;
+                    if let Some(response) = permit.observed_replay() {
+                        if let Some(mut references) = preserved_file_references.take() {
+                            references.reconcile_after_operation().await?;
+                        }
+                        return Ok(replay_response(response));
+                    }
+                    if recovery_attempted {
+                        if let Some(mut references) = preserved_file_references.take() {
+                            references.reconcile_exclusive().await?;
+                        }
+                        return Err(error);
+                    }
+                    recovery_attempted = true;
+                    let existing = self.conv_cache.get_explicit(&key).await;
+                    let reset = explicit_recovery_still_needed(existing.as_ref(), &p)?;
+                    if reset {
+                        preserved_file_references = self.reset_explicit_for_rebuild(&key).await?;
+                        self.pause_after_explicit_reset().await;
+                    }
+                    self.clear_explicit_attempt_state();
+                    operation = Some(permit);
+                }
+            }
+        }
+    }
+
+    fn clear_explicit_attempt_state(&mut self) {
+        self.explicit_lifecycle = None;
+        self.explicit_file_key = None;
+        self.pending_cache_write = None;
+        self.explicit_completion_started = false;
+        self.conv_uuid = None;
+    }
+
+    #[cfg(test)]
+    async fn pause_after_explicit_reset(&self) {
+        if let Some((reached, release)) = &self.explicit_after_reset {
+            let released = release.notified();
+            reached.notify_one();
+            released.await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn pause_after_explicit_reset(&self) {}
+
+    async fn reset_explicit_for_rebuild(
+        &self,
+        key: &ExplicitSessionKey,
+    ) -> Result<Option<PreservedFileReferencesGuard>, ProtocolError> {
+        let mut references = self.staged_files.as_ref().map(|files| {
+            PreservedFileReferencesGuard::new(self.conv_cache.clone(), files.clone(), key.clone())
+        });
+        let _files = self.conv_cache.lock_explicit_files().await;
+        if let Err(error) = self.conv_cache.reset_explicit(key).await {
+            if let Some(references) = &mut references {
+                references.disarm();
+            }
+            return Err(error);
+        }
+        Ok(references)
+    }
+
+    async fn try_explicit_chat_once(
+        &mut self,
+        p: CreateMessageParams,
+        session_digest: String,
+        operation: Option<ExplicitOperationPermit>,
+        reconcile_file_references: bool,
+    ) -> Result<axum::response::Response, ClewdrError> {
+        let principal = self.principal.clone().ok_or(ClewdrError::InvalidAuth)?;
+        let key = ExplicitSessionKey::new(principal.as_str(), &session_digest);
+        let fingerprint = explicit_request_fingerprint(self, &p);
         self.explicit_file_key = Some(key.clone());
         self.explicit_completion_started = false;
-        let operation = self.conv_cache.try_lock_explicit_operation(&key).await?;
+        let operation = match operation {
+            Some(operation) => operation,
+            None => {
+                self.conv_cache
+                    .lock_explicit_request(&key, fingerprint.clone())
+                    .await
+            }
+        };
+        if let Some(response) = operation.observed_replay() {
+            return Ok(replay_response(response));
+        }
+        let (operation, replay) = operation.into_operation();
+        let replay = replay.expect("request operation owns a replay generation");
         let digested = digest_messages(&p.messages)?;
         let user_digests = digested
             .users
@@ -308,12 +638,45 @@ impl ClaudeWebState {
         let response = self
             .finish_explicit_send(&key, existing.is_some(), send_result)
             .await?;
-        self.explicit_lifecycle = Some(ExplicitLifecycle::new(
-            self.conv_cache.clone(),
-            key,
-            operation,
-        ));
-        self.transform_response(response).await
+        let lifecycle = ExplicitLifecycle::new(self.conv_cache.clone(), key.clone(), operation);
+        self.explicit_lifecycle = Some(lifecycle.clone());
+        match self.transform_response(response).await {
+            Ok(response) => match materialize_explicit_response(response).await {
+                Ok((response, snapshot)) => {
+                    if reconcile_file_references {
+                        let Some(files) = &self.staged_files else {
+                            unreachable!("file reconciliation requires staged storage")
+                        };
+                        if let Err(error) =
+                            reconcile_explicit_file_references(&self.conv_cache, files, &key).await
+                        {
+                            replay.fail();
+                            lifecycle.release().await;
+                            return Err(error.into());
+                        }
+                    }
+                    #[cfg(test)]
+                    if let Some((reached, release)) = &self.explicit_before_replay {
+                        let released = release.notified();
+                        reached.notify_one();
+                        released.await;
+                    }
+                    replay.complete(snapshot);
+                    lifecycle.release().await;
+                    Ok(response)
+                }
+                Err(error) => {
+                    replay.fail();
+                    lifecycle.release().await;
+                    Err(error)
+                }
+            },
+            Err(error) => {
+                replay.fail();
+                lifecycle.release().await;
+                Err(error)
+            }
+        }
     }
 
     async fn finish_explicit_send(
@@ -1114,6 +1477,13 @@ mod tests {
         uploads: Arc<AtomicUsize>,
         fail_second_upload: bool,
         incomplete_completion: bool,
+        incomplete_first_completion: bool,
+        fail_first_completion_gone: bool,
+        always_fail_completion_gone: bool,
+        completion_delay: std::time::Duration,
+        fail_first_bootstrap_invalid: bool,
+        bootstrap_calls: Arc<AtomicUsize>,
+        response_padding_bytes: usize,
     }
 
     impl MockClaudeServer {
@@ -1150,6 +1520,14 @@ mod tests {
             body,
         });
         let (content_type, status, body) = if path == "/api/bootstrap" {
+            let bootstrap = mock.bootstrap_calls.fetch_add(1, Ordering::SeqCst);
+            if mock.fail_first_bootstrap_invalid && bootstrap == 0 {
+                return AxumResponse::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"account":null}).to_string()))
+                    .unwrap();
+            }
             (
                 "application/json",
                 StatusCode::OK,
@@ -1177,15 +1555,39 @@ mod tests {
                 )
             }
         } else if path.contains("/completion") {
-            let stop = if mock.incomplete_completion {
+            if !mock.completion_delay.is_zero() {
+                tokio::time::sleep(mock.completion_delay).await;
+            }
+            if mock.always_fail_completion_gone
+                || (mock.fail_first_completion_gone && mock.completions().len() == 1)
+            {
+                return AxumResponse::builder()
+                    .status(StatusCode::GONE)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"error":{"type":"not_found","message":"missing"}}).to_string(),
+                    ))
+                    .unwrap();
+            }
+            let stop = if mock.incomplete_completion
+                || (mock.incomplete_first_completion && mock.completions().len() == 1)
+            {
                 ""
             } else {
                 "data: {\"type\":\"message_stop\"}\n\n"
             };
+            let padding = if mock.response_padding_bytes == 0 {
+                String::new()
+            } else {
+                format!(
+                    "data: {}\n\n",
+                    json!({"type":"padding","padding":"x".repeat(mock.response_padding_bytes)})
+                )
+            };
             (
                 "text/event-stream",
                 StatusCode::OK,
-                format!("data: {{\"completion\":\"answer\"}}\n\n{stop}"),
+                format!("data: {{\"completion\":\"answer\"}}\n\n{padding}{stop}"),
             )
         } else {
             ("application/json", StatusCode::OK, "{}".into())
@@ -1267,6 +1669,654 @@ mod tests {
             .try_chat(session_request(digest, messages))
             .await
             .unwrap();
+    }
+
+    async fn configured_explicit_state(
+        mock: &MockClaudeServer,
+    ) -> (
+        ConfigRestore,
+        crate::services::cookie_actor::CookieActorHandle,
+        ConversationCache,
+        crate::protocol::AuthPrincipal,
+    ) {
+        let endpoint = mock.start().await;
+        let original = crate::config::CLEWDR_CONFIG.load().as_ref().clone();
+        let restore = ConfigRestore(original.clone());
+        crate::config::CLEWDR_CONFIG.rcu(|_| {
+            let mut config = original.clone();
+            config.rproxy = Some(endpoint.clone());
+            config.no_fs = true;
+            config.skip_non_pro = false;
+            config.skip_normal_pro = false;
+            config
+        });
+        let handle = crate::services::cookie_actor::CookieActorHandle::start()
+            .await
+            .unwrap();
+        let cookie =
+            crate::config::CookieStatus::new(&format!("{}-bbbbbbAA", "a".repeat(86)), None)
+                .unwrap();
+        handle.submit(cookie).await.unwrap();
+        tokio::task::yield_now().await;
+        (
+            restore,
+            handle,
+            ConversationCache::new(),
+            crate::protocol::AuthPrincipal::for_authenticated_user(),
+        )
+    }
+
+    #[tokio::test]
+    async fn explicit_session_state_errors_rebuild_once_without_reaching_the_client() {
+        let _config_guard = CONFIG_TEST_LOCK.lock().await;
+        let mock = MockClaudeServer::default();
+        let (_restore, handle, cache, principal) = configured_explicit_state(&mock).await;
+        let user = Message::new_text(Role::User, "hello");
+
+        for (index, state) in [
+            ExplicitSessionState::Uncertain,
+            ExplicitSessionState::Committed,
+            ExplicitSessionState::Tombstoned,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let digest = format!("{index:02x}").repeat(32);
+            let key = ExplicitSessionKey::new(principal.as_str(), &digest);
+            cache
+                .set_explicit_checked(key.clone(), explicit_conversation(state))
+                .await
+                .unwrap();
+            let mut request_state = ClaudeWebState::new(handle.clone(), cache.clone());
+            request_state.principal = Some(principal.clone());
+
+            let response = request_state
+                .try_chat(session_request(&digest, vec![user.clone()]))
+                .await
+                .unwrap();
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                explicit_test_state(&cache, &key).await,
+                ExplicitSessionState::Committed
+            );
+        }
+
+        assert_eq!(mock.completions().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn concurrent_waiters_share_one_state_recovery() {
+        let _config_guard = CONFIG_TEST_LOCK.lock().await;
+        let mock = MockClaudeServer {
+            completion_delay: std::time::Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (_restore, handle, cache, principal) = configured_explicit_state(&mock).await;
+        let invoke = |handle, cache, principal, request: CreateMessageParams, recovery_barrier| async move {
+            let mut state = ClaudeWebState::new(handle, cache);
+            state.principal = Some(principal);
+            state.explicit_recovery_barrier = Some(recovery_barrier);
+            let response = state.try_chat(request).await.unwrap();
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        };
+
+        for (index, session_state) in [
+            ExplicitSessionState::Uncertain,
+            ExplicitSessionState::Tombstoned,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let digest = format!("e{index}").repeat(32);
+            let key = ExplicitSessionKey::new(principal.as_str(), &digest);
+            cache
+                .set_explicit_checked(key.clone(), explicit_conversation(session_state))
+                .await
+                .unwrap();
+            let request =
+                session_request(&digest, vec![Message::new_text(Role::User, "concurrent")]);
+            let expected_completions = index + 1;
+            let recovery_barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let first = tokio::spawn(invoke(
+                handle.clone(),
+                cache.clone(),
+                principal.clone(),
+                request.clone(),
+                recovery_barrier.clone(),
+            ));
+            let second = tokio::spawn(invoke(
+                handle.clone(),
+                cache.clone(),
+                principal.clone(),
+                request,
+                recovery_barrier,
+            ));
+            let (first, second) = tokio::join!(first, second);
+
+            assert_eq!(first.unwrap(), second.unwrap());
+            assert_eq!(mock.completions().len(), expected_completions);
+            assert_eq!(
+                explicit_test_state(&cache, &key).await,
+                ExplicitSessionState::Committed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_explicit_request_does_not_reset_committed_session() {
+        let handle = crate::services::cookie_actor::CookieActorHandle::start()
+            .await
+            .unwrap();
+        let cache = ConversationCache::new();
+        let principal = crate::protocol::AuthPrincipal::for_authenticated_user();
+        let digest = "aa".repeat(32);
+        let key = ExplicitSessionKey::new(principal.as_str(), &digest);
+        cache
+            .set_explicit_checked(
+                key.clone(),
+                explicit_conversation(ExplicitSessionState::Committed),
+            )
+            .await
+            .unwrap();
+        let mut state = ClaudeWebState::new(handle, cache.clone());
+        state.principal = Some(principal);
+
+        let error = state
+            .try_chat(session_request(
+                &digest,
+                vec![Message::new_text(Role::System, "invalid")],
+            ))
+            .await
+            .unwrap_err();
+        let ClewdrError::Protocol { source } = error else {
+            panic!("expected protocol error");
+        };
+
+        assert_eq!(source.status, StatusCode::BAD_REQUEST);
+        assert!(cache.get_explicit(&key).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn upstream_expiration_rebuilds_once() {
+        let _config_guard = CONFIG_TEST_LOCK.lock().await;
+        let mock = MockClaudeServer {
+            fail_first_completion_gone: true,
+            ..Default::default()
+        };
+        let (_restore, handle, cache, principal) = configured_explicit_state(&mock).await;
+        let digest = "ba".repeat(32);
+        let mut state = ClaudeWebState::new(handle, cache);
+        state.principal = Some(principal);
+
+        let response = state
+            .try_chat(session_request(
+                &digest,
+                vec![Message::new_text(Role::User, "hello")],
+            ))
+            .await
+            .unwrap();
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(mock.completions().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_bound_cookie_rebuilds_once_with_another_cookie() {
+        let _config_guard = CONFIG_TEST_LOCK.lock().await;
+        let mock = MockClaudeServer {
+            fail_first_bootstrap_invalid: true,
+            ..Default::default()
+        };
+        let (_restore, handle, cache, principal) = configured_explicit_state(&mock).await;
+        let replacement =
+            crate::config::CookieStatus::new(&format!("{}-bbbbbbAA", "b".repeat(86)), None)
+                .unwrap();
+        handle.submit(replacement).await.unwrap();
+        tokio::task::yield_now().await;
+        let digest = "bd".repeat(32);
+        let mut state = ClaudeWebState::new(handle, cache);
+        state.principal = Some(principal);
+
+        let response = state
+            .try_chat(session_request(
+                &digest,
+                vec![Message::new_text(Role::User, "hello")],
+            ))
+            .await
+            .unwrap();
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(mock.bootstrap_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(mock.completions().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rebuild_preserves_files_until_exact_reference_reconciliation() {
+        let principal = crate::protocol::AuthPrincipal::for_authenticated_user();
+        let digest = "be".repeat(32);
+        let key = ExplicitSessionKey::new(principal.as_str(), &digest);
+        let cache = ConversationCache::new();
+        let directory = tempfile::tempdir().unwrap();
+        let files =
+            crate::protocol_files::StagedFileStore::persistent_with_limits(directory.path(), 1, 2)
+                .await
+                .unwrap();
+        let a = stage_file(&files, &principal, "a", b"a").await;
+        let b = stage_file(&files, &principal, "b", b"b").await;
+        let session_ref = key.session_ref();
+        let mut existing = explicit_conversation(ExplicitSessionState::Committed);
+        existing.explicit.as_mut().unwrap().file_mappings.extend([
+            (a.id.clone(), "upstream-a".into()),
+            (b.id.clone(), "upstream-b".into()),
+        ]);
+        cache
+            .set_explicit_checked(key.clone(), existing)
+            .await
+            .unwrap();
+        files.add_reference(&a.id, &session_ref).await.unwrap();
+        files.add_reference(&b.id, &session_ref).await.unwrap();
+        let handle = crate::services::cookie_actor::CookieActorHandle::start()
+            .await
+            .unwrap();
+        let mut state = ClaudeWebState::new(handle, cache.clone());
+        state.principal = Some(principal.clone());
+        state.staged_files = Some(files.clone());
+
+        let mut references = state
+            .reset_explicit_for_rebuild(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        let blocked = files
+            .stage_stream(
+                &principal,
+                "c",
+                "application/octet-stream",
+                futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"c"))]),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(blocked.code, "staged_storage_full");
+
+        let mut rebuilt = explicit_conversation(ExplicitSessionState::Committed);
+        rebuilt
+            .explicit
+            .as_mut()
+            .unwrap()
+            .file_mappings
+            .insert(a.id.clone(), "replacement-a".into());
+        cache
+            .set_explicit_checked(key.clone(), rebuilt)
+            .await
+            .unwrap();
+        references.reconcile_exclusive().await.unwrap();
+        assert!(files.has_session_reference(&a.id, &session_ref).await);
+        assert!(!files.has_session_reference(&b.id, &session_ref).await);
+        stage_file(&files, &principal, "c", b"c").await;
+
+        let mut references = state
+            .reset_explicit_for_rebuild(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(files.has_session_reference(&a.id, &session_ref).await);
+        references.reconcile_exclusive().await.unwrap();
+        assert!(!files.has_session_reference(&a.id, &session_ref).await);
+    }
+
+    #[tokio::test]
+    async fn cancelled_rebuild_removes_orphaned_file_references() {
+        let _config_guard = CONFIG_TEST_LOCK.lock().await;
+        let mock = MockClaudeServer::default();
+        let (_restore, handle, cache, principal) = configured_explicit_state(&mock).await;
+        let digest = "bf".repeat(32);
+        let key = ExplicitSessionKey::new(principal.as_str(), &digest);
+        let directory = tempfile::tempdir().unwrap();
+        let files = crate::protocol_files::StagedFileStore::persistent(directory.path())
+            .await
+            .unwrap();
+        let staged = stage_file(&files, &principal, "cancelled", b"a").await;
+        let mut existing = explicit_conversation(ExplicitSessionState::Uncertain);
+        existing
+            .explicit
+            .as_mut()
+            .unwrap()
+            .file_mappings
+            .insert(staged.id.clone(), "upstream".into());
+        cache
+            .set_explicit_checked(key.clone(), existing)
+            .await
+            .unwrap();
+        files
+            .add_reference(&staged.id, &key.session_ref())
+            .await
+            .unwrap();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let reached_wait = reached.notified();
+        let mut state = ClaudeWebState::new(handle, cache.clone());
+        state.principal = Some(principal);
+        state.staged_files = Some(files.clone());
+        state.explicit_after_reset = Some((reached.clone(), release));
+        let request = session_request(
+            &digest,
+            vec![Message::new_text(Role::User, "cancel recovery")],
+        );
+        let request = tokio::spawn(async move { state.try_chat(request).await });
+        reached_wait.await;
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while files
+                .has_session_reference(&staged.id, &key.session_ref())
+                .await
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(cache.get_explicit(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_rebuild_reconciles_after_a_new_operation() {
+        let principal = crate::protocol::AuthPrincipal::for_authenticated_user();
+        let key = ExplicitSessionKey::new(principal.as_str(), "cancel-race");
+        let cache = ConversationCache::new();
+        let directory = tempfile::tempdir().unwrap();
+        let files = crate::protocol_files::StagedFileStore::persistent(directory.path())
+            .await
+            .unwrap();
+        let a = stage_file(&files, &principal, "a", b"a").await;
+        let b = stage_file(&files, &principal, "b", b"b").await;
+        let session_ref = key.session_ref();
+        files.add_reference(&a.id, &session_ref).await.unwrap();
+        files.add_reference(&b.id, &session_ref).await.unwrap();
+        let operation = cache.lock_explicit_operation(&key).await;
+        drop(PreservedFileReferencesGuard::new(
+            cache.clone(),
+            files.clone(),
+            key.clone(),
+        ));
+
+        let mut replacement = explicit_conversation(ExplicitSessionState::Committed);
+        replacement
+            .explicit
+            .as_mut()
+            .unwrap()
+            .file_mappings
+            .insert(a.id.clone(), "replacement".into());
+        cache
+            .set_explicit_checked(key.clone(), replacement)
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(files.has_session_reference(&b.id, &session_ref).await);
+        drop(operation);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while files.has_session_reference(&b.id, &session_ref).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(files.has_session_reference(&a.id, &session_ref).await);
+    }
+
+    #[tokio::test]
+    async fn incomplete_response_rebuilds_once() {
+        let _config_guard = CONFIG_TEST_LOCK.lock().await;
+        let mock = MockClaudeServer {
+            incomplete_first_completion: true,
+            ..Default::default()
+        };
+        let (_restore, handle, cache, principal) = configured_explicit_state(&mock).await;
+        let digest = "bb".repeat(32);
+        let mut state = ClaudeWebState::new(handle, cache);
+        state.principal = Some(principal);
+
+        let response = state
+            .try_chat(session_request(
+                &digest,
+                vec![Message::new_text(Role::User, "hello")],
+            ))
+            .await
+            .unwrap();
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(mock.completions().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn oversized_rebuild_response_releases_operation_and_file_references() {
+        let _config_guard = CONFIG_TEST_LOCK.lock().await;
+        let mock = MockClaudeServer {
+            response_padding_bytes: MAX_EXPLICIT_RESPONSE_BYTES + 1,
+            ..Default::default()
+        };
+        let (_restore, handle, cache, principal) = configured_explicit_state(&mock).await;
+        let digest = "c0".repeat(32);
+        let key = ExplicitSessionKey::new(principal.as_str(), &digest);
+        let directory = tempfile::tempdir().unwrap();
+        let files = crate::protocol_files::StagedFileStore::persistent(directory.path())
+            .await
+            .unwrap();
+        let staged = stage_file(&files, &principal, "oversized", b"a").await;
+        let mut existing = explicit_conversation(ExplicitSessionState::Uncertain);
+        existing
+            .explicit
+            .as_mut()
+            .unwrap()
+            .file_mappings
+            .insert(staged.id.clone(), "upstream".into());
+        cache
+            .set_explicit_checked(key.clone(), existing)
+            .await
+            .unwrap();
+        files
+            .add_reference(&staged.id, &key.session_ref())
+            .await
+            .unwrap();
+        let mut state = ClaudeWebState::new(handle, cache.clone());
+        state.principal = Some(principal);
+        state.staged_files = Some(files.clone());
+        state.stream = true;
+        let mut request = session_request(&digest, vec![Message::new_text(Role::User, "large")]);
+        request.stream = Some(true);
+
+        let error = state.try_chat(request).await.unwrap_err();
+        let ClewdrError::Protocol { source } = error else {
+            panic!("expected protocol error")
+        };
+        assert_eq!(source.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(source.code, "explicit_response_too_large");
+        assert!(
+            !files
+                .has_session_reference(&staged.id, &key.session_ref())
+                .await
+        );
+        let operation = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cache.lock_explicit_operation(&key),
+        )
+        .await
+        .unwrap();
+        drop(operation);
+        assert_eq!(mock.completions().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_expiration_stops_after_one_rebuild() {
+        let _config_guard = CONFIG_TEST_LOCK.lock().await;
+        let mock = MockClaudeServer {
+            always_fail_completion_gone: true,
+            ..Default::default()
+        };
+        let (_restore, handle, cache, principal) = configured_explicit_state(&mock).await;
+        let digest = "bc".repeat(32);
+        let mut state = ClaudeWebState::new(handle, cache);
+        state.principal = Some(principal);
+
+        let error = state
+            .try_chat(session_request(
+                &digest,
+                vec![Message::new_text(Role::User, "hello")],
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            recoverable_explicit_error(&error),
+            Some("conversation_expired")
+        );
+        assert_eq!(mock.completions().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_session_requests_share_one_completion() {
+        let _config_guard = CONFIG_TEST_LOCK.lock().await;
+        let mock = MockClaudeServer {
+            completion_delay: std::time::Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (_restore, handle, cache, principal) = configured_explicit_state(&mock).await;
+        let invoke = |handle, cache, principal, request: CreateMessageParams, stream| async move {
+            let mut state = ClaudeWebState::new(handle, cache);
+            state.principal = Some(principal);
+            state.stream = stream;
+            let response = state.try_chat(request).await.unwrap();
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        };
+        for (index, stream) in [false, true].into_iter().enumerate() {
+            let digest = format!("c{index}").repeat(32);
+            let mut request =
+                session_request(&digest, vec![Message::new_text(Role::User, "concurrent")]);
+            request.stream = Some(stream);
+            let expected_count = index + 1;
+            let first = tokio::spawn(invoke(
+                handle.clone(),
+                cache.clone(),
+                principal.clone(),
+                request.clone(),
+                stream,
+            ));
+            while mock.completions().len() < expected_count {
+                tokio::task::yield_now().await;
+            }
+            let second = tokio::spawn(invoke(
+                handle.clone(),
+                cache.clone(),
+                principal.clone(),
+                request,
+                stream,
+            ));
+            let (first, second) = tokio::join!(first, second);
+
+            assert_eq!(first.unwrap(), second.unwrap());
+        }
+        assert_eq!(mock.completions().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn identical_waiter_after_message_stop_replays_active_generation() {
+        let _config_guard = CONFIG_TEST_LOCK.lock().await;
+        let mock = MockClaudeServer::default();
+        let (_restore, handle, cache, principal) = configured_explicit_state(&mock).await;
+        let digest = "ce".repeat(32);
+        let request = session_request(&digest, vec![Message::new_text(Role::User, "message stop")]);
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let reached_wait = reached.notified();
+        let first_handle = handle.clone();
+        let first_cache = cache.clone();
+        let first_principal = principal.clone();
+        let first_request = request.clone();
+        let first_reached = reached.clone();
+        let first_release = release.clone();
+        let first = tokio::spawn(async move {
+            let mut state = ClaudeWebState::new(first_handle, first_cache);
+            state.principal = Some(first_principal);
+            state.explicit_before_replay = Some((first_reached, first_release));
+            let response = state.try_chat(first_request).await.unwrap();
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        });
+        reached_wait.await;
+
+        let second = tokio::spawn(async move {
+            let mut state = ClaudeWebState::new(handle, cache);
+            state.principal = Some(principal);
+            let response = state.try_chat(request).await.unwrap();
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished());
+        release.notify_one();
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(first.unwrap(), second.unwrap());
+        assert_eq!(mock.completions().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_different_session_requests_run_in_order() {
+        let _config_guard = CONFIG_TEST_LOCK.lock().await;
+        let mock = MockClaudeServer {
+            completion_delay: std::time::Duration::from_millis(50),
+            ..Default::default()
+        };
+        let (_restore, handle, cache, principal) = configured_explicit_state(&mock).await;
+        let digest = "da".repeat(32);
+        let first_request = session_request(&digest, vec![Message::new_text(Role::User, "first")]);
+        let second_request = session_request(
+            &digest,
+            vec![
+                Message::new_text(Role::User, "first"),
+                Message::new_text(Role::Assistant, "answer"),
+                Message::new_text(Role::User, "second"),
+            ],
+        );
+        let invoke = |handle, cache, principal, request| async move {
+            let mut state = ClaudeWebState::new(handle, cache);
+            state.principal = Some(principal);
+            let response = state.try_chat(request).await.unwrap();
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        };
+        let first = tokio::spawn(invoke(
+            handle.clone(),
+            cache.clone(),
+            principal.clone(),
+            first_request,
+        ));
+        while mock.completions().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let second = tokio::spawn(invoke(handle, cache, principal, second_request));
+        let (first, second) = tokio::join!(first, second);
+
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(mock.completions().len(), 2);
     }
 
     #[tokio::test]
@@ -1646,12 +2696,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_bound_cookie_tombstones_session_before_upstream() {
-        let handle = crate::services::cookie_actor::CookieActorHandle::start()
-            .await
-            .unwrap();
-        let cache = ConversationCache::new();
-        let principal = crate::protocol::AuthPrincipal::for_authenticated_user();
+    async fn missing_bound_cookie_rebuilds_with_an_available_cookie() {
+        let _config_guard = CONFIG_TEST_LOCK.lock().await;
+        let mock = MockClaudeServer::default();
+        let (_restore, handle, cache, principal) = configured_explicit_state(&mock).await;
         let digest = "ef".repeat(32);
         let key = ExplicitSessionKey::new(principal.as_str(), &digest);
         let first = Message::new_text(Role::User, "u1");
@@ -1682,19 +2730,18 @@ mod tests {
             .unwrap();
         let mut state = ClaudeWebState::new(handle, cache.clone());
         state.principal = Some(principal);
-        let error = state
+        let response = state
             .try_explicit_chat(params(vec![first]), digest)
             .await
-            .unwrap_err();
-        let ClewdrError::Protocol { source } = error else {
-            panic!("expected protocol error");
-        };
-        assert_eq!(source.status, StatusCode::GONE);
-        assert_eq!(source.code, "conversation_expired");
+            .unwrap();
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(
             explicit_test_state(&cache, &key).await,
-            ExplicitSessionState::Tombstoned
+            ExplicitSessionState::Committed
         );
+        assert_eq!(mock.completions().len(), 1);
     }
 
     #[test]

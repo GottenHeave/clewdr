@@ -360,7 +360,7 @@ mod explicit_session_tests {
     async fn setup_lifecycle() -> (ConversationCache, ExplicitSessionKey, ExplicitLifecycle) {
         let cache = ConversationCache::new();
         let key = ExplicitSessionKey::new("principal", "ab".repeat(32));
-        let operation = cache.try_lock_explicit_operation(&key).await.unwrap();
+        let operation = cache.lock_explicit_operation(&key).await.into_guard();
         let mut conversation = explicit_test_conversation(ExplicitSessionState::InFlight);
         conversation.explicit.as_mut().unwrap().pending = Some(PendingExplicitTurn {
             model: None,

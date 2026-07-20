@@ -137,20 +137,20 @@ async fn operation_locks_serialize_only_matching_keys() {
     let cache = ConversationCache::new();
     let key = session('a');
     let other_key = session('b');
-    let held = cache.try_lock_explicit_operation(&key).await.unwrap();
+    let held = cache.lock_explicit_operation(&key).await;
+    assert!(!held.waited());
 
-    assert_eq!(
-        cache
-            .try_lock_explicit_operation(&key)
-            .await
-            .unwrap_err()
-            .code,
-        "session_busy"
-    );
-    drop(cache.try_lock_explicit_operation(&other_key).await.unwrap());
+    let waiting_cache = cache.clone();
+    let waiting_key = key.clone();
+    let waiting =
+        tokio::spawn(async move { waiting_cache.lock_explicit_operation(&waiting_key).await });
+    tokio::task::yield_now().await;
+    assert!(!waiting.is_finished());
+    drop(cache.lock_explicit_operation(&other_key).await);
 
     drop(held);
-    drop(cache.try_lock_explicit_operation(&key).await.unwrap());
+    let waited = waiting.await.unwrap();
+    assert!(waited.waited());
 }
 
 #[tokio::test]

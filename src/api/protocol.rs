@@ -9,7 +9,10 @@ use futures::stream;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    claude_web_state::conversation_cache::{ConversationCache, ExplicitSessionKey},
+    claude_web_state::{
+        conversation_cache::{ConversationCache, ExplicitSessionKey},
+        explicit_session::reset_explicit_session,
+    },
     protocol::{AuthPrincipal, ProtocolError, parse_session_id},
     protocol_files::{FileResponse, StagedFileStore},
 };
@@ -137,9 +140,7 @@ pub(crate) async fn api_reset_session(
             )
         })?;
     let key = ExplicitSessionKey::new(principal.as_str(), digest);
-    let _operation = state.cache.try_lock_explicit_operation(&key).await?;
-    let _files = state.cache.lock_explicit_files().await;
-    let staged_file_ids = state.cache.explicit_staged_file_ids(&key).await;
+    let _operation = state.cache.lock_explicit_operation(&key).await;
     if state.cache.get_explicit(&key).await.is_none() {
         return Err(ProtocolError::new(
             StatusCode::NOT_FOUND,
@@ -147,41 +148,21 @@ pub(crate) async fn api_reset_session(
             "Session does not exist",
         ));
     }
-    if let Some(files) = &state.files {
-        files.remove_session_references(&key.session_ref()).await?;
-    }
-    match state.cache.reset_explicit(&key).await {
+    match reset_explicit_session(&state.cache, state.files.as_ref(), &key).await {
         Ok(true) => {}
         Ok(false) => {
-            restore_file_references(state.files.as_ref(), &key, &staged_file_ids).await?;
             return Err(ProtocolError::new(
                 StatusCode::NOT_FOUND,
                 "session_not_found",
                 "Session does not exist",
             ));
         }
-        Err(error) => {
-            restore_file_references(state.files.as_ref(), &key, &staged_file_ids).await?;
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     }
     Ok(Json(ResetSessionResponse {
         r#type: "session_reset",
         session_id: request.session_id,
     }))
-}
-
-async fn restore_file_references(
-    files: Option<&Arc<StagedFileStore>>,
-    key: &ExplicitSessionKey,
-    staged_file_ids: &[String],
-) -> Result<(), ProtocolError> {
-    if let Some(files) = files {
-        files
-            .set_session_references(&key.session_ref(), staged_file_ids)
-            .await?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
