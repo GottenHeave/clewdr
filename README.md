@@ -33,9 +33,16 @@ Streaming responses are available on `messages` and `chat/completions` routes.
 
 Versioned explicit sessions use `metadata.user_id` values beginning with
 `cherry_topic_v1_`. ClewdR binds each session to its selected Cookie, Claude
-Web conversation, and parent message. A `409` requires explicit client or user
-recovery rather than an automatic retry. After a `410`, call
-`/v1/sessions/reset` once before retrying the request.
+Web conversation, and parent message. Requests for the same session execute in
+order, and concurrent identical requests share the completed response. ClewdR
+automatically resets and rebuilds a session once when reuse validation, an
+uncertain result, or upstream expiration prevents reuse. A repeated failure is
+returned to the client. Explicit-session streams are buffered until Claude Web
+emits `message_stop`, then delivered as SSE; the first downstream byte waits for
+completion validation and memory use grows with the response body, up to a 16
+MiB limit. A larger response returns `502 explicit_response_too_large`.
+Streaming without an explicit session remains incremental. Expired staged files
+still require a new upload.
 
 Upload large files to `/v1/files` as multipart form data containing exactly one
 field named `file`. The returned `file_clewdr_v1_*` ID can be referenced by

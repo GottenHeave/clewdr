@@ -19,8 +19,8 @@ use wreq::Method;
 use crate::{
     claude_web_state::{
         ClaudeWebState,
-        conversation_cache::{ConversationCache, ExplicitSessionKey},
-        explicit_session::ExplicitSessionState,
+        conversation_cache::{ConversationCache, ExplicitOperationGuard, ExplicitSessionKey},
+        explicit_session::{ExplicitSessionState, reset_explicit_session},
     },
     config::CookieStatus,
     error::{CheckClaudeErr, ClewdrError},
@@ -55,13 +55,19 @@ pub(crate) struct DownloadFileQuery {
 struct CookieLease {
     cookie: Option<CookieStatus>,
     handle: CookieActorHandle,
+    operation: Option<ExplicitOperationGuard>,
 }
 
 impl CookieLease {
-    fn new(cookie: CookieStatus, handle: CookieActorHandle) -> Self {
+    fn new(
+        cookie: CookieStatus,
+        handle: CookieActorHandle,
+        operation: ExplicitOperationGuard,
+    ) -> Self {
         Self {
             cookie: Some(cookie),
             handle,
+            operation: Some(operation),
         }
     }
 
@@ -71,19 +77,22 @@ impl CookieLease {
         {
             warn!("Failed to return session Cookie after file download: {error}");
         }
+        self.operation.take();
     }
 }
 
 impl Drop for CookieLease {
     fn drop(&mut self) {
-        let Some(cookie) = self.cookie.take() else {
-            return;
-        };
+        let cookie = self.cookie.take();
+        let operation = self.operation.take();
         let handle = self.handle.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle.return_cookie(cookie, None).await {
+            if let Some(cookie) = cookie
+                && let Err(error) = handle.return_cookie(cookie, None).await
+            {
                 warn!("Failed to return interrupted file-download Cookie: {error}");
             }
+            drop(operation);
         });
     }
 }
@@ -119,6 +128,7 @@ pub(crate) async fn api_download_session_file(
     }
 
     let key = ExplicitSessionKey::new(principal.as_str(), &session_digest);
+    let operation = state.cache.lock_explicit_operation(&key).await.into_guard();
     let conversation = state.cache.get_explicit(&key).await.ok_or_else(|| {
         ProtocolError::new(
             StatusCode::NOT_FOUND,
@@ -168,21 +178,30 @@ pub(crate) async fn api_download_session_file(
     }
     cookie?;
     web.conv_uuid = Some(conversation.conv_uuid.clone());
-    let endpoint = conversation_download_endpoint(
+    let endpoint = match conversation_download_endpoint(
         &web.endpoint,
         &conversation.org_uuid,
         &conversation.conv_uuid,
         &query.path,
-    )
-    .map_err(|source| ClewdrError::Whatever {
-        message: "Failed to build conversation file-download URL".to_string(),
-        source: Some(Box::new(source)),
-    })?;
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(source) => {
+            web.return_cookie(None).await;
+            return Err(ClewdrError::Whatever {
+                message: "Failed to build conversation file-download URL".to_string(),
+                source: Some(Box::new(source)),
+            });
+        }
+    };
     let upstream = match web.build_request(Method::GET, endpoint).send().await {
         Ok(response) => match response.check_claude().await {
             Ok(response) => response,
             Err(error) => {
-                web.return_cookie(None).await;
+                if let ClewdrError::InvalidCookie { reason } = &error {
+                    web.return_cookie(Some(reason.to_owned())).await;
+                } else {
+                    web.return_cookie(None).await;
+                }
                 return Err(error);
             }
         },
@@ -200,9 +219,11 @@ pub(crate) async fn api_download_session_file(
             response = response.header(header, value);
         }
     }
-    let cookie = web.cookie.take().expect("session Cookie was requested");
+    let cookie = web.cookie.take().ok_or(ClewdrError::UnexpectedNone {
+        msg: "session Cookie was not retained for the remote file download",
+    })?;
     let stream = upstream.bytes_stream();
-    let mut lease = CookieLease::new(cookie, state.cookie_actor_handle);
+    let mut lease = CookieLease::new(cookie, state.cookie_actor_handle, operation);
     let stream = async_stream::stream! {
         futures::pin_mut!(stream);
         while let Some(chunk) = stream.next().await {
@@ -352,9 +373,7 @@ pub(crate) async fn api_reset_session(
             )
         })?;
     let key = ExplicitSessionKey::new(principal.as_str(), digest);
-    let _operation = state.cache.try_lock_explicit_operation(&key).await?;
-    let _files = state.cache.lock_explicit_files().await;
-    let staged_file_ids = state.cache.explicit_staged_file_ids(&key).await;
+    let _operation = state.cache.lock_explicit_operation(&key).await;
     if state.cache.get_explicit(&key).await.is_none() {
         return Err(ProtocolError::new(
             StatusCode::NOT_FOUND,
@@ -362,41 +381,21 @@ pub(crate) async fn api_reset_session(
             "Session does not exist",
         ));
     }
-    if let Some(files) = &state.files {
-        files.remove_session_references(&key.session_ref()).await?;
-    }
-    match state.cache.reset_explicit(&key).await {
+    match reset_explicit_session(&state.cache, state.files.as_ref(), &key).await {
         Ok(true) => {}
         Ok(false) => {
-            restore_file_references(state.files.as_ref(), &key, &staged_file_ids).await?;
             return Err(ProtocolError::new(
                 StatusCode::NOT_FOUND,
                 "session_not_found",
                 "Session does not exist",
             ));
         }
-        Err(error) => {
-            restore_file_references(state.files.as_ref(), &key, &staged_file_ids).await?;
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     }
     Ok(Json(ResetSessionResponse {
         r#type: "session_reset",
         session_id: request.session_id,
     }))
-}
-
-async fn restore_file_references(
-    files: Option<&Arc<StagedFileStore>>,
-    key: &ExplicitSessionKey,
-    staged_file_ids: &[String],
-) -> Result<(), ProtocolError> {
-    if let Some(files) = files {
-        files
-            .set_session_references(&key.session_ref(), staged_file_ids)
-            .await?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -407,7 +406,7 @@ mod tests {
         Extension, Router, body,
         body::Body,
         http::{Request, header::CONTENT_TYPE},
-        routing::post,
+        routing::{get, post},
     };
     use bytes::Bytes;
     use futures::stream;
@@ -449,6 +448,9 @@ conversation-id/wiggle/download-file?path=%2Fmnt%2Fuser-data%2Foutputs%2Fhello+w
         assert!(!super::is_output_file_path(
             "/mnt/user-data/outputs/../uploads/input.txt"
         ));
+        assert!(!super::is_output_file_path(
+            "/mnt/user-data/outputs/./report.txt"
+        ));
         assert!(!super::is_output_file_path("/mnt/user-data/outputs/"));
     }
 
@@ -484,6 +486,91 @@ conversation-id/wiggle/download-file?path=%2Fmnt%2Fuser-data%2Foutputs%2Fhello+w
                 files: store,
             })
             .layer(Extension(AuthPrincipal::for_authenticated_user()))
+    }
+
+    fn downloads_app(
+        cache: ConversationCache,
+        cookie_actor_handle: CookieActorHandle,
+        principal: AuthPrincipal,
+    ) -> Router {
+        Router::new()
+            .route(
+                "/v1/sessions/{session_id}/files/download",
+                get(api_download_session_file),
+            )
+            .with_state(DownloadFileState {
+                cache,
+                cookie_actor_handle,
+            })
+            .layer(Extension(principal))
+    }
+
+    async fn get_download(app: Router, uri: &str) -> axum::response::Response {
+        app.oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn download_endpoint_rejects_invalid_paths_and_unavailable_sessions() {
+        let principal = AuthPrincipal::for_authenticated_user();
+        let cache = ConversationCache::new();
+        let actor = CookieActorHandle::start().await.unwrap();
+        let app = downloads_app(cache, actor, principal);
+
+        assert_eq!(
+            get_download(
+                app.clone(),
+                "/v1/sessions/not-a-versioned-session/files/download?path=/mnt/user-data/outputs/report.txt",
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get_download(
+                app.clone(),
+                "/v1/sessions/cherry_topic_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/files/download?path=/mnt/user-data/outputs/../input.txt",
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get_download(
+                app,
+                "/v1/sessions/cherry_topic_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/files/download?path=/mnt/user-data/outputs/report.txt",
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn download_endpoint_requires_a_committed_explicit_session() {
+        let principal = AuthPrincipal::for_authenticated_user();
+        let actor = CookieActorHandle::start().await.unwrap();
+        let digest = "ab".repeat(32);
+        let key = ExplicitSessionKey::new(principal.as_str(), &digest);
+        let uri = format!(
+            "/v1/sessions/cherry_topic_v1_{digest}/files/download?path=/mnt/user-data/outputs/report.txt"
+        );
+
+        for (state, expected_status) in [
+            (ExplicitSessionState::Tombstoned, StatusCode::GONE),
+            (ExplicitSessionState::InFlight, StatusCode::CONFLICT),
+            (ExplicitSessionState::Uncertain, StatusCode::CONFLICT),
+        ] {
+            let cache = ConversationCache::new();
+            cache
+                .set_explicit_checked(key.clone(), explicit_test_conversation(state))
+                .await
+                .unwrap();
+            let response =
+                get_download(downloads_app(cache, actor.clone(), principal.clone()), &uri).await;
+            assert_eq!(response.status(), expected_status);
+        }
     }
 
     async fn post_files(

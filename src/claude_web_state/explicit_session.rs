@@ -6,11 +6,14 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::Mutex;
 
 use crate::{
-    claude_web_state::conversation_cache::{ConversationCache, ExplicitSessionKey},
+    claude_web_state::conversation_cache::{
+        ConversationCache, ExplicitOperationGuard, ExplicitSessionKey,
+    },
     protocol::ProtocolError,
+    protocol_files::StagedFileStore,
     types::{
         claude::{Message, Role},
         claude_web::request::{
@@ -18,6 +21,29 @@ use crate::{
         },
     },
 };
+
+pub async fn reset_explicit_session(
+    cache: &ConversationCache,
+    files: Option<&Arc<StagedFileStore>>,
+    key: &ExplicitSessionKey,
+) -> Result<bool, ProtocolError> {
+    let _files = cache.lock_explicit_files().await;
+    let staged_file_ids = cache.explicit_staged_file_ids(key).await;
+    if let Some(files) = files {
+        files.remove_session_references(&key.session_ref()).await?;
+    }
+    match cache.reset_explicit(key).await {
+        Ok(removed) => Ok(removed),
+        Err(error) => {
+            if let Some(files) = files {
+                files
+                    .set_session_references(&key.session_ref(), &staged_file_ids)
+                    .await?;
+            }
+            Err(error)
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,7 +99,7 @@ pub struct ExplicitLifecycle {
 struct ExplicitLifecycleInner {
     cache: ConversationCache,
     key: ExplicitSessionKey,
-    operation: Mutex<Option<OwnedMutexGuard<()>>>,
+    operation: Mutex<Option<ExplicitOperationGuard>>,
     finalized: AtomicBool,
 }
 
@@ -81,7 +107,7 @@ impl ExplicitLifecycle {
     pub fn new(
         cache: ConversationCache,
         key: ExplicitSessionKey,
-        operation: OwnedMutexGuard<()>,
+        operation: ExplicitOperationGuard,
     ) -> Self {
         Self {
             inner: Arc::new(ExplicitLifecycleInner {
@@ -94,21 +120,38 @@ impl ExplicitLifecycle {
     }
 
     pub async fn commit(&self, assistant_digest: Option<String>) -> Result<(), ProtocolError> {
-        let mut operation = self.inner.operation.lock().await;
-        if operation.is_none() {
+        if self.inner.finalized.load(Ordering::Acquire) {
             return Ok(());
         }
         self.inner
             .cache
             .commit_explicit_turn(&self.inner.key, assistant_digest)
             .await?;
-        operation.take();
         self.inner.finalized.store(true, Ordering::Release);
         Ok(())
     }
 
     pub async fn uncertain(&self) -> Result<(), ProtocolError> {
-        finalize_uncertain(&self.inner).await
+        if self.inner.finalized.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let result = self
+            .inner
+            .cache
+            .mark_explicit_uncertain(&self.inner.key)
+            .await;
+        if result.is_err() {
+            self.inner
+                .cache
+                .mark_explicit_uncertain_in_memory(&self.inner.key)
+                .await;
+        }
+        self.inner.finalized.store(true, Ordering::Release);
+        result
+    }
+
+    pub async fn release(&self) {
+        self.inner.operation.lock().await.take();
     }
 }
 

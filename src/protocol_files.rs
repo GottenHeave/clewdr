@@ -492,6 +492,16 @@ impl StagedFileStore {
         .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn has_session_reference(&self, id: &str, session_ref: &str) -> bool {
+        self.index
+            .lock()
+            .await
+            .files
+            .get(id)
+            .is_some_and(|file| file.references.contains(session_ref))
+    }
+
     pub async fn reconcile_references(
         &self,
         expected: &BTreeSet<(String, String)>,

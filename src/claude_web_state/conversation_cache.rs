@@ -2,12 +2,14 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 
+use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
+use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_with::{TimestampSecondsWithFrac, serde_as};
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, OwnedMutexGuard, watch};
 use tracing::warn;
 
 use super::explicit_session::{
@@ -195,6 +197,178 @@ pub struct ExplicitSessionKey {
     session_digest: String,
 }
 
+#[derive(Clone)]
+pub struct ExplicitResponseSnapshot {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+}
+
+#[derive(Clone)]
+enum ExplicitReplayOutcome {
+    Pending,
+    Complete(ExplicitResponseSnapshot),
+    Failed,
+}
+
+struct StoredOperationState {
+    lock: Arc<Mutex<()>>,
+    active: StdMutex<Option<Arc<ExplicitReplayGeneration>>>,
+    active_version: watch::Sender<u64>,
+}
+
+impl StoredOperationState {
+    fn new() -> Self {
+        let (active_version, _) = watch::channel(0);
+        Self {
+            lock: Arc::new(Mutex::new(())),
+            active: StdMutex::new(None),
+            active_version,
+        }
+    }
+}
+
+struct ExplicitReplayGeneration {
+    fingerprint: String,
+    outcome: watch::Sender<ExplicitReplayOutcome>,
+}
+
+pub struct ExplicitReplayHandle {
+    generation: Arc<ExplicitReplayGeneration>,
+    armed: bool,
+}
+
+pub struct ExplicitOperationGuard {
+    state: Arc<StoredOperationState>,
+    generation: Arc<ExplicitReplayGeneration>,
+}
+
+impl Drop for ExplicitOperationGuard {
+    fn drop(&mut self) {
+        if matches!(
+            &*self.generation.outcome.borrow(),
+            ExplicitReplayOutcome::Pending
+        ) {
+            self.generation
+                .outcome
+                .send_replace(ExplicitReplayOutcome::Failed);
+        }
+        let mut active = self
+            .state
+            .active
+            .lock()
+            .expect("operation generation lock poisoned");
+        if active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.generation))
+        {
+            *active = None;
+            self.state
+                .active_version
+                .send_modify(|version| *version = version.wrapping_add(1));
+        }
+    }
+}
+
+impl ExplicitReplayHandle {
+    pub fn complete(mut self, response: ExplicitResponseSnapshot) {
+        self.generation
+            .outcome
+            .send_replace(ExplicitReplayOutcome::Complete(response));
+        self.armed = false;
+    }
+
+    pub fn fail(mut self) {
+        self.generation
+            .outcome
+            .send_replace(ExplicitReplayOutcome::Failed);
+        self.armed = false;
+    }
+}
+
+impl Drop for ExplicitReplayHandle {
+    fn drop(&mut self) {
+        if self.armed {
+            self.generation
+                .outcome
+                .send_replace(ExplicitReplayOutcome::Failed);
+        }
+    }
+}
+
+fn new_replay_generation(fingerprint: String) -> Arc<ExplicitReplayGeneration> {
+    let (outcome, _) = watch::channel(ExplicitReplayOutcome::Pending);
+    Arc::new(ExplicitReplayGeneration {
+        fingerprint,
+        outcome,
+    })
+}
+
+async fn wait_for_replay_terminal(generation: &ExplicitReplayGeneration) -> ExplicitReplayOutcome {
+    let mut outcome = generation.outcome.subscribe();
+    loop {
+        let current = outcome.borrow().clone();
+        match current {
+            ExplicitReplayOutcome::Pending => {
+                if outcome.changed().await.is_err() {
+                    return ExplicitReplayOutcome::Failed;
+                }
+            }
+            terminal => return terminal,
+        }
+    }
+}
+
+async fn wait_for_generation_release(
+    state: &StoredOperationState,
+    generation: &ExplicitReplayGeneration,
+) {
+    let mut active_version = state.active_version.subscribe();
+    loop {
+        let still_active = state
+            .active
+            .lock()
+            .expect("operation generation lock poisoned")
+            .as_ref()
+            .is_some_and(|active| std::ptr::eq(active.as_ref(), generation));
+        if !still_active {
+            return;
+        }
+        if active_version.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+impl ExplicitOperationPermit {
+    pub fn observed_replay(&self) -> Option<ExplicitResponseSnapshot> {
+        self.replayed.clone()
+    }
+
+    pub fn waited(&self) -> bool {
+        self.waited
+    }
+
+    pub fn into_operation(mut self) -> (ExplicitOperationGuard, Option<ExplicitReplayHandle>) {
+        let replay = self.replay.take();
+        (
+            self.guard.take().expect("operation permit owns its guard"),
+            replay,
+        )
+    }
+
+    pub fn into_guard(self) -> ExplicitOperationGuard {
+        self.into_operation().0
+    }
+}
+
+pub struct ExplicitOperationPermit {
+    guard: Option<ExplicitOperationGuard>,
+    replayed: Option<ExplicitResponseSnapshot>,
+    replay: Option<ExplicitReplayHandle>,
+    waited: bool,
+}
+
 impl ExplicitSessionKey {
     /// Creates a key scoped to one authenticated principal and one client session digest.
     pub fn new(session_principal: impl Into<String>, session_digest: impl Into<String>) -> Self {
@@ -351,7 +525,7 @@ fn enforce_explicit_capacity(
 /// Thread-safe cache for implicit conversations and scoped explicit session records.
 pub struct ConversationCache {
     inner: Arc<Mutex<HashMap<StoredCacheKey, CachedConversation>>>,
-    operation_locks: Arc<Mutex<HashMap<StoredCacheKey, Weak<Mutex<()>>>>>,
+    operation_locks: Arc<Mutex<HashMap<StoredCacheKey, Weak<StoredOperationState>>>>,
     persist_path: Option<Arc<PathBuf>>,
     persist_lock: Arc<Mutex<()>>,
     explicit_mutation_lock: Arc<Mutex<()>>,
@@ -427,38 +601,129 @@ impl ConversationCache {
     }
 
     pub async fn lock_operation(&self, key: &CacheKey) -> OwnedMutexGuard<()> {
-        self.lock_stored_operation(StoredCacheKey::Legacy(key.clone()))
+        self.stored_operation(StoredCacheKey::Legacy(key.clone()))
+            .await
+            .lock
+            .clone()
+            .lock_owned()
             .await
     }
 
-    pub async fn try_lock_explicit_operation(
+    pub async fn lock_explicit_operation(
         &self,
         key: &ExplicitSessionKey,
-    ) -> Result<OwnedMutexGuard<()>, ProtocolError> {
-        let lock = self
-            .stored_operation_lock(StoredCacheKey::ExplicitSession(key.clone()))
+    ) -> ExplicitOperationPermit {
+        let state = self
+            .stored_operation(StoredCacheKey::ExplicitSession(key.clone()))
             .await;
-        lock.try_lock_owned().map_err(|_| {
-            ProtocolError::new(
-                http::StatusCode::CONFLICT,
-                "session_busy",
-                "Another operation is already using this session",
-            )
-        })
+        let mut waited = false;
+        loop {
+            let observed = {
+                state
+                    .active
+                    .lock()
+                    .expect("operation generation lock poisoned")
+                    .clone()
+            };
+            if let Some(active) = observed {
+                waited = true;
+                wait_for_replay_terminal(&active).await;
+                wait_for_generation_release(&state, &active).await;
+                continue;
+            }
+            let generation = new_replay_generation(String::new());
+            let installed = {
+                let mut active = state
+                    .active
+                    .lock()
+                    .expect("operation generation lock poisoned");
+                if active.is_none() {
+                    *active = Some(generation.clone());
+                    true
+                } else {
+                    false
+                }
+            };
+            if installed {
+                return ExplicitOperationPermit {
+                    guard: Some(ExplicitOperationGuard { state, generation }),
+                    replayed: None,
+                    replay: None,
+                    waited,
+                };
+            }
+        }
     }
 
-    async fn lock_stored_operation(&self, key: StoredCacheKey) -> OwnedMutexGuard<()> {
-        self.stored_operation_lock(key).await.lock_owned().await
+    pub async fn lock_explicit_request(
+        &self,
+        key: &ExplicitSessionKey,
+        fingerprint: String,
+    ) -> ExplicitOperationPermit {
+        let state = self
+            .stored_operation(StoredCacheKey::ExplicitSession(key.clone()))
+            .await;
+        let mut waited = false;
+        loop {
+            let observed = state
+                .active
+                .lock()
+                .expect("operation generation lock poisoned")
+                .clone();
+            if let Some(observed) = observed {
+                waited = true;
+                let outcome = wait_for_replay_terminal(&observed).await;
+                if observed.fingerprint == fingerprint
+                    && let ExplicitReplayOutcome::Complete(response) = outcome
+                {
+                    return ExplicitOperationPermit {
+                        guard: None,
+                        replayed: Some(response),
+                        replay: None,
+                        waited,
+                    };
+                }
+                wait_for_generation_release(&state, &observed).await;
+                continue;
+            }
+            let generation = new_replay_generation(fingerprint.clone());
+            let installed = {
+                let mut active = state
+                    .active
+                    .lock()
+                    .expect("operation generation lock poisoned");
+                if active.is_none() {
+                    *active = Some(generation.clone());
+                    true
+                } else {
+                    false
+                }
+            };
+            if installed {
+                return ExplicitOperationPermit {
+                    guard: Some(ExplicitOperationGuard {
+                        state: state.clone(),
+                        generation: generation.clone(),
+                    }),
+                    replayed: None,
+                    replay: Some(ExplicitReplayHandle {
+                        generation,
+                        armed: true,
+                    }),
+                    waited,
+                };
+            }
+        }
     }
 
-    async fn stored_operation_lock(&self, key: StoredCacheKey) -> Arc<Mutex<()>> {
+    async fn stored_operation(&self, key: StoredCacheKey) -> Arc<StoredOperationState> {
         {
             let mut locks = self.operation_locks.lock().await;
             locks.retain(|_, lock| lock.strong_count() > 0);
             if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
                 lock
             } else {
-                let lock = Arc::new(Mutex::new(()));
+                let lock = Arc::new(StoredOperationState::new());
                 locks.insert(key, Arc::downgrade(&lock));
                 lock
             }
@@ -1054,6 +1319,45 @@ mod explicit_tests {
     }
 
     #[tokio::test]
+    async fn replay_is_bound_to_the_generation_observed_on_arrival() {
+        let cache = ConversationCache::new();
+        let key = ExplicitSessionKey::new("principal", "session");
+        let snapshot = |body: &'static str| ExplicitResponseSnapshot {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(body.as_bytes()),
+        };
+
+        let a = cache.lock_explicit_request(&key, "a".into()).await;
+        let (a_guard, a_replay) = a.into_operation();
+        a_replay.unwrap().complete(snapshot("a"));
+
+        let b_cache = cache.clone();
+        let b_key = key.clone();
+        let b =
+            tokio::spawn(async move { b_cache.lock_explicit_request(&b_key, "b".into()).await });
+        tokio::task::yield_now().await;
+        drop(a_guard);
+        let b = b.await.unwrap();
+        assert!(b.observed_replay().is_none());
+        let (b_guard, b_replay) = b.into_operation();
+
+        let c_cache = cache.clone();
+        let c_key = key.clone();
+        let c =
+            tokio::spawn(async move { c_cache.lock_explicit_request(&c_key, "a".into()).await });
+        tokio::task::yield_now().await;
+        b_replay.unwrap().complete(snapshot("b"));
+        drop(b_guard);
+
+        let c = c.await.unwrap();
+        assert!(c.observed_replay().is_none());
+        let (c_guard, c_replay) = c.into_operation();
+        c_replay.unwrap().fail();
+        drop(c_guard);
+    }
+
+    #[tokio::test]
     async fn lifecycle_drop_attempts_persistence_once_and_releases_operation() {
         use crate::claude_web_state::explicit_session::ExplicitLifecycle;
 
@@ -1069,23 +1373,20 @@ mod explicit_tests {
         )
         .await;
         let baseline = cache.persistence_attempts.load(Ordering::Relaxed);
-        let operation = cache.try_lock_explicit_operation(&key).await.unwrap();
+        let operation = cache.lock_explicit_operation(&key).await.into_guard();
         drop(ExplicitLifecycle::new(
             cache.clone(),
             key.clone(),
             operation,
         ));
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if cache.try_lock_explicit_operation(&key).await.is_ok() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        let released = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cache.lock_explicit_operation(&key),
+        )
         .await
         .expect("operation lock must be released after one failed persistence attempt");
+        drop(released);
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert_eq!(
             cache.persistence_attempts.load(Ordering::Relaxed),

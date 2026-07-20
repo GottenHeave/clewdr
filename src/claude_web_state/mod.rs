@@ -80,6 +80,12 @@ pub struct ClaudeWebState {
     pub staged_files: Option<Arc<StagedFileStore>>,
     pub explicit_file_key: Option<conversation_cache::ExplicitSessionKey>,
     pub explicit_completion_started: bool,
+    #[cfg(test)]
+    pub explicit_recovery_barrier: Option<Arc<tokio::sync::Barrier>>,
+    #[cfg(test)]
+    pub explicit_before_replay: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    #[cfg(test)]
+    pub explicit_after_reset: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 impl ClaudeWebState {
@@ -107,6 +113,12 @@ impl ClaudeWebState {
             staged_files: None,
             explicit_file_key: None,
             explicit_completion_started: false,
+            #[cfg(test)]
+            explicit_recovery_barrier: None,
+            #[cfg(test)]
+            explicit_before_replay: None,
+            #[cfg(test)]
+            explicit_after_reset: None,
         }
     }
 
