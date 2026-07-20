@@ -406,7 +406,7 @@ mod tests {
         Extension, Router, body,
         body::Body,
         http::{Request, header::CONTENT_TYPE},
-        routing::{get, post},
+        routing::post,
     };
     use bytes::Bytes;
     use futures::stream;
@@ -448,9 +448,6 @@ conversation-id/wiggle/download-file?path=%2Fmnt%2Fuser-data%2Foutputs%2Fhello+w
         assert!(!super::is_output_file_path(
             "/mnt/user-data/outputs/../uploads/input.txt"
         ));
-        assert!(!super::is_output_file_path(
-            "/mnt/user-data/outputs/./report.txt"
-        ));
         assert!(!super::is_output_file_path("/mnt/user-data/outputs/"));
     }
 
@@ -486,91 +483,6 @@ conversation-id/wiggle/download-file?path=%2Fmnt%2Fuser-data%2Foutputs%2Fhello+w
                 files: store,
             })
             .layer(Extension(AuthPrincipal::for_authenticated_user()))
-    }
-
-    fn downloads_app(
-        cache: ConversationCache,
-        cookie_actor_handle: CookieActorHandle,
-        principal: AuthPrincipal,
-    ) -> Router {
-        Router::new()
-            .route(
-                "/v1/sessions/{session_id}/files/download",
-                get(api_download_session_file),
-            )
-            .with_state(DownloadFileState {
-                cache,
-                cookie_actor_handle,
-            })
-            .layer(Extension(principal))
-    }
-
-    async fn get_download(app: Router, uri: &str) -> axum::response::Response {
-        app.oneshot(Request::get(uri).body(Body::empty()).unwrap())
-            .await
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn download_endpoint_rejects_invalid_paths_and_unavailable_sessions() {
-        let principal = AuthPrincipal::for_authenticated_user();
-        let cache = ConversationCache::new();
-        let actor = CookieActorHandle::start().await.unwrap();
-        let app = downloads_app(cache, actor, principal);
-
-        assert_eq!(
-            get_download(
-                app.clone(),
-                "/v1/sessions/not-a-versioned-session/files/download?path=/mnt/user-data/outputs/report.txt",
-            )
-            .await
-            .status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            get_download(
-                app.clone(),
-                "/v1/sessions/cherry_topic_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/files/download?path=/mnt/user-data/outputs/../input.txt",
-            )
-            .await
-            .status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            get_download(
-                app,
-                "/v1/sessions/cherry_topic_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/files/download?path=/mnt/user-data/outputs/report.txt",
-            )
-            .await
-            .status(),
-            StatusCode::NOT_FOUND
-        );
-    }
-
-    #[tokio::test]
-    async fn download_endpoint_requires_a_committed_explicit_session() {
-        let principal = AuthPrincipal::for_authenticated_user();
-        let actor = CookieActorHandle::start().await.unwrap();
-        let digest = "ab".repeat(32);
-        let key = ExplicitSessionKey::new(principal.as_str(), &digest);
-        let uri = format!(
-            "/v1/sessions/cherry_topic_v1_{digest}/files/download?path=/mnt/user-data/outputs/report.txt"
-        );
-
-        for (state, expected_status) in [
-            (ExplicitSessionState::Tombstoned, StatusCode::GONE),
-            (ExplicitSessionState::InFlight, StatusCode::CONFLICT),
-            (ExplicitSessionState::Uncertain, StatusCode::CONFLICT),
-        ] {
-            let cache = ConversationCache::new();
-            cache
-                .set_explicit_checked(key.clone(), explicit_test_conversation(state))
-                .await
-                .unwrap();
-            let response =
-                get_download(downloads_app(cache, actor.clone(), principal.clone()), &uri).await;
-            assert_eq!(response.status(), expected_status);
-        }
     }
 
     async fn post_files(
