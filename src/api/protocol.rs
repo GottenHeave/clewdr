@@ -2,19 +2,31 @@ use std::sync::Arc;
 
 use axum::{
     Extension, Json,
-    extract::{FromRequest, Multipart, Request, State},
-    http::StatusCode,
+    body::Body,
+    extract::{FromRequest, Multipart, Path, Query, Request, State},
+    http::{
+        StatusCode,
+        header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE},
+    },
+    response::Response,
 };
-use futures::stream;
+use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
+use url::Url;
+use wreq::Method;
 
 use crate::{
     claude_web_state::{
-        conversation_cache::{ConversationCache, ExplicitSessionKey},
-        explicit_session::reset_explicit_session,
+        ClaudeWebState,
+        conversation_cache::{ConversationCache, ExplicitOperationGuard, ExplicitSessionKey},
+        explicit_session::{ExplicitSessionState, reset_explicit_session},
     },
+    config::CookieStatus,
+    error::{CheckClaudeErr, ClewdrError},
     protocol::{AuthPrincipal, ProtocolError, parse_session_id},
     protocol_files::{FileResponse, StagedFileStore},
+    services::cookie_actor::CookieActorHandle,
 };
 
 #[derive(Clone)]
@@ -27,6 +39,227 @@ pub(crate) struct ResetApiState {
 pub(crate) struct FileApiState {
     pub cache: ConversationCache,
     pub files: Option<Arc<StagedFileStore>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DownloadFileState {
+    pub cache: ConversationCache,
+    pub cookie_actor_handle: CookieActorHandle,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct DownloadFileQuery {
+    path: String,
+}
+
+struct CookieLease {
+    cookie: Option<CookieStatus>,
+    handle: CookieActorHandle,
+    operation: Option<ExplicitOperationGuard>,
+}
+
+impl CookieLease {
+    fn new(
+        cookie: CookieStatus,
+        handle: CookieActorHandle,
+        operation: ExplicitOperationGuard,
+    ) -> Self {
+        Self {
+            cookie: Some(cookie),
+            handle,
+            operation: Some(operation),
+        }
+    }
+
+    async fn release(&mut self) {
+        if let Some(cookie) = self.cookie.take()
+            && let Err(error) = self.handle.return_cookie(cookie, None).await
+        {
+            warn!("Failed to return session Cookie after file download: {error}");
+        }
+        self.operation.take();
+    }
+}
+
+impl Drop for CookieLease {
+    fn drop(&mut self) {
+        let cookie = self.cookie.take();
+        let operation = self.operation.take();
+        let handle = self.handle.clone();
+        tokio::spawn(async move {
+            if let Some(cookie) = cookie
+                && let Err(error) = handle.return_cookie(cookie, None).await
+            {
+                warn!("Failed to return interrupted file-download Cookie: {error}");
+            }
+            drop(operation);
+        });
+    }
+}
+
+pub(crate) async fn api_download_session_file(
+    State(state): State<DownloadFileState>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(session_id): Path<String>,
+    Query(query): Query<DownloadFileQuery>,
+) -> Result<Response, ClewdrError> {
+    let session_digest = parse_session_id(Some(&session_id))
+        .map_err(|error| {
+            ProtocolError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_session_id",
+                error.to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            ProtocolError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_session_id",
+                "Remote file downloads require a versioned explicit session ID",
+            )
+        })?;
+    if !is_output_file_path(&query.path) {
+        return Err(ProtocolError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_file_path",
+            "Remote file downloads are limited to /mnt/user-data/outputs",
+        )
+        .into());
+    }
+
+    let key = ExplicitSessionKey::new(principal.as_str(), &session_digest);
+    let operation = state.cache.lock_explicit_operation(&key).await.into_guard();
+    let conversation = state.cache.get_explicit(&key).await.ok_or_else(|| {
+        ProtocolError::new(
+            StatusCode::NOT_FOUND,
+            "session_not_found",
+            "The requested session does not exist for this authenticated principal",
+        )
+    })?;
+    let explicit = conversation.explicit.as_ref().ok_or_else(|| {
+        ProtocolError::new(
+            StatusCode::CONFLICT,
+            "conversation_reuse_failed",
+            "The requested session has no explicit conversation binding",
+        )
+    })?;
+    match explicit.state {
+        ExplicitSessionState::Committed => {}
+        ExplicitSessionState::Tombstoned => {
+            return Err(ProtocolError::new(
+                StatusCode::GONE,
+                "conversation_expired",
+                "The upstream conversation has expired and must be reset",
+            )
+            .into());
+        }
+        ExplicitSessionState::InFlight | ExplicitSessionState::Uncertain => {
+            return Err(ProtocolError::new(
+                StatusCode::CONFLICT,
+                "conversation_state_uncertain",
+                "The session is not available for a remote file download",
+            )
+            .into());
+        }
+    }
+
+    let mut web = ClaudeWebState::new(state.cookie_actor_handle.clone(), state.cache.clone());
+    let cookie = web
+        .request_session_cookie(&session_digest, Some(&conversation.cookie_id))
+        .await;
+    if matches!(cookie, Err(ClewdrError::NoCookieAvailable)) {
+        state.cache.tombstone_explicit(&key).await?;
+        return Err(ProtocolError::new(
+            StatusCode::GONE,
+            "conversation_expired",
+            "The session Cookie is no longer available",
+        )
+        .into());
+    }
+    cookie?;
+    web.conv_uuid = Some(conversation.conv_uuid.clone());
+    let endpoint = match conversation_download_endpoint(
+        &web.endpoint,
+        &conversation.org_uuid,
+        &conversation.conv_uuid,
+        &query.path,
+    ) {
+        Ok(endpoint) => endpoint,
+        Err(source) => {
+            web.return_cookie(None).await;
+            return Err(ClewdrError::Whatever {
+                message: "Failed to build conversation file-download URL".to_string(),
+                source: Some(Box::new(source)),
+            });
+        }
+    };
+    let upstream = match web.build_request(Method::GET, endpoint).send().await {
+        Ok(response) => match response.check_claude().await {
+            Ok(response) => response,
+            Err(error) => {
+                if let ClewdrError::InvalidCookie { reason } = &error {
+                    web.return_cookie(Some(reason.to_owned())).await;
+                } else {
+                    web.return_cookie(None).await;
+                }
+                return Err(error);
+            }
+        },
+        Err(source) => {
+            web.return_cookie(None).await;
+            return Err(ClewdrError::WreqError {
+                msg: "Failed to download remote file",
+                source,
+            });
+        }
+    };
+    let mut response = Response::builder().status(StatusCode::OK);
+    for header in [CONTENT_TYPE, CONTENT_DISPOSITION, CONTENT_LENGTH] {
+        if let Some(value) = upstream.headers().get(&header) {
+            response = response.header(header, value);
+        }
+    }
+    let cookie = web.cookie.take().ok_or(ClewdrError::UnexpectedNone {
+        msg: "session Cookie was not retained for the remote file download",
+    })?;
+    let stream = upstream.bytes_stream();
+    let mut lease = CookieLease::new(cookie, state.cookie_actor_handle, operation);
+    let stream = async_stream::stream! {
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            yield chunk;
+        }
+        lease.release().await;
+    };
+    response
+        .body(Body::from_stream(stream))
+        .map_err(|error| ClewdrError::Whatever {
+            message: "Failed to construct remote file-download response".to_string(),
+            source: Some(Box::new(error)),
+        })
+}
+
+fn is_output_file_path(path: &str) -> bool {
+    let Some(relative) = path.strip_prefix("/mnt/user-data/outputs/") else {
+        return false;
+    };
+    !relative.is_empty()
+        && relative
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn conversation_download_endpoint(
+    endpoint: &Url,
+    organization_uuid: &str,
+    conversation_uuid: &str,
+    path: &str,
+) -> Result<Url, url::ParseError> {
+    let mut url = endpoint.join(&format!(
+        "api/organizations/{organization_uuid}/conversations/{conversation_uuid}/wiggle/download-file"
+    ))?;
+    url.query_pairs_mut().append_pair("path", path);
+    Ok(url)
 }
 
 pub(crate) struct ProtocolMultipart(Multipart);
@@ -173,7 +406,7 @@ mod tests {
         Extension, Router, body,
         body::Body,
         http::{Request, header::CONTENT_TYPE},
-        routing::post,
+        routing::{get, post},
     };
     use bytes::Bytes;
     use futures::stream;
@@ -184,6 +417,42 @@ mod tests {
         conversation_cache::{explicit_test_conversation, explicit_test_seed},
         explicit_session::ExplicitSessionState,
     };
+
+    #[test]
+    fn download_endpoint_uses_the_session_bound_claude_web_route() {
+        let endpoint = url::Url::parse("https://claude.ai/").unwrap();
+
+        let download = super::conversation_download_endpoint(
+            &endpoint,
+            "organization-id",
+            "conversation-id",
+            "/mnt/user-data/outputs/hello world.md",
+        )
+        .unwrap();
+
+        assert_eq!(
+            download.as_str(),
+            "https://claude.ai/api/organizations/organization-id/conversations/\
+conversation-id/wiggle/download-file?path=%2Fmnt%2Fuser-data%2Foutputs%2Fhello+world.md"
+        );
+    }
+
+    #[test]
+    fn remote_downloads_accept_only_output_files_without_traversal() {
+        assert!(super::is_output_file_path(
+            "/mnt/user-data/outputs/exports/hello-world.md"
+        ));
+        assert!(!super::is_output_file_path(
+            "/mnt/user-data/uploads/input.txt"
+        ));
+        assert!(!super::is_output_file_path(
+            "/mnt/user-data/outputs/../uploads/input.txt"
+        ));
+        assert!(!super::is_output_file_path(
+            "/mnt/user-data/outputs/./report.txt"
+        ));
+        assert!(!super::is_output_file_path("/mnt/user-data/outputs/"));
+    }
 
     fn multipart_body(boundary: &str, fields: &[(&str, &str, &str, &[u8])]) -> Vec<u8> {
         let mut body = Vec::new();
@@ -217,6 +486,91 @@ mod tests {
                 files: store,
             })
             .layer(Extension(AuthPrincipal::for_authenticated_user()))
+    }
+
+    fn downloads_app(
+        cache: ConversationCache,
+        cookie_actor_handle: CookieActorHandle,
+        principal: AuthPrincipal,
+    ) -> Router {
+        Router::new()
+            .route(
+                "/v1/sessions/{session_id}/files/download",
+                get(api_download_session_file),
+            )
+            .with_state(DownloadFileState {
+                cache,
+                cookie_actor_handle,
+            })
+            .layer(Extension(principal))
+    }
+
+    async fn get_download(app: Router, uri: &str) -> axum::response::Response {
+        app.oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn download_endpoint_rejects_invalid_paths_and_unavailable_sessions() {
+        let principal = AuthPrincipal::for_authenticated_user();
+        let cache = ConversationCache::new();
+        let actor = CookieActorHandle::start().await.unwrap();
+        let app = downloads_app(cache, actor, principal);
+
+        assert_eq!(
+            get_download(
+                app.clone(),
+                "/v1/sessions/not-a-versioned-session/files/download?path=/mnt/user-data/outputs/report.txt",
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get_download(
+                app.clone(),
+                "/v1/sessions/cherry_topic_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/files/download?path=/mnt/user-data/outputs/../input.txt",
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get_download(
+                app,
+                "/v1/sessions/cherry_topic_v1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/files/download?path=/mnt/user-data/outputs/report.txt",
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn download_endpoint_requires_a_committed_explicit_session() {
+        let principal = AuthPrincipal::for_authenticated_user();
+        let actor = CookieActorHandle::start().await.unwrap();
+        let digest = "ab".repeat(32);
+        let key = ExplicitSessionKey::new(principal.as_str(), &digest);
+        let uri = format!(
+            "/v1/sessions/cherry_topic_v1_{digest}/files/download?path=/mnt/user-data/outputs/report.txt"
+        );
+
+        for (state, expected_status) in [
+            (ExplicitSessionState::Tombstoned, StatusCode::GONE),
+            (ExplicitSessionState::InFlight, StatusCode::CONFLICT),
+            (ExplicitSessionState::Uncertain, StatusCode::CONFLICT),
+        ] {
+            let cache = ConversationCache::new();
+            cache
+                .set_explicit_checked(key.clone(), explicit_test_conversation(state))
+                .await
+                .unwrap();
+            let response =
+                get_download(downloads_app(cache, actor.clone(), principal.clone()), &uri).await;
+            assert_eq!(response.status(), expected_status);
+        }
     }
 
     async fn post_files(

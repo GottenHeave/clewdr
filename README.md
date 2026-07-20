@@ -24,6 +24,7 @@ It keeps resource usage low, serves OpenAI-style endpoints, and ships with a Lep
 | Claude.ai | `http://127.0.0.1:8484/v1/messages` |
 | Claude.ai session reset | `http://127.0.0.1:8484/v1/sessions/reset` |
 | Claude.ai staged files | `http://127.0.0.1:8484/v1/files` |
+| Claude.ai remote file download | `http://127.0.0.1:8484/v1/sessions/{session_id}/files/download?path=...` |
 | Claude.ai OpenAI compatible | `http://127.0.0.1:8484/v1/chat/completions` |
 | Claude Code | `http://127.0.0.1:8484/code/v1/messages` |
 | Claude Code OpenAI compatible | `http://127.0.0.1:8484/code/v1/chat/completions` |

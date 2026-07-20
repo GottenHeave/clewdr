@@ -135,7 +135,17 @@ impl RouterBuilder {
                 cache: self.protocol_cache.clone(),
                 files: self.staged_files.clone(),
             });
-        self.inner = self.inner.merge(reset).merge(files);
+        let downloads = Router::new()
+            .route(
+                "/v1/sessions/{session_id}/files/download",
+                get(api_download_session_file),
+            )
+            .layer(from_extractor::<RequireFlexibleAuth>())
+            .with_state(DownloadFileState {
+                cache: self.protocol_cache.clone(),
+                cookie_actor_handle: self.cookie_actor_handle.clone(),
+            });
+        self.inner = self.inner.merge(reset).merge(files).merge(downloads);
         self
     }
 
