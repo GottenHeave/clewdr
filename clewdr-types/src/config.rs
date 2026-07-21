@@ -16,6 +16,7 @@ pub struct ConfigApi {
     pub admin_password: String,
     pub proxy: Option<String>,
     pub rproxy: Option<String>,
+    pub public_base_url: Option<String>,
     #[serde(default)]
     pub max_retries: usize,
     #[serde(default)]

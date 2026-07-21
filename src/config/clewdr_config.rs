@@ -86,6 +86,8 @@ pub struct ClewdrConfig {
     pub proxy: Option<String>,
     #[serde(default)]
     pub rproxy: Option<Url>,
+    #[serde(default)]
+    pub public_base_url: Option<Url>,
 
     // Api settings, can hot reload
     #[serde(default = "default_max_retries")]
@@ -155,6 +157,7 @@ impl Default for ClewdrConfig {
             ip: default_ip(),
             port: default_port(),
             rproxy: None,
+            public_base_url: None,
             use_real_roles: default_use_real_roles(),
             custom_prompt: String::new(),
             custom_h: None,
@@ -215,6 +218,9 @@ impl Display for ClewdrConfig {
         if let Some(ref rproxy) = self.rproxy {
             writeln!(f, "Reverse Proxy: {}", rproxy.to_string().blue())?;
         }
+        if let Some(ref public_base_url) = self.public_base_url {
+            writeln!(f, "Public Base URL: {}", public_base_url.to_string().blue())?;
+        }
         writeln!(f, "Skip Free: {}", enabled(self.skip_non_pro))?;
         writeln!(f, "Skip restricted: {}", enabled(self.skip_restricted))?;
         writeln!(
@@ -249,6 +255,7 @@ impl From<&ClewdrConfig> for clewdr_types::ConfigApi {
             admin_password: c.admin_password.clone(),
             proxy: c.proxy.clone(),
             rproxy: c.rproxy.as_ref().map(|u| u.to_string()),
+            public_base_url: c.public_base_url.as_ref().map(|u| u.to_string()),
             max_retries: c.max_retries,
             preserve_chats: c.preserve_chats,
             web_search: c.web_search,
@@ -281,6 +288,7 @@ impl From<clewdr_types::ConfigApi> for ClewdrConfig {
             admin_password: c.admin_password,
             proxy: c.proxy,
             rproxy: c.rproxy.and_then(|s| Url::parse(&s).ok()),
+            public_base_url: c.public_base_url.and_then(|s| Url::parse(&s).ok()),
             max_retries: c.max_retries,
             preserve_chats: c.preserve_chats,
             web_search: c.web_search,

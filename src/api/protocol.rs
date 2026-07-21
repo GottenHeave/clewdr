@@ -24,7 +24,7 @@ use crate::{
     },
     config::CookieStatus,
     error::{CheckClaudeErr, ClewdrError},
-    protocol::{AuthPrincipal, ProtocolError, parse_session_id},
+    protocol::{AuthPrincipal, ProtocolError, is_output_file_path, parse_session_id},
     protocol_files::{FileResponse, StagedFileStore},
     services::cookie_actor::CookieActorHandle,
 };
@@ -99,7 +99,6 @@ impl Drop for CookieLease {
 
 pub(crate) async fn api_download_session_file(
     State(state): State<DownloadFileState>,
-    Extension(principal): Extension<AuthPrincipal>,
     Path(session_id): Path<String>,
     Query(query): Query<DownloadFileQuery>,
 ) -> Result<Response, ClewdrError> {
@@ -127,13 +126,16 @@ pub(crate) async fn api_download_session_file(
         .into());
     }
 
-    let key = ExplicitSessionKey::new(principal.as_str(), &session_digest);
+    let key = ExplicitSessionKey::new(
+        AuthPrincipal::for_authenticated_user().as_str(),
+        &session_digest,
+    );
     let operation = state.cache.lock_explicit_operation(&key).await.into_guard();
     let conversation = state.cache.get_explicit(&key).await.ok_or_else(|| {
         ProtocolError::new(
             StatusCode::NOT_FOUND,
             "session_not_found",
-            "The requested session does not exist for this authenticated principal",
+            "The requested session does not exist",
         )
     })?;
     let explicit = conversation.explicit.as_ref().ok_or_else(|| {
@@ -237,16 +239,6 @@ pub(crate) async fn api_download_session_file(
             message: "Failed to construct remote file-download response".to_string(),
             source: Some(Box::new(error)),
         })
-}
-
-fn is_output_file_path(path: &str) -> bool {
-    let Some(relative) = path.strip_prefix("/mnt/user-data/outputs/") else {
-        return false;
-    };
-    !relative.is_empty()
-        && relative
-            .split('/')
-            .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
 fn conversation_download_endpoint(
@@ -439,16 +431,18 @@ conversation-id/wiggle/download-file?path=%2Fmnt%2Fuser-data%2Foutputs%2Fhello+w
 
     #[test]
     fn remote_downloads_accept_only_output_files_without_traversal() {
-        assert!(super::is_output_file_path(
+        assert!(crate::protocol::is_output_file_path(
             "/mnt/user-data/outputs/exports/hello-world.md"
         ));
-        assert!(!super::is_output_file_path(
+        assert!(!crate::protocol::is_output_file_path(
             "/mnt/user-data/uploads/input.txt"
         ));
-        assert!(!super::is_output_file_path(
+        assert!(!crate::protocol::is_output_file_path(
             "/mnt/user-data/outputs/../uploads/input.txt"
         ));
-        assert!(!super::is_output_file_path("/mnt/user-data/outputs/"));
+        assert!(!crate::protocol::is_output_file_path(
+            "/mnt/user-data/outputs/"
+        ));
     }
 
     fn multipart_body(boundary: &str, fields: &[(&str, &str, &str, &[u8])]) -> Vec<u8> {

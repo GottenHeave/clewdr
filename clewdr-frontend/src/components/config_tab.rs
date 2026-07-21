@@ -78,6 +78,9 @@ pub fn ConfigTab() -> impl IntoView {
                 "admin_password" => c.admin_password = value,
                 "proxy" => c.proxy = if value.is_empty() { None } else { Some(value) },
                 "rproxy" => c.rproxy = if value.is_empty() { None } else { Some(value) },
+                "public_base_url" => {
+                    c.public_base_url = if value.is_empty() { None } else { Some(value) }
+                }
                 "max_retries" => c.max_retries = value.parse().unwrap_or(c.max_retries),
                 "custom_h" => c.custom_h = if value.is_empty() { None } else { Some(value) },
                 "custom_a" => c.custom_a = if value.is_empty() { None } else { Some(value) },
@@ -194,6 +197,7 @@ pub fn ConfigTab() -> impl IntoView {
                                     <TextInput name="admin_password" label=i18n.t("config.sections.network.adminPassword") value=cfg.admin_password.clone() input_type="password" on_input=on_input />
                                     <TextInput name="proxy" label=i18n.t("config.sections.network.proxy") value=cfg.proxy.clone().unwrap_or_default() on_input=on_input />
                                     <TextInput name="rproxy" label=i18n.t("config.sections.network.rproxy") value=cfg.rproxy.clone().unwrap_or_default() on_input=on_input />
+                                    <TextInput name="public_base_url" label=i18n.t("config.sections.network.publicBaseUrl") value=cfg.public_base_url.clone().unwrap_or_default() on_input=on_input />
                                 </ConfigSection>
 
                                 // API

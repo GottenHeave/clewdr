@@ -24,7 +24,7 @@ It keeps resource usage low, serves OpenAI-style endpoints, and ships with a Lep
 | Claude.ai | `http://127.0.0.1:8484/v1/messages` |
 | Claude.ai session reset | `http://127.0.0.1:8484/v1/sessions/reset` |
 | Claude.ai staged files | `http://127.0.0.1:8484/v1/files` |
-| Claude.ai remote file download | `http://127.0.0.1:8484/v1/sessions/{session_id}/files/download?path=...` |
+| Claude.ai remote file download | `GET http://127.0.0.1:8484/v1/sessions/{session_id}/files/download?path=...` |
 | Claude.ai OpenAI compatible | `http://127.0.0.1:8484/v1/chat/completions` |
 | Claude Code | `http://127.0.0.1:8484/code/v1/messages` |
 | Claude Code OpenAI compatible | `http://127.0.0.1:8484/code/v1/chat/completions` |
@@ -43,6 +43,12 @@ completion validation and memory use grows with the response body, up to a 16
 MiB limit. A larger response returns `502 explicit_response_too_large`.
 Streaming without an explicit session remains incremental. Expired staged files
 still require a new upload.
+
+When an explicit-session response names a file under
+`/mnt/user-data/outputs/`, ClewdR appends a `Download Files` section. Set
+`public_base_url` to make those links absolute, or leave it unset to use
+relative `/v1/...` links. The download endpoint is public; treat each explicit
+session ID as an output-file access capability.
 
 Upload large files to `/v1/files` as multipart form data containing exactly one
 field named `file`. The returned `file_clewdr_v1_*` ID can be referenced by

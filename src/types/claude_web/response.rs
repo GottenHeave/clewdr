@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use async_stream::try_stream;
 use axum::{
     BoxError, Json,
@@ -6,6 +8,7 @@ use axum::{
 use bytes::Bytes;
 use eventsource_stream::{EventStream, Eventsource};
 use futures::{Stream, TryStreamExt};
+use regex::Regex;
 use serde::Deserialize;
 use url::Url;
 use wreq::Proxy;
@@ -15,32 +18,82 @@ use crate::{
     claude_web_state::ClaudeWebState,
     claude_web_state::explicit_session::digest_assistant_output,
     error::{CheckClaudeErr, ClewdrError},
+    protocol::{is_output_file_path, output_file_download_url},
     types::claude::{
-        ContentBlock, CountMessageTokensResponse, CreateMessageParams, CreateMessageResponse,
-        Message, Role,
+        ContentBlock, ContentBlockDelta, CountMessageTokensResponse, CreateMessageParams,
+        CreateMessageResponse, Message, Role, StreamEvent,
     },
     utils::print_out_text,
 };
+
+static OUTPUT_FILE_PATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"/mnt/user-data/outputs/[^\s<>()\[\]{}\"']+"#)
+        .expect("output file path pattern is valid")
+});
 
 pub async fn merge_sse(
     stream: EventStream<impl Stream<Item = Result<Bytes, wreq::Error>>>,
 ) -> Result<(String, bool), ClewdrError> {
     // Collect all SSE events so completion text can be merged and message_stop can
     // decide whether an explicit lifecycle may commit the turn.
-    #[derive(Deserialize)]
-    struct Data {
-        completion: String,
-    }
     let events = stream.try_collect::<Vec<_>>().await?;
     let saw_message_stop = events
         .iter()
         .any(|event| is_message_stop(&event.event, &event.data));
-    let text = events
-        .iter()
-        .filter_map(|event| serde_json::from_str::<Data>(&event.data).ok())
-        .map(|data| data.completion)
-        .collect();
+    let text = events.iter().filter_map(event_text).collect();
     Ok((text, saw_message_stop))
+}
+
+fn event_text(event: &eventsource_stream::Event) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Data {
+        completion: String,
+    }
+
+    if let Ok(data) = serde_json::from_str::<Data>(&event.data) {
+        return Some(data.completion);
+    }
+    let StreamEvent::ContentBlockDelta {
+        delta: ContentBlockDelta::TextDelta { text },
+        ..
+    } = serde_json::from_str(&event.data).ok()?
+    else {
+        return None;
+    };
+    Some(text)
+}
+
+fn output_file_links(text: &str, session_digest: Option<&str>) -> Option<String> {
+    let session_digest = session_digest?;
+    let mut paths = Vec::new();
+    for candidate in OUTPUT_FILE_PATH.find_iter(text) {
+        let path = candidate.as_str().trim_end_matches(|character: char| {
+            matches!(character, '.' | ',' | ';' | ':' | '!' | '?')
+        });
+        if is_output_file_path(path) && !paths.iter().any(|known| known == path) {
+            paths.push(path.to_owned());
+        }
+    }
+    (!paths.is_empty()).then(|| {
+        let links = paths
+            .iter()
+            .map(|path| {
+                let name = path.rsplit('/').next().unwrap_or(path);
+                format!(
+                    "- [{name}]({})",
+                    output_file_download_url(session_digest, path)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\n\nDownload Files\n{links}")
+    })
+}
+
+fn stream_event(event: StreamEvent) -> Result<SseEvent, axum::Error> {
+    SseEvent::default()
+        .json_data(event)
+        .map_err(axum::Error::new)
 }
 
 fn is_message_stop(event: &str, data: &str) -> bool {
@@ -82,6 +135,7 @@ impl ClaudeWebState {
             let endpoint = self.endpoint.clone();
             let proxy = self.proxy.clone();
             let client = self.client.clone();
+            let explicit_session_digest = self.explicit_session_digest.clone();
             if crate::config::CLEWDR_CONFIG.load().enable_web_count_tokens
                 && let Some(tokens) = self.try_code_count_tokens().await
             {
@@ -97,21 +151,52 @@ impl ClaudeWebState {
                 let lifecycle = explicit_lifecycle;
                 let mut explicit_finalized = false;
                 let mut acc = String::new();
-                #[derive(serde::Deserialize)]
-                struct Data { completion: String }
+                let mut active_text_block = None;
+                let mut next_content_block_index = 0;
                 futures::pin_mut!(stream);
                 while let Some(event) = stream.try_next().await? {
-                    // message_stop is the commit boundary; EOF or downstream drop is uncertain.
-                    if is_message_stop(&event.event, &event.data)
-                        && let Some(lifecycle) = &lifecycle
-                    {
-                        let digest = (!acc.is_empty()).then(|| digest_assistant_output(&acc));
-                        lifecycle.commit(digest).await.map_err(axum::Error::new)?;
-                        explicit_finalized = true;
+                    if let Ok(StreamEvent::ContentBlockStart { index, content_block }) = serde_json::from_str(&event.data) {
+                        next_content_block_index = next_content_block_index.max(index.saturating_add(1));
+                        if matches!(content_block, ContentBlock::Text { .. }) {
+                            active_text_block = Some(index);
+                        }
                     }
-                    // Forward every event while accumulating only completion payloads.
-                    if let Ok(d) = serde_json::from_str::<Data>(&event.data) {
-                        acc.push_str(&d.completion);
+                    if let Ok(StreamEvent::ContentBlockStop { index }) = serde_json::from_str(&event.data) {
+                        next_content_block_index = next_content_block_index.max(index.saturating_add(1));
+                        if active_text_block == Some(index) {
+                            active_text_block = None;
+                        }
+                    }
+                    if let Some(text) = event_text(&event) {
+                        acc.push_str(&text);
+                    }
+                    // message_stop is the commit boundary; EOF or downstream drop is uncertain.
+                    if is_message_stop(&event.event, &event.data) {
+                        if let Some(links) = output_file_links(&acc, explicit_session_digest.as_deref()) {
+                            let index = active_text_block.unwrap_or(next_content_block_index);
+                            if active_text_block.is_none() {
+                                yield stream_event(StreamEvent::ContentBlockStart {
+                                    index,
+                                    content_block: ContentBlock::Text {
+                                        text: String::new(),
+                                        cache_control: None,
+                                        citations: None,
+                                    },
+                                })?;
+                            }
+                            yield stream_event(StreamEvent::ContentBlockDelta {
+                                index,
+                                delta: ContentBlockDelta::TextDelta { text: links },
+                            })?;
+                            if active_text_block.is_none() {
+                                yield stream_event(StreamEvent::ContentBlockStop { index })?;
+                            }
+                        }
+                        if let Some(lifecycle) = &lifecycle {
+                            let digest = (!acc.is_empty()).then(|| digest_assistant_output(&acc));
+                            lifecycle.commit(digest).await.map_err(axum::Error::new)?;
+                            explicit_finalized = true;
+                        }
                     }
                     let e = SseEvent::default().event(event.event).id(event.id);
                     let e = if let Some(retry) = event.retry { e.retry(retry) } else { e };
@@ -212,8 +297,11 @@ impl ClaudeWebState {
         }
 
         print_out_text(text.to_owned(), "claude_web_non_stream.txt");
+        let response_text = output_file_links(&text, self.explicit_session_digest.as_deref())
+            .map(|links| format!("{text}{links}"))
+            .unwrap_or_else(|| text.clone());
         let mut response =
-            CreateMessageResponse::text(text.clone(), Default::default(), self.usage.to_owned());
+            CreateMessageResponse::text(response_text, Default::default(), self.usage.to_owned());
 
         let enable_precise = crate::config::CLEWDR_CONFIG.load().enable_web_count_tokens;
         let mut usage = self.usage.to_owned();
@@ -341,6 +429,25 @@ mod explicit_session_tests {
         services::cookie_actor::CookieActorHandle,
     };
 
+    #[test]
+    fn output_paths_append_download_links_for_explicit_sessions() {
+        let digest = "ab".repeat(32);
+        let links = super::output_file_links(
+            "Created /mnt/user-data/outputs/report.pdf and /mnt/user-data/outputs/report.pdf.",
+            Some(&digest),
+        )
+        .unwrap();
+
+        assert!(links.starts_with("\n\nDownload Files\n"));
+        assert_eq!(
+            links.lines().filter(|line| line.starts_with("- [")).count(),
+            1
+        );
+        assert!(links.contains(&format!("cherry_topic_v1_{digest}")));
+        assert!(links.contains("path=%2Fmnt%2Fuser-data%2Foutputs%2Freport.pdf"));
+        assert!(super::output_file_links("/mnt/user-data/outputs/report.pdf", None).is_none());
+    }
+
     async fn healthy_stream() -> Response {
         Response::builder()
             .header(CONTENT_TYPE, "text/event-stream")
@@ -354,6 +461,15 @@ mod explicit_session_tests {
         Response::builder()
             .header(CONTENT_TYPE, "text/event-stream")
             .body(Body::from("data: {\"type\":\"message_start\"}\n\n"))
+            .unwrap()
+    }
+
+    async fn output_file_stream() -> Response {
+        Response::builder()
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(
+                "data: {\"completion\":\"Created /mnt/user-data/outputs/report.pdf\"}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+            ))
             .unwrap()
     }
 
@@ -383,7 +499,8 @@ mod explicit_session_tests {
     async fn upstream_response(path: &'static str) -> wreq::Response {
         let app = Router::new()
             .route("/healthy", get(healthy_stream))
-            .route("/incomplete", get(incomplete_stream));
+            .route("/incomplete", get(incomplete_stream))
+            .route("/output-file", get(output_file_stream));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -405,6 +522,27 @@ mod explicit_session_tests {
             .transform_response(upstream_response(path).await)
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn streaming_response_appends_links_before_message_stop() {
+        let handle = CookieActorHandle::start().await.unwrap();
+        let mut state = ClaudeWebState::new(handle, ConversationCache::new());
+        state.stream = true;
+        state.explicit_session_digest = Some("ab".repeat(32));
+        let response = state
+            .transform_response(upstream_response("output-file").await)
+            .await
+            .unwrap();
+        let body = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let links = body.find("Download Files").unwrap();
+        let stop = body.rfind("message_stop").unwrap();
+
+        assert!(links < stop);
+        assert!(body.contains("cherry_topic_v1_"));
     }
 
     #[tokio::test]

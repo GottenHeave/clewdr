@@ -136,7 +136,8 @@
         "proxy": "Proxy (optional)",
         "proxyPlaceholder": "http://proxy:port",
         "rproxy": "Reverse Proxy (optional)",
-        "rproxyPlaceholder": "https://example.com"
+        "rproxyPlaceholder": "https://example.com",
+        "publicBaseUrl": "Public Base URL (optional)"
       },
       "api": {
         "title": "API Settings",

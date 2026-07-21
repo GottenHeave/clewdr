@@ -360,6 +360,7 @@ impl ClaudeWebState {
         session_digest: String,
     ) -> Result<axum::response::Response, ClewdrError> {
         let principal = self.principal.clone().ok_or(ClewdrError::InvalidAuth)?;
+        self.explicit_session_digest = Some(session_digest.clone());
         let key = ExplicitSessionKey::new(principal.as_str(), &session_digest);
         let fingerprint = explicit_request_fingerprint(self, &p);
         let mut recovery_attempted = false;
