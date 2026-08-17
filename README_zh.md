@@ -56,7 +56,7 @@ SillyTavern：
 {
   "api_url": "http://127.0.0.1:8484/v1/chat/completions",
   "api_key": "控制台显示的密码",
-  "model": "claude-3-sonnet-20240229"
+  "model": "claude-sonnet-5"
 }
 ```
 
@@ -68,7 +68,7 @@ Continue（VS Code）：
     {
       "title": "Claude via ClewdR",
       "provider": "openai",
-      "model": "claude-3-sonnet-20240229",
+      "model": "claude-sonnet-5",
       "apiBase": "http://127.0.0.1:8484/v1/",
       "apiKey": "控制台显示的密码"
     }

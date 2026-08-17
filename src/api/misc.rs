@@ -232,51 +232,29 @@ pub async fn api_auth(AuthBearer(t): AuthBearer) -> StatusCode {
     StatusCode::OK
 }
 
+// Active Claude Web bootstrap models plus Clewdr's thinking compatibility aliases.
 const MODEL_LIST: &[&str] = &[
-    "claude-3-7-sonnet-20250219",
-    "claude-3-7-sonnet-20250219-thinking",
-    "claude-sonnet-4-20250514",
-    "claude-sonnet-4-20250514-thinking",
-    "claude-sonnet-4-20250514-1M",
-    "claude-sonnet-4-20250514-1M-thinking",
-    "claude-sonnet-4-5-20250929",
-    "claude-sonnet-4-5-20250929-thinking",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-5-thinking",
-    "claude-sonnet-4-5-20250929-1M",
-    "claude-sonnet-4-5-20250929-1M-thinking",
-    "claude-sonnet-4-6",
-    "claude-sonnet-4-6-thinking",
-    "claude-sonnet-4-6-1M",
-    "claude-sonnet-4-6-1M-thinking",
+    "claude-fable-5",
+    "claude-fable-5-thinking",
+    "claude-opus-5",
+    "claude-opus-5-thinking",
     "claude-sonnet-5",
     "claude-sonnet-5-thinking",
     "claude-haiku-4-5-20251001",
     "claude-haiku-4-5-20251001-thinking",
-    "claude-haiku-4-5",
-    "claude-haiku-4-5-thinking",
-    "claude-opus-4-20250514",
-    "claude-opus-4-20250514-thinking",
-    "claude-opus-4-1-20250805",
-    "claude-opus-4-1-20250805-thinking",
-    "claude-opus-4-1",
-    "claude-opus-4-1-thinking",
-    "claude-opus-4-5-20251101",
-    "claude-opus-4-5-20251101-thinking",
-    "claude-opus-4-5",
-    "claude-opus-4-5-thinking",
-    "claude-opus-4-6",
-    "claude-opus-4-6-thinking",
-    "claude-opus-4-6-1M",
-    "claude-opus-4-6-1M-thinking",
-    "claude-opus-4-7",
-    "claude-opus-4-7-thinking",
     "claude-opus-4-8",
     "claude-opus-4-8-thinking",
+    "claude-opus-4-7",
+    "claude-opus-4-7-thinking",
+    "claude-opus-4-6",
+    "claude-opus-4-6-thinking",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-6-thinking",
+    "claude-3-opus-20240229",
 ];
 
 /// API endpoint to get the list of available models
-/// Retrieves the list of models from the configuration
+/// Retrieves the active Claude Web models and compatibility aliases
 pub async fn api_get_models() -> Json<Value> {
     let data: Vec<Value> = MODEL_LIST
         .iter()
@@ -300,35 +278,28 @@ mod tests {
     use super::MODEL_LIST;
 
     #[test]
-    fn model_list_includes_current_official_models() {
-        for model in [
+    fn model_list_matches_active_bootstrap_models() {
+        const EXPECTED_MODELS: &[&str] = &[
+            "claude-fable-5",
+            "claude-fable-5-thinking",
+            "claude-opus-5",
+            "claude-opus-5-thinking",
             "claude-sonnet-5",
             "claude-sonnet-5-thinking",
             "claude-haiku-4-5-20251001",
-            "claude-haiku-4-5",
-            "claude-sonnet-4-5",
-            "claude-opus-4-1",
-            "claude-opus-4-7",
-            "claude-opus-4-7-thinking",
+            "claude-haiku-4-5-20251001-thinking",
             "claude-opus-4-8",
             "claude-opus-4-8-thinking",
-        ] {
-            assert!(MODEL_LIST.contains(&model), "{model} should be listed");
-        }
-    }
+            "claude-opus-4-7",
+            "claude-opus-4-7-thinking",
+            "claude-opus-4-6",
+            "claude-opus-4-6-thinking",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6-thinking",
+            "claude-3-opus-20240229",
+        ];
 
-    #[test]
-    fn model_list_excludes_unconfirmed_dated_new_model_ids() {
-        for model in [
-            "claude-sonnet-5-20260422",
-            "claude-opus-4-7-20260105",
-            "claude-opus-4-8-20260312",
-        ] {
-            assert!(
-                !MODEL_LIST.contains(&model),
-                "{model} should not be advertised"
-            );
-        }
+        assert_eq!(MODEL_LIST, EXPECTED_MODELS);
     }
 }
 

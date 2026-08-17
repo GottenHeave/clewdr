@@ -95,7 +95,7 @@ SillyTavern:
 {
   "api_url": "http://127.0.0.1:8484/v1/chat/completions",
   "api_key": "password-from-console",
-  "model": "claude-3-sonnet-20240229"
+  "model": "claude-sonnet-5"
 }
 ```
 
@@ -107,7 +107,7 @@ Continue (VS Code):
     {
       "title": "Claude via ClewdR",
       "provider": "openai",
-      "model": "claude-3-sonnet-20240229",
+      "model": "claude-sonnet-5",
       "apiBase": "http://127.0.0.1:8484/v1/",
       "apiKey": "password-from-console"
     }
